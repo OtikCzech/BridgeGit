@@ -1,0 +1,46 @@
+appId: cz.otik.bridgegit
+productName: BridgeGit
+artifactName: '${productName}-${version}-${arch}.${ext}'
+directories:
+  output: release
+toolsets:
+  winCodeSign: "1.1.0"
+files:
+  - package.json
+  - dist/**/*
+  - assets/icons/**/*
+extraResources:
+  - from: assets/icons/bridgegit.ico
+    to: assets/icons/bridgegit.ico
+asar: true
+asarUnpack:
+  - node_modules/node-pty/**/*
+npmRebuild: false
+win:
+  icon: assets/icons/bridgegit.ico
+  executableName: BridgeGit
+  signAndEditExecutable: false
+  target:
+    - target: nsis
+      arch:
+        - x64
+    - target: portable
+      arch:
+        - x64
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  perMachine: false
+  deleteAppDataOnUninstall: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: BridgeGit
+  artifactName: '${productName}-Setup-${version}-${arch}.${ext}'
+portable:
+  artifactName: '${productName}-Portable-${version}-${arch}.${ext}'
+linux:
+  category: Development
+  target:
+    - target: AppImage
+      arch:
+        - x64

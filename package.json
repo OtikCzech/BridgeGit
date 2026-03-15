@@ -1,0 +1,51 @@
+{
+  "name": "bridgegit",
+  "version": "0.1.0",
+  "description": "Desktop Git workspace with repository tree, diff, shell terminal, and markdown notes.",
+  "main": "dist/main/index.js",
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "build": "vue-tsc --noEmit -p tsconfig.json && tsc -p tsconfig.node.json && vite build",
+    "dist:win": "npm run build && electron-builder --win nsis",
+    "dist:win:portable": "npm run build && electron-builder --win portable",
+    "dist:linux": "npm run build && electron-builder --linux AppImage",
+    "rebuild:native": "electron-rebuild -f -w node-pty",
+    "postinstall": "npm run rebuild:native",
+    "start": "electron .",
+    "test": "echo \"No tests yet\" && exit 0"
+  },
+  "keywords": [
+    "git",
+    "terminal",
+    "electron",
+    "vue"
+  ],
+  "engines": {
+    "node": ">=24.14.0 <25"
+  },
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "electron-store": "^11.0.2",
+    "node-pty": "^1.1.0",
+    "simple-git": "^3.33.0"
+  },
+  "devDependencies": {
+    "@electron/rebuild": "^4.0.3",
+    "@types/node": "^25.5.0",
+    "@vitejs/plugin-vue": "^6.0.5",
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/addon-web-links": "^0.12.0",
+    "@xterm/xterm": "^6.0.0",
+    "diff2html": "^3.4.56",
+    "dompurify": "^3.3.0",
+    "electron": "^41.0.0",
+    "electron-builder": "^26.8.1",
+    "marked": "^17.0.1",
+    "sass": "^1.98.0",
+    "typescript": "^5.9.3",
+    "vite": "^8.0.0",
+    "vue": "^3.5.30",
+    "vue-tsc": "^3.2.5"
+  }
+}
