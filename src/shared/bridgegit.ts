@@ -15,6 +15,8 @@ export interface GitChange {
   originalPath?: string;
 }
 
+export type GitDiffMode = 'working-tree' | 'staged';
+
 export interface GitStatusSummary {
   currentBranch: string | null;
   trackingBranch: string | null;
@@ -35,6 +37,12 @@ export interface BranchInfo {
 export interface BranchSummary {
   current: string | null;
   all: BranchInfo[];
+}
+
+export interface RepoDirectoryEntry {
+  name: string;
+  path: string;
+  kind: 'directory' | 'file';
 }
 
 export interface GitLogEntry {
@@ -59,6 +67,15 @@ export interface GitCommitRef {
   current: boolean;
 }
 
+export interface GitWorktreeSummary {
+  path: string;
+  branch: string | null;
+  head: string | null;
+  detached: boolean;
+  bare: boolean;
+  current: boolean;
+}
+
 export interface PanelLayout {
   sidebarWidth: number;
   terminalHeight: number;
@@ -68,6 +85,27 @@ export interface PanelLayout {
   diffCollapsed: boolean;
   terminalCollapsed: boolean;
 }
+
+export type PanelLayoutsByWorkspace = Record<string, PanelLayout>;
+export type RepoPanelFileListMode = 'list' | 'tree';
+export type RepoPanelSectionId = 'staged' | 'changed' | 'untracked' | 'conflicts';
+export type RepoPanelSectionState = Record<RepoPanelSectionId, boolean>;
+
+export interface WorkspaceRepoPanelFilesState {
+  expanded: boolean;
+  viewMode: RepoPanelFileListMode;
+  showAll: boolean;
+  collapsedSections: RepoPanelSectionState;
+}
+
+export interface WorkspaceRepoPanelState {
+  fontSize: number;
+  historyOpen: boolean;
+  workspaceDetailExpanded: boolean;
+  files: WorkspaceRepoPanelFilesState;
+}
+
+export type WorkspaceRepoPanelStatesById = Record<string, WorkspaceRepoPanelState>;
 
 export interface PtyCreateOptions {
   shell?: string;
@@ -104,6 +142,7 @@ export interface WorkspaceShellTabState {
   type: 'shell';
   title: string;
   cwd: string;
+  fontSize: number;
   launcherProfileId?: string | null;
 }
 
@@ -118,24 +157,176 @@ export interface WorkspaceNoteTabState {
   fontSize: number;
 }
 
-export type WorkspaceTabState = WorkspaceShellTabState | WorkspaceNoteTabState;
+export interface WorkspaceCodeTabState {
+  id: string;
+  type: 'code';
+  title: string;
+  filePath: string;
+  content: string;
+  savedContent: string;
+  fontSize: number;
+}
+
+export interface CodeNavigationTarget {
+  filePath: string;
+  line?: number;
+  column?: number;
+}
+
+export interface CodeNavigationRequest extends CodeNavigationTarget {
+  token: number;
+}
+
+export interface GitTextSearchMatch {
+  path: string;
+  filePath: string;
+  line: number;
+  column: number;
+  text: string;
+}
+
+export type WorkspaceExternalFileChangeState = 'changed' | 'unavailable' | 'session-dirty';
+
+export type WorkspaceTabState = WorkspaceShellTabState | WorkspaceNoteTabState | WorkspaceCodeTabState;
 
 export interface WorkspaceSessionState {
   tabs: WorkspaceTabState[];
   activeTabId: string | null;
 }
 
-export type WorkspaceSessionsByContext = Record<string, WorkspaceSessionState>;
+export type WorkspaceKind = 'global' | 'project';
 
-export interface NoteFileHandle {
+export interface WorkspaceDescriptor {
+  id: string;
+  kind: WorkspaceKind;
+  repoPath: string | null;
+}
+
+export type WorkspaceDescriptorsById = Record<string, WorkspaceDescriptor>;
+export type WorkspaceSessionsById = Record<string, WorkspaceSessionState>;
+
+export interface WorkspaceOverviewItem {
+  workspaceId: string;
+  path: string | null;
+  title: string;
+  repoName: string;
+  branch: string | null;
+  changedCount: number | null;
+  untrackedCount: number | null;
+  conflictedCount: number | null;
+  hasPanelActivity: boolean;
+  hasPanelAttention: boolean;
+  isCurrent: boolean;
+}
+
+export interface WorkspaceIndicatorVisibilitySettings {
+  repo: boolean;
+  activity: boolean;
+  attention: boolean;
+}
+
+export type AppAppearance = 'bridgegit-dark' | 'bridgegit-light' | 'github-dark' | 'github-light' | 'nord';
+export type EditorThemePreset = AppAppearance;
+export type EditorTheme = 'follow-app' | EditorThemePreset;
+export type ResolvedEditorTheme = EditorThemePreset;
+export type ThemeVariant = 'dark' | 'light';
+
+export interface WorkspaceTabDefaults {
+  shellFontSize: number;
+  noteFontSize: number;
+}
+
+export type WorktreeDetectionInterval = 60_000 | 180_000 | 300_000 | 900_000 | null;
+
+export interface NoteFileStat {
   path: string;
+  lastModifiedMs: number;
+  size: number;
+}
+
+export interface NoteFileHandle extends NoteFileStat {
   content: string;
 }
 
+export type WorkspaceFileTabType = 'note' | 'code' | 'unsupported';
+
 export const GLOBAL_WORKSPACE_SESSION_KEY = '__global__';
+export const GLOBAL_WORKSPACE_ID = 'workspace-global';
+export const DEFAULT_SHELL_FONT_SIZE = 13;
+export const MIN_SHELL_FONT_SIZE = 11;
+export const MAX_SHELL_FONT_SIZE = 22;
 export const DEFAULT_NOTE_FONT_SIZE = 14;
 export const MIN_NOTE_FONT_SIZE = 12;
 export const MAX_NOTE_FONT_SIZE = 24;
+const WORKSPACE_NOTE_FILE_EXTENSIONS = new Set(['md', 'markdown', 'txt']);
+const WORKSPACE_CODE_FILE_EXTENSIONS = new Set([
+  'bash',
+  'bat',
+  'c',
+  'cc',
+  'cfg',
+  'conf',
+  'cpp',
+  'cs',
+  'css',
+  'csv',
+  'env',
+  'gitignore',
+  'gitattributes',
+  'go',
+  'h',
+  'hpp',
+  'htm',
+  'html',
+  'ini',
+  'java',
+  'js',
+  'json',
+  'jsonc',
+  'jsx',
+  'kt',
+  'kts',
+  'less',
+  'log',
+  'lua',
+  'mjs',
+  'php',
+  'pl',
+  'ps1',
+  'psm1',
+  'py',
+  'rb',
+  'rs',
+  'sass',
+  'scss',
+  'sh',
+  'sql',
+  'svg',
+  'toml',
+  'ts',
+  'tsx',
+  'vue',
+  'xml',
+  'yaml',
+  'yml',
+  'zsh',
+]);
+const WORKSPACE_CODE_FILE_NAMES = new Set([
+  '.editorconfig',
+  '.env',
+  '.env.example',
+  '.eslintignore',
+  '.eslintrc',
+  '.gitattributes',
+  '.gitignore',
+  '.npmrc',
+  '.nvmrc',
+  '.prettierignore',
+  '.prettierrc',
+  'dockerfile',
+  'makefile',
+  'readme',
+]);
 
 export type TerminalCommandTarget = 'active-tab' | 'new-tab';
 
@@ -175,22 +366,54 @@ export type ProjectTitleMode = 'auto' | 'custom';
 
 export interface SessionData {
   lastRepoPath: string | null;
+  activeWorkspaceId: string | null;
   recentRepos: RecentRepoEntry[];
+  workspaceOrder: string[];
+  workspaceDescriptors: WorkspaceDescriptorsById;
   panelLayout: PanelLayout;
+  panelLayoutsByWorkspace: PanelLayoutsByWorkspace;
+  workspaceRepoPanelStates: WorkspaceRepoPanelStatesById;
   terminalCwd: string | null;
   projectTitle: string;
   projectTitleMode: ProjectTitleMode;
+  projectTitlesByContext: Record<string, string>;
+  appAppearance: AppAppearance;
+  editorTheme: EditorTheme;
+  workspaceIndicatorVisibility: WorkspaceIndicatorVisibilitySettings;
+  workspaceTabDefaults: WorkspaceTabDefaults;
+  worktreeDetectionIntervalMs: WorktreeDetectionInterval;
+  dismissedWorktreePaths: string[];
   soundNotificationsEnabled: boolean;
   infoNoteLastSeenRevision: string | null;
   terminalCommandPresets: TerminalCommandPreset[];
-  workspaceSessions: WorkspaceSessionsByContext;
+  workspaceSessions: WorkspaceSessionsById;
 }
 
 export interface ProjectSettingsFormData {
   projectTitle: string;
   contentLayout: PanelLayout['contentLayout'];
+  appAppearance: AppAppearance;
+  editorTheme: EditorTheme;
+  workspacePanelFontSize: number;
+  workspaceIndicatorVisibility: WorkspaceIndicatorVisibilitySettings;
+  workspaceTabDefaults: WorkspaceTabDefaults;
+  worktreeDetectionIntervalMs: WorktreeDetectionInterval;
   soundNotificationsEnabled: boolean;
   terminalCommandPresets: TerminalCommandPreset[];
+}
+
+export function cloneWorkspaceIndicatorVisibilitySettings(
+  workspaceIndicatorVisibility: WorkspaceIndicatorVisibilitySettings,
+): WorkspaceIndicatorVisibilitySettings {
+  return { ...workspaceIndicatorVisibility };
+}
+
+export function cloneWorkspaceTabDefaults(workspaceTabDefaults: WorkspaceTabDefaults): WorkspaceTabDefaults {
+  return { ...workspaceTabDefaults };
+}
+
+export function cloneDismissedWorktreePaths(dismissedWorktreePaths: string[]): string[] {
+  return [...dismissedWorktreePaths];
 }
 
 export function cloneTerminalCommandPresets(presets: TerminalCommandPreset[]): TerminalCommandPreset[] {
@@ -211,12 +434,91 @@ export function cloneWorkspaceSessionState(workspaceSession: WorkspaceSessionSta
   };
 }
 
-export function cloneWorkspaceSessions(workspaceSessions: WorkspaceSessionsByContext): WorkspaceSessionsByContext {
+export function cloneWorkspaceDescriptors(workspaceDescriptors: WorkspaceDescriptorsById): WorkspaceDescriptorsById {
   return Object.fromEntries(
-    Object.entries(workspaceSessions).map(([contextKey, workspaceSession]) => (
-      [contextKey, cloneWorkspaceSessionState(workspaceSession)]
+    Object.entries(workspaceDescriptors).map(([workspaceId, workspaceDescriptor]) => (
+      [workspaceId, { ...workspaceDescriptor }]
     )),
   );
+}
+
+export function cloneWorkspaceSessions(workspaceSessions: WorkspaceSessionsById): WorkspaceSessionsById {
+  return Object.fromEntries(
+    Object.entries(workspaceSessions).map(([workspaceId, workspaceSession]) => (
+      [workspaceId, cloneWorkspaceSessionState(workspaceSession)]
+    )),
+  );
+}
+
+export function clonePanelLayoutsByWorkspace(panelLayoutsByWorkspace: PanelLayoutsByWorkspace): PanelLayoutsByWorkspace {
+  return Object.fromEntries(
+    Object.entries(panelLayoutsByWorkspace).map(([workspaceId, panelLayout]) => (
+      [workspaceId, { ...panelLayout }]
+    )),
+  );
+}
+
+export function cloneRepoPanelSectionState(repoPanelSectionState: RepoPanelSectionState): RepoPanelSectionState {
+  return { ...repoPanelSectionState };
+}
+
+export function cloneWorkspaceRepoPanelState(workspaceRepoPanelState: WorkspaceRepoPanelState): WorkspaceRepoPanelState {
+  return {
+    fontSize: workspaceRepoPanelState.fontSize,
+    historyOpen: workspaceRepoPanelState.historyOpen,
+    workspaceDetailExpanded: workspaceRepoPanelState.workspaceDetailExpanded,
+    files: {
+      expanded: workspaceRepoPanelState.files.expanded,
+      viewMode: workspaceRepoPanelState.files.viewMode,
+      showAll: workspaceRepoPanelState.files.showAll,
+      collapsedSections: cloneRepoPanelSectionState(workspaceRepoPanelState.files.collapsedSections),
+    },
+  };
+}
+
+export function cloneWorkspaceRepoPanelStates(
+  workspaceRepoPanelStates: WorkspaceRepoPanelStatesById,
+): WorkspaceRepoPanelStatesById {
+  return Object.fromEntries(
+    Object.entries(workspaceRepoPanelStates).map(([workspaceId, workspaceRepoPanelState]) => (
+      [workspaceId, cloneWorkspaceRepoPanelState(workspaceRepoPanelState)]
+    )),
+  );
+}
+
+export function cloneProjectTitlesByContext(projectTitlesByContext: Record<string, string>): Record<string, string> {
+  return { ...projectTitlesByContext };
+}
+
+export function normalizeAppAppearance(appAppearance: AppAppearance | null | undefined): AppAppearance {
+  if (
+    appAppearance === 'bridgegit-light'
+    || appAppearance === 'github-dark'
+    || appAppearance === 'github-light'
+    || appAppearance === 'nord'
+  ) {
+    return appAppearance;
+  }
+
+  return 'bridgegit-dark';
+}
+
+export function normalizeEditorTheme(editorTheme: EditorTheme | null | undefined): EditorTheme {
+  if (
+    editorTheme === 'bridgegit-dark'
+    || editorTheme === 'bridgegit-light'
+    || editorTheme === 'github-dark'
+    || editorTheme === 'github-light'
+    || editorTheme === 'nord'
+  ) {
+    return editorTheme;
+  }
+
+  return 'follow-app';
+}
+
+export function resolveThemeVariant(theme: AppAppearance | EditorTheme | ResolvedEditorTheme): ThemeVariant {
+  return theme === 'bridgegit-light' || theme === 'github-light' ? 'light' : 'dark';
 }
 
 export function normalizeNoteFontSize(fontSize: number | null | undefined): number {
@@ -225,6 +527,45 @@ export function normalizeNoteFontSize(fontSize: number | null | undefined): numb
   }
 
   return Math.min(MAX_NOTE_FONT_SIZE, Math.max(MIN_NOTE_FONT_SIZE, Math.round(fontSize)));
+}
+
+export function getWorkspaceFileExtension(filePath: string): string {
+  const fileName = filePath.split(/[\\/]/).filter(Boolean).at(-1) ?? filePath;
+  const fileNameParts = fileName.split('.');
+
+  if (fileName.startsWith('.') && fileNameParts.length === 2) {
+    return fileName.slice(1).toLowerCase();
+  }
+
+  return fileNameParts.length > 1
+    ? fileNameParts.at(-1)?.toLowerCase() ?? ''
+    : '';
+}
+
+export function getWorkspaceFileBaseName(filePath: string): string {
+  return filePath.split(/[\\/]/).filter(Boolean).at(-1)?.toLowerCase() ?? filePath.toLowerCase();
+}
+
+export function resolveWorkspaceFileTabType(filePath: string): WorkspaceFileTabType {
+  const extension = getWorkspaceFileExtension(filePath);
+
+  if (WORKSPACE_NOTE_FILE_EXTENSIONS.has(extension)) {
+    return 'note';
+  }
+
+  if (WORKSPACE_CODE_FILE_EXTENSIONS.has(extension) || WORKSPACE_CODE_FILE_NAMES.has(getWorkspaceFileBaseName(filePath))) {
+    return 'code';
+  }
+
+  return 'unsupported';
+}
+
+export function normalizeShellFontSize(fontSize: number | null | undefined): number {
+  if (typeof fontSize !== 'number' || Number.isNaN(fontSize) || !Number.isFinite(fontSize)) {
+    return DEFAULT_SHELL_FONT_SIZE;
+  }
+
+  return Math.min(MAX_SHELL_FONT_SIZE, Math.max(MIN_SHELL_FONT_SIZE, Math.round(fontSize)));
 }
 
 const DEFAULT_TERMINAL_COMMAND_PRESETS: TerminalCommandPreset[] = [
@@ -296,11 +637,38 @@ export const DEFAULT_PANEL_LAYOUT: PanelLayout = {
 
 export const DEFAULT_SESSION_DATA: SessionData = {
   lastRepoPath: null,
+  activeWorkspaceId: GLOBAL_WORKSPACE_ID,
   recentRepos: [],
+  workspaceOrder: [],
+  workspaceDescriptors: {
+    [GLOBAL_WORKSPACE_ID]: {
+      id: GLOBAL_WORKSPACE_ID,
+      kind: 'global',
+      repoPath: null,
+    },
+  },
   panelLayout: { ...DEFAULT_PANEL_LAYOUT },
+  panelLayoutsByWorkspace: {
+    [GLOBAL_WORKSPACE_ID]: { ...DEFAULT_PANEL_LAYOUT },
+  },
+  workspaceRepoPanelStates: {},
   terminalCwd: null,
   projectTitle: 'BridgeGit',
   projectTitleMode: 'auto',
+  projectTitlesByContext: {},
+  appAppearance: 'bridgegit-dark',
+  editorTheme: 'follow-app',
+  workspaceIndicatorVisibility: {
+    repo: true,
+    activity: true,
+    attention: true,
+  },
+  workspaceTabDefaults: {
+    shellFontSize: DEFAULT_SHELL_FONT_SIZE,
+    noteFontSize: DEFAULT_NOTE_FONT_SIZE,
+  },
+  worktreeDetectionIntervalMs: 180_000,
+  dismissedWorktreePaths: [],
   soundNotificationsEnabled: true,
   infoNoteLastSeenRevision: null,
   terminalCommandPresets: getDefaultTerminalCommandPresets(),

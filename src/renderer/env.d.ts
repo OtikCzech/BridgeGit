@@ -2,13 +2,19 @@
 
 import type {
   BranchSummary,
+  GitChange,
+  GitDiffMode,
   GitLogResult,
   GitStatusSummary,
+  GitTextSearchMatch,
+  GitWorktreeSummary,
   NoteFileHandle,
+  NoteFileStat,
   PtyCreateOptions,
   PtyDataEvent,
   PtyExitEvent,
   PtySessionInfo,
+  RepoDirectoryEntry,
   SessionData,
 } from '../shared/bridgegit';
 
@@ -24,11 +30,14 @@ declare global {
         node: string;
       };
       dialog: {
-        openRepo: () => Promise<string | null>;
+        openRepo: (defaultPath?: string | null) => Promise<string | null>;
       };
       notes: {
         openFile: () => Promise<NoteFileHandle | null>;
         readFile: (filePath: string) => Promise<NoteFileHandle>;
+        inspectFile: (filePath: string) => Promise<NoteFileHandle | null>;
+        statFile: (filePath: string) => Promise<NoteFileStat | null>;
+        resolveLink: (baseFilePath: string | null, href: string) => Promise<string | null>;
         saveFile: (filePath: string, content: string) => Promise<string>;
         saveFileAs: (content: string, defaultPath?: string | null) => Promise<string | null>;
       };
@@ -44,9 +53,19 @@ declare global {
         save: (session: Partial<SessionData>) => Promise<SessionData>;
       };
       git: {
+        isRepository: (repoPath: string) => Promise<boolean>;
         status: (repoPath: string) => Promise<GitStatusSummary>;
         branches: (repoPath: string) => Promise<BranchSummary>;
-        diff: (repoPath: string, filePath?: string) => Promise<string>;
+        listDirectory: (repoPath: string, relativePath?: string) => Promise<RepoDirectoryEntry[]>;
+        searchFiles: (repoPath: string, query: string, limit?: number) => Promise<string[]>;
+        searchText: (
+          repoPath: string,
+          query: string,
+          limit?: number,
+          wholeWord?: boolean,
+        ) => Promise<GitTextSearchMatch[]>;
+        worktrees: (repoPath: string) => Promise<GitWorktreeSummary[]>;
+        diff: (repoPath: string, filePath?: string, mode?: GitDiffMode) => Promise<string>;
         commitDiff: (
           repoPath: string,
           commitHash: string,
@@ -55,6 +74,8 @@ declare global {
         log: (repoPath: string, limit?: number) => Promise<GitLogResult>;
         stage: (repoPath: string, files: string[]) => Promise<GitStatusSummary>;
         unstage: (repoPath: string, files: string[]) => Promise<GitStatusSummary>;
+        discard: (repoPath: string, change: GitChange) => Promise<GitStatusSummary>;
+        discardHunk: (repoPath: string, patch: string, mode: GitDiffMode) => Promise<GitStatusSummary>;
         commit: (repoPath: string, message: string) => Promise<GitStatusSummary>;
         checkout: (repoPath: string, branchName: string) => Promise<BranchSummary>;
       };

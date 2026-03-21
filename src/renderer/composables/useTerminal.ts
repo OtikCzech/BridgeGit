@@ -1,4 +1,4 @@
-import { ref } from 'vue';
+import { ref, type Ref } from 'vue';
 import type {
   PtyCreateOptions,
   PtyDataEvent,
@@ -11,6 +11,20 @@ interface TerminalHandlers {
   onExit?: (payload: PtyExitEvent) => void;
 }
 
+interface TerminalRuntime {
+  sessionInfo: Ref<PtySessionInfo | null>;
+  isStarting: Ref<boolean>;
+  error: Ref<string | null>;
+  exitCode: Ref<number | null>;
+  outputBuffer: Ref<string>;
+  subscribers: Set<TerminalHandlers>;
+  dataUnsubscribe: (() => void) | null;
+  exitUnsubscribe: (() => void) | null;
+}
+
+const OUTPUT_BUFFER_LIMIT = 512_000;
+const terminalRuntimes = new Map<string, TerminalRuntime>();
+
 function toErrorMessage(error: unknown): string {
   if (error instanceof Error) {
     return error.message;
@@ -19,112 +33,173 @@ function toErrorMessage(error: unknown): string {
   return 'Terminal session failed.';
 }
 
-export function useTerminal() {
-  const sessionInfo = ref<PtySessionInfo | null>(null);
-  const isStarting = ref(false);
-  const error = ref<string | null>(null);
-  const exitCode = ref<number | null>(null);
+function getOrCreateRuntime(runtimeKey: string): TerminalRuntime {
+  const existingRuntime = terminalRuntimes.get(runtimeKey);
 
-  let dataUnsubscribe: (() => void) | null = null;
-  let exitUnsubscribe: (() => void) | null = null;
-
-  function cleanupListeners() {
-    dataUnsubscribe?.();
-    exitUnsubscribe?.();
-    dataUnsubscribe = null;
-    exitUnsubscribe = null;
+  if (existingRuntime) {
+    return existingRuntime;
   }
 
-  function attachListeners(handlers: TerminalHandlers) {
-    cleanupListeners();
+  const runtime: TerminalRuntime = {
+    sessionInfo: ref<PtySessionInfo | null>(null),
+    isStarting: ref(false),
+    error: ref<string | null>(null),
+    exitCode: ref<number | null>(null),
+    outputBuffer: ref(''),
+    subscribers: new Set(),
+    dataUnsubscribe: null,
+    exitUnsubscribe: null,
+  };
 
-    dataUnsubscribe =
-      window.bridgegit?.terminal.onData((payload) => {
-        if (payload.ptyId !== sessionInfo.value?.ptyId) {
-          return;
-        }
+  terminalRuntimes.set(runtimeKey, runtime);
+  return runtime;
+}
 
-        handlers.onData(payload);
-      }) ?? null;
+function cleanupListeners(runtime: TerminalRuntime) {
+  runtime.dataUnsubscribe?.();
+  runtime.exitUnsubscribe?.();
+  runtime.dataUnsubscribe = null;
+  runtime.exitUnsubscribe = null;
+}
 
-    exitUnsubscribe =
-      window.bridgegit?.terminal.onExit((payload) => {
-        if (payload.ptyId !== sessionInfo.value?.ptyId) {
-          return;
-        }
-
-        exitCode.value = payload.exitCode;
-        sessionInfo.value = null;
-        handlers.onExit?.(payload);
-      }) ?? null;
+function trimOutputBuffer(runtime: TerminalRuntime) {
+  if (runtime.outputBuffer.value.length <= OUTPUT_BUFFER_LIMIT) {
+    return;
   }
 
-  async function start(options: PtyCreateOptions, handlers: TerminalHandlers) {
+  runtime.outputBuffer.value = runtime.outputBuffer.value.slice(-OUTPUT_BUFFER_LIMIT);
+}
+
+function attachBridgeListeners(runtime: TerminalRuntime) {
+  if (runtime.dataUnsubscribe || runtime.exitUnsubscribe || !window.bridgegit?.terminal) {
+    return;
+  }
+
+  runtime.dataUnsubscribe = window.bridgegit.terminal.onData((payload) => {
+    if (payload.ptyId !== runtime.sessionInfo.value?.ptyId) {
+      return;
+    }
+
+    runtime.outputBuffer.value += payload.data;
+    trimOutputBuffer(runtime);
+    runtime.subscribers.forEach((handlers) => {
+      handlers.onData(payload);
+    });
+  });
+
+  runtime.exitUnsubscribe = window.bridgegit.terminal.onExit((payload) => {
+    if (payload.ptyId !== runtime.sessionInfo.value?.ptyId) {
+      return;
+    }
+
+    runtime.exitCode.value = payload.exitCode;
+    runtime.sessionInfo.value = null;
+    runtime.subscribers.forEach((handlers) => {
+      handlers.onExit?.(payload);
+    });
+    cleanupListeners(runtime);
+  });
+}
+
+export function useTerminal(runtimeKey: string) {
+  const runtime = getOrCreateRuntime(runtimeKey);
+  let activeHandlers: TerminalHandlers | null = null;
+
+  function attach(handlers: TerminalHandlers) {
+    if (activeHandlers) {
+      runtime.subscribers.delete(activeHandlers);
+    }
+
+    activeHandlers = handlers;
+    runtime.subscribers.add(handlers);
+    attachBridgeListeners(runtime);
+  }
+
+  function detach() {
+    if (!activeHandlers) {
+      return;
+    }
+
+    runtime.subscribers.delete(activeHandlers);
+    activeHandlers = null;
+  }
+
+  async function start(options: PtyCreateOptions) {
     if (!window.bridgegit?.terminal) {
-      error.value = 'Terminal API is unavailable in the current runtime.';
+      runtime.error.value = 'Terminal API is unavailable in the current runtime.';
       return null;
     }
 
-    isStarting.value = true;
-    error.value = null;
-    exitCode.value = null;
+    if (runtime.sessionInfo.value) {
+      attachBridgeListeners(runtime);
+      return runtime.sessionInfo.value;
+    }
+
+    runtime.isStarting.value = true;
+    runtime.error.value = null;
+    runtime.exitCode.value = null;
+    runtime.outputBuffer.value = '';
 
     try {
-      attachListeners(handlers);
       const nextSession = await window.bridgegit.terminal.create(options);
-      sessionInfo.value = nextSession;
+      runtime.sessionInfo.value = nextSession;
+      attachBridgeListeners(runtime);
       return nextSession;
     } catch (nextError) {
-      cleanupListeners();
-      error.value = toErrorMessage(nextError);
+      cleanupListeners(runtime);
+      runtime.error.value = toErrorMessage(nextError);
       return null;
     } finally {
-      isStarting.value = false;
+      runtime.isStarting.value = false;
     }
   }
 
-  async function restart(options: PtyCreateOptions, handlers: TerminalHandlers) {
+  async function restart(options: PtyCreateOptions) {
     kill();
-    return start(options, handlers);
+    return start(options);
   }
 
   function write(data: string) {
-    if (!sessionInfo.value || !window.bridgegit?.terminal) {
+    if (!runtime.sessionInfo.value || !window.bridgegit?.terminal) {
       return;
     }
 
-    window.bridgegit.terminal.write(sessionInfo.value.ptyId, data);
+    window.bridgegit.terminal.write(runtime.sessionInfo.value.ptyId, data);
   }
 
   function resize(cols: number, rows: number) {
-    if (!sessionInfo.value || !window.bridgegit?.terminal) {
+    if (!runtime.sessionInfo.value || !window.bridgegit?.terminal) {
       return;
     }
 
-    window.bridgegit.terminal.resize(sessionInfo.value.ptyId, cols, rows);
+    window.bridgegit.terminal.resize(runtime.sessionInfo.value.ptyId, cols, rows);
   }
 
   function kill() {
-    if (!sessionInfo.value || !window.bridgegit?.terminal) {
-      cleanupListeners();
+    if (!runtime.sessionInfo.value || !window.bridgegit?.terminal) {
+      cleanupListeners(runtime);
       return;
     }
 
-    window.bridgegit.terminal.kill(sessionInfo.value.ptyId);
-    sessionInfo.value = null;
-    cleanupListeners();
+    window.bridgegit.terminal.kill(runtime.sessionInfo.value.ptyId);
+    runtime.sessionInfo.value = null;
+    runtime.exitCode.value = null;
+    runtime.outputBuffer.value = '';
+    cleanupListeners(runtime);
   }
 
   function dispose() {
-    kill();
-    cleanupListeners();
+    detach();
   }
 
   return {
-    sessionInfo,
-    isStarting,
-    error,
-    exitCode,
+    sessionInfo: runtime.sessionInfo,
+    isStarting: runtime.isStarting,
+    error: runtime.error,
+    exitCode: runtime.exitCode,
+    outputBuffer: runtime.outputBuffer,
+    attach,
+    detach,
     start,
     restart,
     write,

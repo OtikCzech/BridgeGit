@@ -1,18 +1,21 @@
 # BridgeGit
 
-BridgeGit is a desktop Git workspace that keeps repository tree, diff review, shell sessions, and Markdown notes in one focused UI.
+BridgeGit is a desktop Git client with an integrated terminal workspace, built with Electron + Vue.
 
 It combines:
-- Repository tree, status, staging, and commit workflows
+- Git status/staging/commit workflows
 - Diff viewer (side-by-side and unified)
-- Workspace tabs for shell sessions and notes
+- Workspace tabs for shell sessions, notes, and code files
 - Session persistence (repo, layout, tabs, presets)
 
 ## Highlights
 
 - Three-panel layout: Repository panel, Diff panel, Workspace panel
 - Shell tabs with multi-session support and reconnect
-- Notes tabs with Markdown source/split/preview modes
+- Notes tabs with Markdown source/split/preview modes plus Mermaid diagrams
+- Code editor tabs powered by CodeMirror 6
+- Ctrl/Cmd+click navigation and reference search in the editor
+- Application appearance themes and editor theme variants
 - Custom command presets (including default Codex/Claude presets)
 - Keyboard-driven workflow for common actions
 
@@ -74,10 +77,8 @@ npm run start
 ## Default Keyboard Shortcuts
 
 - `Ctrl+1` / `Ctrl+2` / `Ctrl+3` – toggle repository/diff/workspace panels
-- `Ctrl+N` – open new tab menu
-- `Ctrl+N, S` – new shell tab
-- `Ctrl+N, N` – new notes tab
-- `Ctrl+N, O` – open note file
+- `Ctrl+N` – new shell tab
+- `Ctrl+Shift+N` – new notes tab
 - `Ctrl+PgUp` / `Ctrl+PgDn` – previous/next shell tab
 - `Ctrl+F4` – close active shell tab
 - `Ctrl+H` – open git history
@@ -94,3 +95,7 @@ npm run start
 ## License
 
 MIT
+
+## Windows Note
+
+Windows may show a SmartScreen warning on first launch because BridgeGit is not yet code-signed.

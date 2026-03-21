@@ -1,71 +1,10 @@
-.terminal-session__screen::-webkit-scrollbar,
-.terminal-session__screen .xterm-viewport::-webkit-scrollbar,
-.repo-panel__groups::-webkit-scrollbar,
-.note-tab__input::-webkit-scrollbar,
-.note-tab__preview::-webkit-scrollbar,
-.diff-viewer__rendered::-webkit-scrollbar,
-.diff-viewer__rendered .d2h-file-side-diff::-webkit-scrollbar,
-.diff-viewer__rendered .d2h-file-diff::-webkit-scrollbar,
-.diff-viewer__column::-webkit-scrollbar,
-.diff-viewer__unified::-webkit-scrollbar {
-  width: 10px;
-  height: 10px;
-}
-
-.terminal-session__screen::-webkit-scrollbar-thumb,
-.terminal-session__screen .xterm-viewport::-webkit-scrollbar-thumb,
-.repo-panel__groups::-webkit-scrollbar-thumb,
-.note-tab__input::-webkit-scrollbar-thumb,
-.note-tab__preview::-webkit-scrollbar-thumb,
-.diff-viewer__rendered::-webkit-scrollbar-thumb,
-.diff-viewer__rendered .d2h-file-side-diff::-webkit-scrollbar-thumb,
-.diff-viewer__rendered .d2h-file-diff::-webkit-scrollbar-thumb,
-.diff-viewer__column::-webkit-scrollbar-thumb,
-.diff-viewer__unified::-webkit-scrollbar-thumb {
-  border: 2px solid transparent;
-  border-radius: 999px;
-  background: rgba(88, 102, 124, 0.44);
-  background-clip: padding-box;
-}
-
-.terminal-session__screen::-webkit-scrollbar-track,
-.terminal-session__screen .xterm-viewport::-webkit-scrollbar-track,
-.repo-panel__groups::-webkit-scrollbar-track,
-.note-tab__input::-webkit-scrollbar-track,
-.note-tab__preview::-webkit-scrollbar-track,
-.diff-viewer__rendered::-webkit-scrollbar-track,
-.diff-viewer__rendered .d2h-file-side-diff::-webkit-scrollbar-track,
-.diff-viewer__rendered .d2h-file-diff::-webkit-scrollbar-track,
-.diff-viewer__column::-webkit-scrollbar-track,
-.diff-viewer__unified::-webkit-scrollbar-track {
-  background: rgba(8, 12, 17, 0.72);
-}
-
-.terminal-session__screen::-webkit-scrollbar-corner,
-.terminal-session__screen .xterm-viewport::-webkit-scrollbar-corner,
-.repo-panel__groups::-webkit-scrollbar-corner,
-.note-tab__input::-webkit-scrollbar-corner,
-.note-tab__preview::-webkit-scrollbar-corner,
-.diff-viewer__rendered::-webkit-scrollbar-corner,
-.diff-viewer__rendered .d2h-file-side-diff::-webkit-scrollbar-corner,
-.diff-viewer__rendered .d2h-file-diff::-webkit-scrollbar-corner,
-.diff-viewer__column::-webkit-scrollbar-corner,
-.diff-viewer__unified::-webkit-scrollbar-corner {
-  background: rgba(8, 12, 17, 0.72);
-}
-
 .terminal-session__screen .xterm {
   height: 100%;
 }
 
 .terminal-session__screen .xterm-viewport {
   background: transparent !important;
-  scrollbar-color: rgba(88, 102, 124, 0.44) rgba(8, 12, 17, 0.72);
-}
-
-.note-tab__input,
-.note-tab__preview {
-  scrollbar-color: rgba(88, 102, 124, 0.44) rgba(8, 12, 17, 0.72);
+  scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track);
 }
 
 .terminal-session__screen .xterm-screen canvas {

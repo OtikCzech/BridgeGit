@@ -1,0 +1,174 @@
+<svg width="1280" height="640" viewBox="0 0 1280 640" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <!-- Background -->
+  <rect width="1280" height="640" fill="#070A0E"/>
+
+  <!-- Window frame -->
+  <rect x="80" y="40" width="1120" height="560" rx="12" fill="#0D1117" stroke="#21262D" stroke-width="2"/>
+
+  <!-- Title bar -->
+  <rect x="80" y="40" width="1120" height="38" rx="12" fill="#161B22"/>
+  <rect x="80" y="66" width="1120" height="12" fill="#161B22"/>
+
+  <!-- Window controls -->
+  <circle cx="106" cy="59" r="6" fill="#FF5F57"/>
+  <circle cx="126" cy="59" r="6" fill="#FEBC2E"/>
+  <circle cx="146" cy="59" r="6" fill="#28C840"/>
+
+  <!-- Title bar text -->
+  <text x="640" y="64" font-family="'Segoe UI', sans-serif" font-size="13" font-weight="600" fill="#8B949E" text-anchor="middle">BridgeGit — myproject</text>
+
+  <!-- Left panel: Repo Panel -->
+  <rect x="82" y="78" width="240" height="482" fill="#0D1117"/>
+  <rect x="322" y="78" width="1" height="482" fill="#21262D"/>
+
+  <!-- Repo panel header -->
+  <rect x="82" y="78" width="240" height="32" fill="#161B22"/>
+  <text x="100" y="99" font-family="'Segoe UI', sans-serif" font-size="12" font-weight="600" fill="#E6EDF3">Repository</text>
+
+  <!-- Branch badge -->
+  <rect x="100" y="120" width="80" height="22" rx="11" fill="#1A3A2A"/>
+  <text x="117" y="135" font-family="'Cascadia Code', monospace" font-size="11" fill="#3FB950">main</text>
+  <circle cx="112" cy="131" r="4" fill="#3FB950"/>
+
+  <!-- Section: Modified files -->
+  <text x="100" y="165" font-family="'Segoe UI', sans-serif" font-size="11" font-weight="600" fill="#8B949E" letter-spacing="0.5">MODIFIED</text>
+
+  <!-- File entries -->
+  <rect x="88" y="174" width="228" height="26" rx="4" fill="#1A2332"/>
+  <text x="118" y="191" font-family="'Cascadia Code', monospace" font-size="11" fill="#E6EDF3">App.vue</text>
+  <text x="100" y="191" font-family="'Cascadia Code', monospace" font-size="11" fill="#D29922">M</text>
+  <text x="290" y="191" font-family="'Cascadia Code', monospace" font-size="10" fill="#8B949E" text-anchor="end">+24 -8</text>
+
+  <rect x="88" y="204" width="228" height="26" rx="4" fill="transparent"/>
+  <text x="118" y="221" font-family="'Cascadia Code', monospace" font-size="11" fill="#8B949E">useSession.ts</text>
+  <text x="100" y="221" font-family="'Cascadia Code', monospace" font-size="11" fill="#D29922">M</text>
+
+  <rect x="88" y="234" width="228" height="26" rx="4" fill="transparent"/>
+  <text x="118" y="251" font-family="'Cascadia Code', monospace" font-size="11" fill="#8B949E">main.scss</text>
+  <text x="100" y="251" font-family="'Cascadia Code', monospace" font-size="11" fill="#D29922">M</text>
+
+  <!-- Section: Untracked -->
+  <text x="100" y="290" font-family="'Segoe UI', sans-serif" font-size="11" font-weight="600" fill="#8B949E" letter-spacing="0.5">UNTRACKED</text>
+
+  <rect x="88" y="299" width="228" height="26" rx="4" fill="transparent"/>
+  <text x="118" y="316" font-family="'Cascadia Code', monospace" font-size="11" fill="#8B949E">NoteTabView.vue</text>
+  <text x="100" y="316" font-family="'Cascadia Code', monospace" font-size="11" fill="#3FB950">A</text>
+
+  <!-- Section: Staged -->
+  <text x="100" y="355" font-family="'Segoe UI', sans-serif" font-size="11" font-weight="600" fill="#8B949E" letter-spacing="0.5">STAGED</text>
+
+  <rect x="88" y="364" width="228" height="26" rx="4" fill="transparent"/>
+  <text x="118" y="381" font-family="'Cascadia Code', monospace" font-size="11" fill="#8B949E">RepoPanel.vue</text>
+  <text x="100" y="381" font-family="'Cascadia Code', monospace" font-size="11" fill="#3FB950">M</text>
+
+  <!-- Commit button -->
+  <rect x="100" y="420" width="204" height="32" rx="6" fill="#238636"/>
+  <text x="202" y="441" font-family="'Segoe UI', sans-serif" font-size="13" font-weight="600" fill="#FFFFFF" text-anchor="middle">Commit</text>
+
+  <!-- Center panel: Diff Viewer -->
+  <rect x="323" y="78" width="876" height="310" fill="#0D1117"/>
+  <rect x="323" y="388" width="876" height="1" fill="#21262D"/>
+
+  <!-- Diff header -->
+  <rect x="323" y="78" width="876" height="32" fill="#161B22"/>
+  <text x="341" y="99" font-family="'Cascadia Code', monospace" font-size="12" font-weight="600" fill="#E6EDF3">App.vue</text>
+  <text x="440" y="99" font-family="'Cascadia Code', monospace" font-size="11" fill="#8B949E">+24 -8</text>
+
+  <!-- Diff content - line numbers + code -->
+  <!-- Unchanged line -->
+  <text x="340" y="128" font-family="'Cascadia Code', monospace" font-size="11" fill="#484F58">142</text>
+  <text x="380" y="128" font-family="'Cascadia Code', monospace" font-size="11" fill="#8B949E">&lt;template&gt;</text>
+
+  <text x="340" y="146" font-family="'Cascadia Code', monospace" font-size="11" fill="#484F58">143</text>
+  <text x="380" y="146" font-family="'Cascadia Code', monospace" font-size="11" fill="#8B949E">  &lt;div class="app-layout"&gt;</text>
+
+  <!-- Removed line -->
+  <rect x="330" y="151" width="860" height="18" fill="#3D1F20"/>
+  <text x="340" y="164" font-family="'Cascadia Code', monospace" font-size="11" fill="#FF7B72">144</text>
+  <text x="373" y="164" font-family="'Cascadia Code', monospace" font-size="11" fill="#FF7B72">-    &lt;RepoPanel :repo="currentRepo" /&gt;</text>
+
+  <!-- Added lines -->
+  <rect x="330" y="169" width="860" height="18" fill="#1A2E1A"/>
+  <text x="340" y="182" font-family="'Cascadia Code', monospace" font-size="11" fill="#3FB950">144</text>
+  <text x="373" y="182" font-family="'Cascadia Code', monospace" font-size="11" fill="#3FB950">+    &lt;RepoPanel</text>
+
+  <rect x="330" y="187" width="860" height="18" fill="#1A2E1A"/>
+  <text x="340" y="200" font-family="'Cascadia Code', monospace" font-size="11" fill="#3FB950">145</text>
+  <text x="373" y="200" font-family="'Cascadia Code', monospace" font-size="11" fill="#3FB950">+      :repo="currentRepo"</text>
+
+  <rect x="330" y="205" width="860" height="18" fill="#1A2E1A"/>
+  <text x="340" y="218" font-family="'Cascadia Code', monospace" font-size="11" fill="#3FB950">146</text>
+  <text x="373" y="218" font-family="'Cascadia Code', monospace" font-size="11" fill="#3FB950">+      :session="session"</text>
+
+  <rect x="330" y="223" width="860" height="18" fill="#1A2E1A"/>
+  <text x="340" y="236" font-family="'Cascadia Code', monospace" font-size="11" fill="#3FB950">147</text>
+  <text x="373" y="236" font-family="'Cascadia Code', monospace" font-size="11" fill="#3FB950">+      @commit="handleCommit"</text>
+
+  <rect x="330" y="241" width="860" height="18" fill="#1A2E1A"/>
+  <text x="340" y="254" font-family="'Cascadia Code', monospace" font-size="11" fill="#3FB950">148</text>
+  <text x="373" y="254" font-family="'Cascadia Code', monospace" font-size="11" fill="#3FB950">+    /&gt;</text>
+
+  <!-- More unchanged -->
+  <text x="340" y="272" font-family="'Cascadia Code', monospace" font-size="11" fill="#484F58">149</text>
+  <text x="380" y="272" font-family="'Cascadia Code', monospace" font-size="11" fill="#8B949E">    &lt;DiffViewer :file="selectedFile" /&gt;</text>
+
+  <text x="340" y="290" font-family="'Cascadia Code', monospace" font-size="11" fill="#484F58">150</text>
+  <text x="380" y="290" font-family="'Cascadia Code', monospace" font-size="11" fill="#8B949E">    &lt;TerminalPanel ref="terminal" /&gt;</text>
+
+  <!-- Diff scrollbar hint -->
+  <rect x="1186" y="115" width="4" height="60" rx="2" fill="#39C1FF" opacity="0.3"/>
+
+  <!-- Bottom panel: Terminal -->
+  <rect x="323" y="389" width="876" height="171" fill="#0D1117"/>
+
+  <!-- Terminal tabs -->
+  <rect x="323" y="389" width="876" height="30" fill="#161B22"/>
+  <rect x="330" y="393" width="100" height="22" rx="4" fill="#0D1117"/>
+  <text x="350" y="408" font-family="'Cascadia Code', monospace" font-size="11" fill="#39C1FF">PowerShell</text>
+  <rect x="436" y="393" width="70" height="22" rx="4" fill="transparent"/>
+  <text x="453" y="408" font-family="'Cascadia Code', monospace" font-size="11" fill="#484F58">bash</text>
+
+  <!-- Terminal content -->
+  <text x="340" y="440" font-family="'Cascadia Code', monospace" font-size="12" fill="#39C1FF">PS C:\www\myproject&gt;</text>
+  <text x="545" y="440" font-family="'Cascadia Code', monospace" font-size="12" fill="#E6EDF3"> git status</text>
+
+  <text x="340" y="460" font-family="'Cascadia Code', monospace" font-size="12" fill="#8B949E">On branch main</text>
+  <text x="340" y="478" font-family="'Cascadia Code', monospace" font-size="12" fill="#8B949E">Changes not staged for commit:</text>
+  <text x="340" y="496" font-family="'Cascadia Code', monospace" font-size="12" fill="#D29922">  modified:   src/renderer/App.vue</text>
+  <text x="340" y="514" font-family="'Cascadia Code', monospace" font-size="12" fill="#3FB950">  added:      src/components/NoteTabView.vue</text>
+
+  <text x="340" y="540" font-family="'Cascadia Code', monospace" font-size="12" fill="#39C1FF">PS C:\www\myproject&gt;</text>
+  <rect x="545" y="530" width="8" height="15" fill="#39C1FF" opacity="0.7"/>
+
+  <!-- Status bar -->
+  <rect x="82" y="560" width="1116" height="38" rx="0" fill="#161B22"/>
+  <rect x="80" y="586" width="1120" height="14" rx="0 0 12 12" fill="#161B22"/>
+
+  <!-- Status bar content -->
+  <circle cx="106" cy="575" r="5" fill="#3FB950"/>
+  <text x="118" y="580" font-family="'Cascadia Code', monospace" font-size="11" fill="#8B949E">main</text>
+  <text x="180" y="580" font-family="'Segoe UI', sans-serif" font-size="11" fill="#484F58">|</text>
+  <text x="196" y="580" font-family="'Cascadia Code', monospace" font-size="11" fill="#8B949E">C:\www\myproject</text>
+  <text x="380" y="580" font-family="'Segoe UI', sans-serif" font-size="11" fill="#484F58">|</text>
+  <text x="396" y="580" font-family="'Cascadia Code', monospace" font-size="11" fill="#D29922">3 modified</text>
+  <text x="490" y="580" font-family="'Cascadia Code', monospace" font-size="11" fill="#3FB950">1 staged</text>
+
+  <!-- BridgeGit branding - bottom right -->
+  <text x="1080" y="580" font-family="'Segoe UI', sans-serif" font-size="13" font-weight="700" fill="#39C1FF">BridgeGit</text>
+  <text x="1155" y="580" font-family="'Segoe UI', sans-serif" font-size="11" fill="#484F58">v0.1.0</text>
+
+  <!-- Logo small - top right area -->
+  <g transform="translate(1130, 5) scale(0.12)">
+    <rect width="256" height="256" rx="56" fill="#0D1117" stroke="#21262D" stroke-width="8"/>
+    <rect x="28" y="28" width="200" height="200" rx="40" stroke="#39C1FF" stroke-width="12"/>
+    <rect x="58" y="92" width="24" height="92" rx="8" fill="#39C1FF"/>
+    <rect x="174" y="92" width="24" height="92" rx="8" fill="#39C1FF"/>
+    <path d="M82 102C101 72 155 72 174 102V126H82V102Z" fill="#39C1FF"/>
+    <path d="M82 128H174" stroke="#0D1117" stroke-width="10" stroke-linecap="round"/>
+    <path d="M74 172H182" stroke="#8BE0FF" stroke-width="10" stroke-linecap="round"/>
+    <circle cx="78" cy="172" r="13" fill="#FF9B54"/>
+    <circle cx="128" cy="172" r="13" fill="#FF9B54"/>
+    <circle cx="178" cy="172" r="13" fill="#FF9B54"/>
+    <path d="M78 172H128H178" stroke="#FF9B54" stroke-width="6" stroke-linecap="round"/>
+  </g>
+</svg>

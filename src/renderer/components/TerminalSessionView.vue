@@ -3,12 +3,16 @@ import { FitAddon } from '@xterm/addon-fit';
 import { WebLinksAddon } from '@xterm/addon-web-links';
 import { Terminal } from '@xterm/xterm';
 import { nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
-import type { TerminalCommandPreset } from '../../shared/bridgegit';
+import { normalizeShellFontSize, type AppAppearance, type TerminalCommandPreset, type ThemeVariant } from '../../shared/bridgegit';
 import { SHORTCUTS, matchesCommandSlotShortcut, matchesShortcut } from '../shortcuts';
 import { useTerminal } from '../composables/useTerminal';
 
 interface Props {
+  sessionKey: string;
   cwd: string;
+  fontSize: number;
+  appearanceTheme: AppAppearance;
+  appearanceThemeVariant: ThemeVariant;
   active: boolean;
   reconnectToken?: number;
 }
@@ -16,19 +20,29 @@ interface Props {
 const props = defineProps<Props>();
 const emit = defineEmits<{
   activity: [];
+  activate: [];
   input: [data: string];
+  'update:font-size': [fontSize: number];
 }>();
 
 const terminalRoot = ref<HTMLElement | null>(null);
 const copyToast = ref<string | null>(null);
-const { sessionInfo, isStarting, error, exitCode, start, restart, write, resize, dispose } =
-  useTerminal();
-const DEFAULT_TERMINAL_FONT_SIZE = 13;
-const MIN_TERMINAL_FONT_SIZE = 11;
-const MAX_TERMINAL_FONT_SIZE = 22;
+const {
+  sessionInfo,
+  isStarting,
+  error,
+  exitCode,
+  outputBuffer,
+  attach,
+  start,
+  restart,
+  write,
+  resize,
+  dispose,
+} = useTerminal(props.sessionKey);
 const OUTPUT_BUFFER_LIMIT = 12000;
 const DEFAULT_PROMPT_TIMEOUT_MS = 20_000;
-const terminalFontSize = ref(DEFAULT_TERMINAL_FONT_SIZE);
+const terminalFontSize = ref(normalizeShellFontSize(props.fontSize));
 
 interface PromptWaiter {
   pattern: RegExp;
@@ -44,6 +58,8 @@ let resizeObserver: ResizeObserver | null = null;
 let copySelectionTimer: number | null = null;
 let copyToastTimer: number | null = null;
 let lastCopiedSelection: string | null = null;
+let copyInterruptGuardActive = false;
+let suppressActivityUntilInput = true;
 let plainTextBuffer = '';
 let plainTextBufferOffset = 0;
 let activePresetExecutionId = 0;
@@ -67,6 +83,136 @@ const blockedTerminalShortcuts = [
   SHORTCUTS.terminalPreviousTab,
   SHORTCUTS.terminalNextTab,
 ];
+
+function getTerminalTheme(theme: AppAppearance) {
+  if (theme === 'bridgegit-light') {
+    return {
+      background: '#f7fbff',
+      foreground: '#1d2a38',
+      cursor: '#2d7cd8',
+      cursorAccent: '#f7fbff',
+      selectionBackground: 'rgba(45, 124, 216, 0.2)',
+      black: '#1f2935',
+      red: '#c86464',
+      green: '#3f8a5d',
+      yellow: '#b98938',
+      blue: '#2d7cd8',
+      magenta: '#a25bc0',
+      cyan: '#2f8ea0',
+      white: '#d8e2ea',
+      brightBlack: '#7b8a99',
+      brightRed: '#dc7c73',
+      brightGreen: '#69b986',
+      brightYellow: '#d7ae63',
+      brightBlue: '#5ba2f5',
+      brightMagenta: '#c78de1',
+      brightCyan: '#69b5c2',
+      brightWhite: '#ffffff',
+    };
+  }
+
+  if (theme === 'github-dark') {
+    return {
+      background: '#0d1117',
+      foreground: '#c9d1d9',
+      cursor: '#58a6ff',
+      cursorAccent: '#0d1117',
+      selectionBackground: 'rgba(56, 139, 253, 0.26)',
+      black: '#161b22',
+      red: '#ff7b72',
+      green: '#3fb950',
+      yellow: '#d29922',
+      blue: '#58a6ff',
+      magenta: '#bc8cff',
+      cyan: '#39c5cf',
+      white: '#b1bac4',
+      brightBlack: '#6e7681',
+      brightRed: '#ffa198',
+      brightGreen: '#56d364',
+      brightYellow: '#e3b341',
+      brightBlue: '#79c0ff',
+      brightMagenta: '#d2a8ff',
+      brightCyan: '#56d4dd',
+      brightWhite: '#f0f6fc',
+    };
+  }
+
+  if (theme === 'github-light') {
+    return {
+      background: '#ffffff',
+      foreground: '#24292f',
+      cursor: '#0969da',
+      cursorAccent: '#ffffff',
+      selectionBackground: 'rgba(9, 105, 218, 0.2)',
+      black: '#24292f',
+      red: '#cf222e',
+      green: '#116329',
+      yellow: '#9a6700',
+      blue: '#0969da',
+      magenta: '#8250df',
+      cyan: '#1b7c83',
+      white: '#d0d7de',
+      brightBlack: '#6e7781',
+      brightRed: '#ff8182',
+      brightGreen: '#2da44e',
+      brightYellow: '#bf8700',
+      brightBlue: '#218bff',
+      brightMagenta: '#a475f9',
+      brightCyan: '#3192aa',
+      brightWhite: '#f6f8fa',
+    };
+  }
+
+  if (theme === 'nord') {
+    return {
+      background: '#2e3440',
+      foreground: '#d8dee9',
+      cursor: '#88c0d0',
+      cursorAccent: '#2e3440',
+      selectionBackground: 'rgba(129, 161, 193, 0.24)',
+      black: '#3b4252',
+      red: '#bf616a',
+      green: '#a3be8c',
+      yellow: '#ebcb8b',
+      blue: '#81a1c1',
+      magenta: '#b48ead',
+      cyan: '#88c0d0',
+      white: '#e5e9f0',
+      brightBlack: '#4c566a',
+      brightRed: '#d08770',
+      brightGreen: '#b8d6a5',
+      brightYellow: '#f0d49a',
+      brightBlue: '#8fbcbb',
+      brightMagenta: '#c895bf',
+      brightCyan: '#93ccdc',
+      brightWhite: '#eceff4',
+    };
+  }
+
+  return {
+    background: '#04070b',
+    foreground: '#dde4ec',
+    cursor: '#69b2ff',
+    cursorAccent: '#04070b',
+    selectionBackground: 'rgba(105, 178, 255, 0.24)',
+    black: '#0b0f14',
+    red: '#d16969',
+    green: '#4f9b67',
+    yellow: '#d7ba7d',
+    blue: '#69b2ff',
+    magenta: '#c586c0',
+    cyan: '#78c0ff',
+    white: '#d4d4d4',
+    brightBlack: '#6e7681',
+    brightRed: '#f48771',
+    brightGreen: '#8fdbab',
+    brightYellow: '#f2cc8f',
+    brightBlue: '#9dcfff',
+    brightMagenta: '#d8a5ff',
+    brightCyan: '#b5d8ff',
+    brightWhite: '#f5f7fa',
+  };
+}
 
 function focusTerminal() {
   if (props.active) {
@@ -125,6 +271,7 @@ function appendOutputToBuffer(data: string) {
 }
 
 function sendInput(data: string) {
+  suppressActivityUntilInput = false;
   emit('input', data);
   write(data);
 }
@@ -176,7 +323,7 @@ function applyTerminalFontSize(nextFontSize: number) {
     return;
   }
 
-  const clampedFontSize = Math.min(MAX_TERMINAL_FONT_SIZE, Math.max(MIN_TERMINAL_FONT_SIZE, nextFontSize));
+  const clampedFontSize = normalizeShellFontSize(nextFontSize);
 
   if (clampedFontSize === terminalFontSize.value) {
     return;
@@ -184,6 +331,7 @@ function applyTerminalFontSize(nextFontSize: number) {
 
   terminalFontSize.value = clampedFontSize;
   terminal.options.fontSize = clampedFontSize;
+  emit('update:font-size', clampedFontSize);
   fitTerminal();
 }
 
@@ -318,6 +466,28 @@ function isPasteShortcut(event: KeyboardEvent) {
     && event.key.toLowerCase() === 'v';
 }
 
+function isCopyShortcut(event: KeyboardEvent) {
+  return event.type === 'keydown'
+    && (event.ctrlKey || event.metaKey)
+    && !event.altKey
+    && event.key.toLowerCase() === 'c';
+}
+
+function isModifierOnlyKey(event: KeyboardEvent) {
+  return event.key === 'Control'
+    || event.key === 'Shift'
+    || event.key === 'Alt'
+    || event.key === 'Meta';
+}
+
+function clearCopyInterruptGuard() {
+  copyInterruptGuardActive = false;
+}
+
+function armCopyInterruptGuard() {
+  copyInterruptGuardActive = true;
+}
+
 function isSoftLineBreakShortcut(event: KeyboardEvent) {
   return event.ctrlKey && !event.metaKey && !event.altKey && event.key === 'Enter';
 }
@@ -335,6 +505,12 @@ function handleContextMenuPaste(event: MouseEvent) {
 }
 
 function handleTerminalKeydown(event: KeyboardEvent) {
+  emit('activate');
+
+  if (!isModifierOnlyKey(event) && !isCopyShortcut(event)) {
+    clearCopyInterruptGuard();
+  }
+
   if (!isSoftLineBreakShortcut(event)) {
     return;
   }
@@ -343,6 +519,21 @@ function handleTerminalKeydown(event: KeyboardEvent) {
   event.stopPropagation();
   sendInput('\n');
   terminal?.focus();
+}
+
+function handleTerminalPointerdown(event: PointerEvent) {
+  emit('activate');
+
+  if (event.button !== 0) {
+    return;
+  }
+
+  if (copyInterruptGuardActive) {
+    clearCopyInterruptGuard();
+    return;
+  }
+
+  armCopyInterruptGuard();
 }
 
 async function waitForPrompt(
@@ -499,18 +690,10 @@ async function connectTerminal(mode: 'start' | 'restart' = 'start') {
     resetOutputTracking();
   }
 
+  suppressActivityUntilInput = true;
+
   const runner = mode === 'restart' ? restart : start;
-  const session = await runner(options, {
-    onData: ({ data }) => {
-      appendOutputToBuffer(data);
-      terminal?.write(data);
-      emit('activity');
-    },
-    onExit: ({ exitCode: code }) => {
-      rejectPromptWaiters(`Terminal session exited with code ${code}.`);
-      writeStatusLine(`[process exited with code ${code}]`);
-    },
-  });
+  const session = await runner(options);
 
   if (session) {
     await nextTick();
@@ -536,29 +719,7 @@ function initializeTerminal() {
     fontSize: terminalFontSize.value,
     lineHeight: 1.35,
     scrollback: 5000,
-    theme: {
-      background: '#04070b',
-      foreground: '#dde4ec',
-      cursor: '#69b2ff',
-      cursorAccent: '#04070b',
-      selectionBackground: 'rgba(105, 178, 255, 0.24)',
-      black: '#0b0f14',
-      red: '#d16969',
-      green: '#4f9b67',
-      yellow: '#d7ba7d',
-      blue: '#69b2ff',
-      magenta: '#c586c0',
-      cyan: '#78c0ff',
-      white: '#d4d4d4',
-      brightBlack: '#6e7681',
-      brightRed: '#f48771',
-      brightGreen: '#8fdbab',
-      brightYellow: '#f2cc8f',
-      brightBlue: '#9dcfff',
-      brightMagenta: '#d8a5ff',
-      brightCyan: '#b5d8ff',
-      brightWhite: '#f5f7fa',
-    },
+    theme: getTerminalTheme(props.appearanceTheme),
   });
 
   fitAddon = new FitAddon();
@@ -570,6 +731,17 @@ function initializeTerminal() {
       event.stopPropagation();
       void pasteTextFromClipboard();
       return false;
+    }
+
+    if (isCopyShortcut(event) && copyInterruptGuardActive) {
+      event.preventDefault();
+      event.stopPropagation();
+      showCopyToast('Ctrl+C blocked during mouse selection');
+      return false;
+    }
+
+    if (!isModifierOnlyKey(event) && !isCopyShortcut(event)) {
+      clearCopyInterruptGuard();
     }
 
     if (isCommandSlotShortcut(event)) {
@@ -605,6 +777,7 @@ function initializeTerminal() {
   });
 
   resizeObserver.observe(terminalRoot.value);
+  terminalRoot.value.addEventListener('pointerdown', handleTerminalPointerdown, true);
   terminalRoot.value.addEventListener('pointerup', scheduleSelectionCopy);
   terminalRoot.value.addEventListener('keyup', scheduleSelectionCopy);
   terminalRoot.value.addEventListener('keydown', handleTerminalKeydown, true);
@@ -615,6 +788,26 @@ function initializeTerminal() {
 
 onMounted(async () => {
   initializeTerminal();
+  attach({
+    onData: ({ data }) => {
+      appendOutputToBuffer(data);
+      terminal?.write(data);
+
+      if (!suppressActivityUntilInput) {
+        emit('activity');
+      }
+    },
+    onExit: ({ exitCode: code }) => {
+      rejectPromptWaiters(`Terminal session exited with code ${code}.`);
+      writeStatusLine(`[process exited with code ${code}]`);
+    },
+  });
+
+  if (outputBuffer.value) {
+    terminal?.write(outputBuffer.value);
+    appendOutputToBuffer(outputBuffer.value);
+  }
+
   await connectTerminal();
 });
 
@@ -643,6 +836,37 @@ watch(
 );
 
 watch(
+  () => props.fontSize,
+  (nextFontSize) => {
+    const normalizedFontSize = normalizeShellFontSize(nextFontSize);
+
+    if (normalizedFontSize === terminalFontSize.value) {
+      return;
+    }
+
+    terminalFontSize.value = normalizedFontSize;
+
+    if (!terminal) {
+      return;
+    }
+
+    terminal.options.fontSize = normalizedFontSize;
+    fitTerminal();
+  },
+);
+
+watch(
+  () => props.appearanceTheme,
+  (nextTheme) => {
+    if (!terminal) {
+      return;
+    }
+
+    terminal.options.theme = getTerminalTheme(nextTheme);
+  },
+);
+
+watch(
   () => props.reconnectToken,
   async (nextToken, previousToken) => {
     if (!terminal || !nextToken || nextToken === previousToken) {
@@ -663,6 +887,7 @@ onBeforeUnmount(() => {
   }
 
   terminalRoot.value?.removeEventListener('pointerup', scheduleSelectionCopy);
+  terminalRoot.value?.removeEventListener('pointerdown', handleTerminalPointerdown, true);
   terminalRoot.value?.removeEventListener('keyup', scheduleSelectionCopy);
   terminalRoot.value?.removeEventListener('keydown', handleTerminalKeydown, true);
   terminalRoot.value?.removeEventListener('wheel', handleWheelZoom, terminalWheelListenerOptions);
@@ -676,7 +901,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <section class="terminal-session">
+  <section class="terminal-session" :data-appearance-theme="appearanceTheme">
     <div v-if="error" class="terminal-session__notice terminal-session__notice--error">
       {{ error }}
     </div>
@@ -699,12 +924,44 @@ onBeforeUnmount(() => {
 
 <style scoped lang="scss">
 .terminal-session {
+  --terminal-screen-bg:
+    radial-gradient(circle at top right, rgba(110, 197, 255, 0.12), transparent 30%),
+    rgba(4, 7, 11, 0.95);
+  --terminal-toast-bg: rgba(8, 12, 17, 0.98);
   display: flex;
   flex-direction: column;
   gap: 8px;
   height: 100%;
   min-height: 0;
   padding: 7px;
+}
+
+.terminal-session[data-appearance-theme='bridgegit-light'] {
+  --terminal-screen-bg:
+    radial-gradient(circle at top right, rgba(45, 124, 216, 0.08), transparent 30%),
+    rgba(247, 251, 255, 0.98);
+  --terminal-toast-bg: rgba(255, 255, 255, 0.98);
+}
+
+.terminal-session[data-appearance-theme='github-dark'] {
+  --terminal-screen-bg:
+    radial-gradient(circle at top right, rgba(56, 139, 253, 0.1), transparent 30%),
+    rgba(13, 17, 23, 0.98);
+  --terminal-toast-bg: rgba(22, 27, 34, 0.98);
+}
+
+.terminal-session[data-appearance-theme='github-light'] {
+  --terminal-screen-bg:
+    radial-gradient(circle at top right, rgba(9, 105, 218, 0.08), transparent 30%),
+    rgba(255, 255, 255, 0.98);
+  --terminal-toast-bg: rgba(255, 255, 255, 0.98);
+}
+
+.terminal-session[data-appearance-theme='nord'] {
+  --terminal-screen-bg:
+    radial-gradient(circle at top right, rgba(136, 192, 208, 0.1), transparent 30%),
+    rgba(46, 52, 64, 0.98);
+  --terminal-toast-bg: rgba(59, 66, 82, 0.98);
 }
 
 .terminal-session__notice {
@@ -742,9 +999,7 @@ onBeforeUnmount(() => {
   border-bottom: 0;
   border-left: 0;
   border-radius: 0;
-  background:
-    radial-gradient(circle at top right, rgba(110, 197, 255, 0.12), transparent 30%),
-    rgba(4, 7, 11, 0.95);
+  background: var(--terminal-screen-bg);
 }
 
 .terminal-session__toast {
@@ -755,7 +1010,7 @@ onBeforeUnmount(() => {
   padding: 0.42rem 0.72rem;
   border: 1px solid rgba(110, 197, 255, 0.26);
   border-radius: 10px;
-  background: rgba(8, 12, 17, 0.98);
+  background: var(--terminal-toast-bg);
   box-shadow: 0 12px 30px rgba(0, 0, 0, 0.28);
   color: #f2f8ff;
   font-size: 0.76rem;

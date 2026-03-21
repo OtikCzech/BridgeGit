@@ -1,6 +1,8 @@
 import { ref } from 'vue';
 import type {
   BranchSummary,
+  GitChange,
+  GitDiffMode,
   GitLogEntry,
   GitLogResult,
   GitStatusSummary,
@@ -9,6 +11,19 @@ import type {
 interface RefreshOptions {
   reloadDiff?: boolean;
   silent?: boolean;
+}
+
+interface SetRepoPathOptions {
+  loadMode?: 'branches' | 'full';
+}
+
+interface SelectFileOptions {
+  diffMode?: GitDiffMode;
+}
+
+interface RepoStateCacheEntry {
+  status: GitStatusSummary;
+  branches: BranchSummary;
 }
 
 const HISTORY_LIMIT = 120;
@@ -27,6 +42,7 @@ export function useGit() {
   const branches = ref<BranchSummary | null>(null);
   const log = ref<GitLogResult | null>(null);
   const selectedPath = ref<string | null>(null);
+  const selectedDiffMode = ref<GitDiffMode>('working-tree');
   const selectedCommit = ref<GitLogEntry | null>(null);
   const diff = ref('');
   const commitDiff = ref('');
@@ -36,9 +52,38 @@ export function useGit() {
   const commitDiffError = ref<string | null>(null);
   const isLoadingCommitDiff = ref(false);
   const isRefreshing = ref(false);
-
   let pollTimer: number | null = null;
   let refreshInFlight = false;
+  let repoRequestVersion = 0;
+  const repoStateCache = new Map<string, RepoStateCacheEntry>();
+
+  function createRepoRequestSnapshot(expectedRepoPath: string | null = repoPath.value) {
+    return {
+      repoPath: expectedRepoPath,
+      version: repoRequestVersion,
+    };
+  }
+
+  function isRepoRequestCurrent(request: { repoPath: string | null; version: number }) {
+    return request.version === repoRequestVersion && request.repoPath === repoPath.value;
+  }
+
+  function cloneStatusSummary(nextStatus: GitStatusSummary): GitStatusSummary {
+    return {
+      ...nextStatus,
+      staged: nextStatus.staged.map((item) => ({ ...item })),
+      unstaged: nextStatus.unstaged.map((item) => ({ ...item })),
+      untracked: nextStatus.untracked.map((item) => ({ ...item })),
+      conflicted: nextStatus.conflicted.map((item) => ({ ...item })),
+    };
+  }
+
+  function cloneBranchSummary(nextBranches: BranchSummary): BranchSummary {
+    return {
+      ...nextBranches,
+      all: nextBranches.all.map((item) => ({ ...item })),
+    };
+  }
 
   function clearCommitDiffState() {
     selectedCommit.value = null;
@@ -52,8 +97,36 @@ export function useGit() {
     branches.value = null;
     log.value = null;
     selectedPath.value = null;
+    selectedDiffMode.value = 'working-tree';
     diff.value = '';
     clearCommitDiffState();
+  }
+
+  function resolveDiffMode(
+    filePath: string,
+    nextStatus: GitStatusSummary | null = status.value,
+    preferredMode?: GitDiffMode,
+  ): GitDiffMode {
+    if (preferredMode) {
+      return preferredMode;
+    }
+
+    if (!nextStatus) {
+      return 'working-tree';
+    }
+
+    const hasWorkingTreeChange = [
+      ...nextStatus.unstaged,
+      ...nextStatus.untracked,
+      ...nextStatus.conflicted,
+    ].some((item) => item.path === filePath);
+
+    if (hasWorkingTreeChange) {
+      return 'working-tree';
+    }
+
+    const hasStagedChange = nextStatus.staged.some((item) => item.path === filePath);
+    return hasStagedChange ? 'staged' : 'working-tree';
   }
 
   function selectedPathExists(nextStatus: GitStatusSummary | null): boolean {
@@ -72,7 +145,9 @@ export function useGit() {
   }
 
   async function refresh(options: RefreshOptions = {}) {
-    if (!repoPath.value || !window.bridgegit?.git) {
+    const request = createRepoRequestSnapshot();
+
+    if (!request.repoPath || !window.bridgegit?.git) {
       clearState();
       return;
     }
@@ -91,12 +166,20 @@ export function useGit() {
 
     try {
       const [nextStatus, nextBranches] = await Promise.all([
-        window.bridgegit.git.status(repoPath.value),
-        window.bridgegit.git.branches(repoPath.value),
+        window.bridgegit.git.status(request.repoPath),
+        window.bridgegit.git.branches(request.repoPath),
       ]);
+
+      if (!isRepoRequestCurrent(request)) {
+        return;
+      }
 
       status.value = nextStatus;
       branches.value = nextBranches;
+      repoStateCache.set(request.repoPath, {
+        status: cloneStatusSummary(nextStatus),
+        branches: cloneBranchSummary(nextBranches),
+      });
       error.value = null;
 
       const shouldReloadDiff = options.reloadDiff ?? true;
@@ -108,29 +191,103 @@ export function useGit() {
       }
 
       if (shouldReloadDiff && selectedPath.value) {
-        diff.value = await window.bridgegit.git.diff(repoPath.value, selectedPath.value);
+        const nextSelectedDiffMode = resolveDiffMode(selectedPath.value, nextStatus, selectedDiffMode.value);
+        const nextDiff = await window.bridgegit.git.diff(
+          request.repoPath,
+          selectedPath.value,
+          nextSelectedDiffMode,
+        );
+
+        if (!isRepoRequestCurrent(request)) {
+          return;
+        }
+
+        selectedDiffMode.value = nextSelectedDiffMode;
+        diff.value = nextDiff;
       }
     } catch (nextError) {
+      if (!isRepoRequestCurrent(request)) {
+        return;
+      }
+
+      clearState();
       error.value = toErrorMessage(nextError);
     } finally {
-      refreshInFlight = false;
-      isRefreshing.value = false;
-      isLoading.value = false;
+      if (isRepoRequestCurrent(request)) {
+        refreshInFlight = false;
+        isRefreshing.value = false;
+        isLoading.value = false;
+      } else {
+        refreshInFlight = false;
+      }
     }
   }
 
-  async function setRepoPath(nextRepoPath: string | null) {
-    repoPath.value = nextRepoPath;
-    log.value = null;
-    error.value = null;
-    selectedPath.value = null;
-    diff.value = '';
-    clearCommitDiffState();
+  async function loadBranchesOnly(nextRepoPath: string) {
+    if (!window.bridgegit?.git) {
+      return;
+    }
 
+    const request = createRepoRequestSnapshot(nextRepoPath);
+    isLoading.value = true;
+
+    try {
+      const nextBranches = await window.bridgegit.git.branches(nextRepoPath);
+
+      if (!isRepoRequestCurrent(request)) {
+        return;
+      }
+
+      branches.value = nextBranches;
+      error.value = null;
+    } catch (nextError) {
+      if (!isRepoRequestCurrent(request)) {
+        return;
+      }
+
+      branches.value = null;
+      error.value = toErrorMessage(nextError);
+    } finally {
+      if (isRepoRequestCurrent(request)) {
+        isLoading.value = false;
+      }
+    }
+  }
+
+  async function setRepoPath(nextRepoPath: string | null, options: SetRepoPathOptions = {}) {
+    repoRequestVersion += 1;
+    repoPath.value = nextRepoPath;
     stopPolling();
+    clearState();
+    refreshInFlight = false;
+    isLoading.value = false;
+    isRefreshing.value = false;
+    isLoadingLog.value = false;
+    isLoadingCommitDiff.value = false;
+    error.value = null;
 
     if (!nextRepoPath) {
-      clearState();
+      return;
+    }
+
+    const loadMode = options.loadMode ?? 'full';
+    const cachedRepoState = repoStateCache.get(nextRepoPath);
+
+    if (loadMode === 'branches') {
+      if (cachedRepoState) {
+        branches.value = cloneBranchSummary(cachedRepoState.branches);
+        return;
+      }
+
+      await loadBranchesOnly(nextRepoPath);
+      return;
+    }
+
+    if (cachedRepoState) {
+      status.value = cloneStatusSummary(cachedRepoState.status);
+      branches.value = cloneBranchSummary(cachedRepoState.branches);
+      startPolling();
+      void refresh({ reloadDiff: false, silent: true });
       return;
     }
 
@@ -138,23 +295,56 @@ export function useGit() {
     startPolling();
   }
 
-  async function selectFile(filePath: string) {
+  async function ensureFullStatus() {
+    if (!repoPath.value) {
+      return;
+    }
+
+    if (status.value && branches.value) {
+      startPolling();
+      return;
+    }
+
+    await refresh({ reloadDiff: false });
+    startPolling();
+  }
+
+  async function selectFile(filePath: string, options: SelectFileOptions = {}) {
     if (!repoPath.value || !window.bridgegit?.git) {
       return;
     }
 
+    const request = createRepoRequestSnapshot();
+    const nextSelectedDiffMode = resolveDiffMode(filePath, status.value, options.diffMode);
     selectedPath.value = filePath;
+    selectedDiffMode.value = nextSelectedDiffMode;
     clearCommitDiffState();
     isLoading.value = true;
 
     try {
-      diff.value = await window.bridgegit.git.diff(repoPath.value, filePath);
+      const nextDiff = await window.bridgegit.git.diff(
+        request.repoPath!,
+        filePath,
+        nextSelectedDiffMode,
+      );
+
+      if (!isRepoRequestCurrent(request)) {
+        return;
+      }
+
+      diff.value = nextDiff;
       error.value = null;
     } catch (nextError) {
+      if (!isRepoRequestCurrent(request)) {
+        return;
+      }
+
       diff.value = '';
       error.value = toErrorMessage(nextError);
     } finally {
-      isLoading.value = false;
+      if (isRepoRequestCurrent(request)) {
+        isLoading.value = false;
+      }
     }
   }
 
@@ -185,6 +375,42 @@ export function useGit() {
 
     try {
       await window.bridgegit.git.unstage(repoPath.value, files);
+      error.value = null;
+      await refresh();
+    } catch (nextError) {
+      error.value = toErrorMessage(nextError);
+    } finally {
+      isLoading.value = false;
+    }
+  }
+
+  async function discardFile(change: GitChange) {
+    if (!repoPath.value || !window.bridgegit?.git) {
+      return;
+    }
+
+    isLoading.value = true;
+
+    try {
+      await window.bridgegit.git.discard(repoPath.value, change);
+      error.value = null;
+      await refresh();
+    } catch (nextError) {
+      error.value = toErrorMessage(nextError);
+    } finally {
+      isLoading.value = false;
+    }
+  }
+
+  async function discardHunk(patch: string, mode: GitDiffMode = selectedDiffMode.value) {
+    if (!repoPath.value || !window.bridgegit?.git) {
+      return;
+    }
+
+    isLoading.value = true;
+
+    try {
+      await window.bridgegit.git.discardHunk(repoPath.value, patch, mode);
       error.value = null;
       await refresh();
     } catch (nextError) {
@@ -239,22 +465,35 @@ export function useGit() {
       return;
     }
 
+    const request = createRepoRequestSnapshot();
     selectedCommit.value = commit;
     commitDiff.value = '';
     commitDiffError.value = null;
     isLoadingCommitDiff.value = true;
 
     try {
-      commitDiff.value = await window.bridgegit.git.commitDiff(
-        repoPath.value,
+      const nextCommitDiff = await window.bridgegit.git.commitDiff(
+        request.repoPath!,
         commit.hash,
         commit.parentHashes[0] ?? null,
       );
+
+      if (!isRepoRequestCurrent(request)) {
+        return;
+      }
+
+      commitDiff.value = nextCommitDiff;
     } catch (nextError) {
+      if (!isRepoRequestCurrent(request)) {
+        return;
+      }
+
       commitDiff.value = '';
       commitDiffError.value = toErrorMessage(nextError);
     } finally {
-      isLoadingCommitDiff.value = false;
+      if (isRepoRequestCurrent(request)) {
+        isLoadingCommitDiff.value = false;
+      }
     }
   }
 
@@ -295,18 +534,30 @@ export function useGit() {
       return null;
     }
 
+    const request = createRepoRequestSnapshot();
     isLoadingLog.value = true;
 
     try {
-      const nextLog = await window.bridgegit.git.log(repoPath.value, limit);
+      const nextLog = await window.bridgegit.git.log(request.repoPath!, limit);
+
+      if (!isRepoRequestCurrent(request)) {
+        return null;
+      }
+
       log.value = nextLog;
       error.value = null;
       return nextLog;
     } catch (nextError) {
+      if (!isRepoRequestCurrent(request)) {
+        return null;
+      }
+
       error.value = toErrorMessage(nextError);
       return null;
     } finally {
-      isLoadingLog.value = false;
+      if (isRepoRequestCurrent(request)) {
+        isLoadingLog.value = false;
+      }
     }
   }
 
@@ -316,6 +567,7 @@ export function useGit() {
     branches,
     log,
     selectedPath,
+    selectedDiffMode,
     selectedCommit,
     diff,
     commitDiff,
@@ -328,11 +580,14 @@ export function useGit() {
     refresh,
     loadLog,
     setRepoPath,
+    ensureFullStatus,
     selectFile,
     openCommitDiff,
     clearCommitDiff,
     stageFiles,
     unstageFiles,
+    discardFile,
+    discardHunk,
     commitChanges,
     checkoutBranch,
     dispose,

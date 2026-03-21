@@ -1,7 +1,7 @@
 {
   "name": "bridgegit",
-  "version": "0.1.0",
-  "description": "Desktop Git workspace with repository tree, diff, shell terminal, and markdown notes.",
+  "version": "0.2.0",
+  "description": "Git GUI + PowerShell terminal desktop app",
   "main": "dist/main/index.js",
   "scripts": {
     "dev": "node scripts/dev.mjs",
@@ -11,7 +11,7 @@
     "dist:linux": "npm run build && electron-builder --linux AppImage",
     "rebuild:native": "electron-rebuild -f -w node-pty",
     "postinstall": "npm run rebuild:native",
-    "start": "electron .",
+    "start": "node scripts/start.mjs",
     "test": "echo \"No tests yet\" && exit 0"
   },
   "keywords": [
@@ -26,7 +26,28 @@
   "author": "",
   "license": "MIT",
   "dependencies": {
+    "@babel/runtime": "^7.29.2",
+    "@codemirror/commands": "^6.10.3",
+    "@codemirror/lang-css": "^6.3.1",
+    "@codemirror/lang-html": "^6.4.11",
+    "@codemirror/lang-javascript": "^6.2.5",
+    "@codemirror/lang-json": "^6.0.2",
+    "@codemirror/lang-php": "^6.0.2",
+    "@codemirror/lang-sass": "^6.0.2",
+    "@codemirror/lang-sql": "^6.10.0",
+    "@codemirror/lang-vue": "^0.1.3",
+    "@codemirror/lang-xml": "^6.1.0",
+    "@codemirror/lang-yaml": "^6.1.2",
+    "@codemirror/language": "^6.12.2",
+    "@codemirror/legacy-modes": "^6.5.2",
+    "@codemirror/search": "^6.6.0",
+    "@codemirror/state": "^6.6.0",
+    "@codemirror/view": "^6.40.0",
+    "@lezer/highlight": "^1.2.3",
+    "@uiw/codemirror-theme-github": "^4.25.8",
+    "@uiw/codemirror-theme-nord": "^4.25.8",
     "electron-store": "^11.0.2",
+    "mermaid": "^11.13.0",
     "node-pty": "^1.1.0",
     "simple-git": "^3.33.0"
   },

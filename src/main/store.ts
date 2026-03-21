@@ -1,16 +1,30 @@
 import {
   DEFAULT_SESSION_DATA,
+  DEFAULT_PANEL_LAYOUT,
+  GLOBAL_WORKSPACE_ID,
   GLOBAL_WORKSPACE_SESSION_KEY,
   getDefaultTerminalCommandPresets,
+  normalizeAppAppearance,
+  normalizeEditorTheme,
   normalizeNoteFontSize,
+  normalizeShellFontSize,
+  type PanelLayout,
   type ProjectTitleMode,
   type RecentRepoEntry,
+  type RepoPanelFileListMode,
+  type RepoPanelSectionId,
+  type RepoPanelSectionState,
   type SessionData,
   type TerminalCommandPreset,
   type TerminalCommandStep,
+  type WorktreeDetectionInterval,
+  type WorkspaceTabDefaults,
+  type WorkspaceDescriptor,
+  type WorkspaceDescriptorsById,
+  type WorkspaceRepoPanelState,
   type WorkspaceTabState,
   type WorkspaceSessionState,
-  type WorkspaceSessionsByContext,
+  type WorkspaceSessionsById,
 } from '../shared/bridgegit';
 import { normalizeStoredPath, normalizeTerminalCwd } from './path-utils';
 
@@ -42,6 +56,7 @@ interface PartialWorkspaceShellTabState {
   type?: 'shell';
   title?: string;
   cwd?: string;
+  fontSize?: number;
   launcherProfileId?: string | null;
 }
 
@@ -56,19 +71,55 @@ interface PartialWorkspaceNoteTabState {
   fontSize?: number;
 }
 
-type PartialWorkspaceTabState = PartialWorkspaceShellTabState | PartialWorkspaceNoteTabState;
+interface PartialWorkspaceCodeTabState {
+  id?: string;
+  type?: 'code';
+  title?: string;
+  filePath?: string | null;
+  content?: string;
+  savedContent?: string;
+  fontSize?: number;
+}
+
+type PartialWorkspaceTabState =
+  | PartialWorkspaceShellTabState
+  | PartialWorkspaceNoteTabState
+  | PartialWorkspaceCodeTabState;
 
 interface PartialWorkspaceSessionState {
   tabs?: PartialWorkspaceTabState[];
   activeTabId?: string | null;
 }
 
-interface LegacySessionData extends Partial<Omit<SessionData, 'workspaceSessions'>> {
+interface PartialWorkspaceDescriptor {
+  id?: string;
+  kind?: WorkspaceDescriptor['kind'];
+  repoPath?: string | null;
+}
+
+interface PartialWorkspaceRepoPanelFilesState {
+  expanded?: boolean;
+  viewMode?: RepoPanelFileListMode;
+  showAll?: boolean;
+  collapsedSections?: Partial<Record<RepoPanelSectionId, boolean>>;
+}
+
+interface PartialWorkspaceRepoPanelState {
+  fontSize?: number;
+  historyOpen?: boolean;
+  workspaceDetailExpanded?: boolean;
+  files?: PartialWorkspaceRepoPanelFilesState;
+}
+
+interface LegacySessionData extends Partial<Omit<SessionData, 'workspaceSessions' | 'workspaceDescriptors' | 'panelLayoutsByWorkspace' | 'workspaceRepoPanelStates'>> {
   terminalTabs?: Array<Partial<LegacyTerminalTabState>>;
   workspaceTabs?: PartialWorkspaceTabState[];
   activeWorkspaceTabId?: string | null;
   activeTerminalTabId?: string | null;
   workspaceSessions?: Record<string, PartialWorkspaceSessionState>;
+  workspaceDescriptors?: Record<string, PartialWorkspaceDescriptor>;
+  panelLayoutsByWorkspace?: Record<string, Partial<PanelLayout>>;
+  workspaceRepoPanelStates?: Record<string, PartialWorkspaceRepoPanelState>;
 }
 
 interface SessionStore {
@@ -90,11 +141,72 @@ function getPathLeafName(pathValue: string): string {
 }
 
 function normalizeWorkspaceContextKey(contextKey: string | null | undefined): string {
-  if (!contextKey || contextKey === GLOBAL_WORKSPACE_SESSION_KEY) {
+  const trimmedContextKey = contextKey?.trim();
+
+  if (
+    !trimmedContextKey
+    || trimmedContextKey === GLOBAL_WORKSPACE_SESSION_KEY
+    || trimmedContextKey === GLOBAL_WORKSPACE_ID
+  ) {
     return GLOBAL_WORKSPACE_SESSION_KEY;
   }
 
-  return normalizeStoredPath(contextKey) ?? GLOBAL_WORKSPACE_SESSION_KEY;
+  if (trimmedContextKey.startsWith('workspace:')) {
+    return trimmedContextKey;
+  }
+
+  return normalizeStoredPath(trimmedContextKey) ?? GLOBAL_WORKSPACE_SESSION_KEY;
+}
+
+function buildWorkspaceId(
+  kind: WorkspaceDescriptor['kind'],
+  repoPath: string | null,
+  existingWorkspaceIds: Iterable<string> = [],
+  preferredWorkspaceId?: string | null,
+): string {
+  if (kind === 'global') {
+    return GLOBAL_WORKSPACE_ID;
+  }
+
+  const usedWorkspaceIds = new Set(existingWorkspaceIds);
+  const normalizedRepoPath = normalizeStoredPath(repoPath);
+  const trimmedPreferredWorkspaceId = preferredWorkspaceId?.trim();
+
+  if (
+    trimmedPreferredWorkspaceId
+    && trimmedPreferredWorkspaceId !== GLOBAL_WORKSPACE_ID
+    && !usedWorkspaceIds.has(trimmedPreferredWorkspaceId)
+  ) {
+    return trimmedPreferredWorkspaceId;
+  }
+
+  if (normalizedRepoPath) {
+    const baseWorkspaceId = `workspace:${normalizedRepoPath}`;
+
+    if (!usedWorkspaceIds.has(baseWorkspaceId)) {
+      return baseWorkspaceId;
+    }
+
+    let duplicateIndex = 2;
+    let nextWorkspaceId = `${baseWorkspaceId}#${duplicateIndex}`;
+
+    while (usedWorkspaceIds.has(nextWorkspaceId)) {
+      duplicateIndex += 1;
+      nextWorkspaceId = `${baseWorkspaceId}#${duplicateIndex}`;
+    }
+
+    return nextWorkspaceId;
+  }
+
+  let fallbackIndex = 1;
+  let nextWorkspaceId = `workspace:project:${fallbackIndex}`;
+
+  while (usedWorkspaceIds.has(nextWorkspaceId)) {
+    fallbackIndex += 1;
+    nextWorkspaceId = `workspace:project:${fallbackIndex}`;
+  }
+
+  return nextWorkspaceId;
 }
 
 function normalizeTimestamp(value: string | undefined): string {
@@ -150,9 +262,163 @@ function normalizeRecentRepos(
     .slice(0, 12);
 }
 
+function normalizeWorkspaceOrder(
+  workspaceOrder: string[] | undefined,
+  recentRepos: RecentRepoEntry[],
+  workspaceDescriptors: WorkspaceDescriptorsById,
+): string[] {
+  const orderedWorkspaceIds: string[] = [];
+  const seenWorkspaceIds = new Set<string>();
+  const projectWorkspaceIdsByPath = new Map<string, string>();
+
+  Object.values(workspaceDescriptors).forEach((workspaceDescriptor) => {
+    if (workspaceDescriptor.kind !== 'project' || !workspaceDescriptor.repoPath) {
+      return;
+    }
+
+    projectWorkspaceIdsByPath.set(workspaceDescriptor.repoPath, workspaceDescriptor.id);
+  });
+
+  for (const rawWorkspaceId of workspaceOrder ?? []) {
+    const normalizedWorkspaceId = rawWorkspaceId?.trim();
+
+    if (!normalizedWorkspaceId || seenWorkspaceIds.has(normalizedWorkspaceId) || !workspaceDescriptors[normalizedWorkspaceId]) {
+      continue;
+    }
+
+    seenWorkspaceIds.add(normalizedWorkspaceId);
+    orderedWorkspaceIds.push(normalizedWorkspaceId);
+  }
+
+  for (const repoEntry of recentRepos) {
+    const workspaceId = projectWorkspaceIdsByPath.get(repoEntry.path);
+
+    if (!workspaceId || seenWorkspaceIds.has(workspaceId)) {
+      continue;
+    }
+
+    seenWorkspaceIds.add(workspaceId);
+    orderedWorkspaceIds.push(workspaceId);
+  }
+
+  for (const workspaceDescriptor of Object.values(workspaceDescriptors)) {
+    if (workspaceDescriptor.kind !== 'project' || seenWorkspaceIds.has(workspaceDescriptor.id)) {
+      continue;
+    }
+
+    seenWorkspaceIds.add(workspaceDescriptor.id);
+    orderedWorkspaceIds.push(workspaceDescriptor.id);
+  }
+
+  return orderedWorkspaceIds;
+}
+
+function normalizeWorkspaceDescriptors(
+  workspaceDescriptors: Record<string, PartialWorkspaceDescriptor> | undefined,
+  legacyWorkspaceSessions: Record<string, PartialWorkspaceSessionState> | undefined,
+  recentRepos: RecentRepoEntry[],
+  lastRepoPath: string | null,
+): WorkspaceDescriptorsById {
+  const normalizedDescriptors: WorkspaceDescriptorsById = {
+    [GLOBAL_WORKSPACE_ID]: {
+      id: GLOBAL_WORKSPACE_ID,
+      kind: 'global',
+      repoPath: null,
+    },
+  };
+
+  for (const [rawWorkspaceId, workspaceDescriptor] of Object.entries(workspaceDescriptors ?? {})) {
+    const workspaceId = rawWorkspaceId?.trim();
+
+    if (!workspaceId || workspaceId === GLOBAL_WORKSPACE_ID) {
+      continue;
+    }
+
+    const kind = workspaceDescriptor.kind === 'global' ? 'global' : 'project';
+    const repoPath = kind === 'project'
+      ? normalizeStoredPath(workspaceDescriptor.repoPath)
+      : null;
+
+    if (kind === 'global' || !repoPath || repoPath.startsWith('workspace:')) {
+      continue;
+    }
+
+    const normalizedWorkspaceId = buildWorkspaceId(
+      'project',
+      repoPath,
+      Object.keys(normalizedDescriptors),
+      workspaceId,
+    );
+
+    normalizedDescriptors[normalizedWorkspaceId] = {
+      id: normalizedWorkspaceId,
+      kind: 'project',
+      repoPath,
+    };
+  }
+
+  const hasExplicitProjectDescriptors = Object.values(normalizedDescriptors).some((workspaceDescriptor) => (
+    workspaceDescriptor.kind === 'project' && Boolean(workspaceDescriptor.repoPath)
+  ));
+  if (!hasExplicitProjectDescriptors) {
+    for (const rawContextKey of Object.keys(legacyWorkspaceSessions ?? {})) {
+      if (!rawContextKey || rawContextKey === GLOBAL_WORKSPACE_ID || rawContextKey.startsWith('workspace:')) {
+        continue;
+      }
+
+      const contextKey = normalizeWorkspaceContextKey(rawContextKey);
+
+      if (contextKey === GLOBAL_WORKSPACE_SESSION_KEY || contextKey.startsWith('workspace:')) {
+        continue;
+      }
+
+      const workspaceId = buildWorkspaceId('project', contextKey, Object.keys(normalizedDescriptors));
+
+      normalizedDescriptors[workspaceId] = {
+        id: workspaceId,
+        kind: 'project',
+        repoPath: contextKey,
+      };
+    }
+  }
+
+  if (lastRepoPath) {
+    const existingWorkspace = Object.values(normalizedDescriptors).find((workspaceDescriptor) => (
+      workspaceDescriptor.kind === 'project' && workspaceDescriptor.repoPath === lastRepoPath
+    ));
+
+    if (!existingWorkspace) {
+      const workspaceId = buildWorkspaceId('project', lastRepoPath, Object.keys(normalizedDescriptors));
+      normalizedDescriptors[workspaceId] = {
+        id: workspaceId,
+        kind: 'project',
+        repoPath: lastRepoPath,
+      };
+    }
+  }
+
+  for (const recentRepo of recentRepos) {
+    const existingWorkspace = Object.values(normalizedDescriptors).find((workspaceDescriptor) => (
+      workspaceDescriptor.kind === 'project' && workspaceDescriptor.repoPath === recentRepo.path
+    ));
+
+    if (!existingWorkspace) {
+      const workspaceId = buildWorkspaceId('project', recentRepo.path, Object.keys(normalizedDescriptors));
+      normalizedDescriptors[workspaceId] = {
+        id: workspaceId,
+        kind: 'project',
+        repoPath: recentRepo.path,
+      };
+    }
+  }
+
+  return normalizedDescriptors;
+}
+
 function normalizeWorkspaceTabs(
   workspaceTabs: PartialWorkspaceTabState[] | undefined,
   legacyTerminalTabs: Array<Partial<LegacyTerminalTabState>> | undefined,
+  workspaceTabDefaults: WorkspaceTabDefaults,
   fallbackCwd: string,
 ): WorkspaceTabState[] {
   const seenIds = new Set<string>();
@@ -185,7 +451,29 @@ function normalizeWorkspaceTabs(
         content,
         savedContent,
         viewMode: normalizeNoteTabViewMode(tab.viewMode),
-        fontSize: normalizeNoteFontSize(tab.fontSize),
+        fontSize: normalizeNoteFontSize(tab.fontSize ?? workspaceTabDefaults.noteFontSize),
+      });
+      continue;
+    }
+
+    if (tab.type === 'code') {
+      const filePath = normalizeStoredPath(tab.filePath);
+
+      if (!filePath) {
+        continue;
+      }
+
+      const content = tab.content ?? '';
+      const savedContent = tab.savedContent ?? content;
+
+      normalizedTabs.push({
+        id,
+        type: 'code',
+        title: title || getPathLeafName(filePath),
+        filePath,
+        content,
+        savedContent,
+        fontSize: normalizeNoteFontSize(tab.fontSize ?? workspaceTabDefaults.noteFontSize),
       });
       continue;
     }
@@ -197,6 +485,7 @@ function normalizeWorkspaceTabs(
       type: 'shell',
       title: title || 'Shell',
       cwd: normalizeTerminalCwd(shellTab.cwd, fallbackCwd),
+      fontSize: normalizeShellFontSize(shellTab.fontSize ?? workspaceTabDefaults.shellFontSize),
       launcherProfileId: shellTab.launcherProfileId?.trim() || null,
     });
   }
@@ -209,11 +498,13 @@ function normalizeWorkspaceSessionState(
   legacyWorkspaceTabs: PartialWorkspaceTabState[] | undefined,
   legacyTerminalTabs: Array<Partial<LegacyTerminalTabState>> | undefined,
   requestedActiveTabId: string | null | undefined,
+  workspaceTabDefaults: WorkspaceTabDefaults,
   fallbackCwd: string,
 ): WorkspaceSessionState {
   const tabs = normalizeWorkspaceTabs(
     workspaceSession?.tabs ?? legacyWorkspaceTabs,
     workspaceSession?.tabs ? undefined : legacyTerminalTabs,
+    workspaceTabDefaults,
     fallbackCwd,
   );
   const activeTabId = tabs.find((tab) => tab.id === (workspaceSession?.activeTabId ?? requestedActiveTabId))?.id
@@ -228,22 +519,40 @@ function normalizeWorkspaceSessionState(
 
 function normalizeWorkspaceSessions(
   workspaceSessions: Record<string, PartialWorkspaceSessionState> | undefined,
+  workspaceDescriptors: WorkspaceDescriptorsById,
   legacyWorkspaceTabs: PartialWorkspaceTabState[] | undefined,
   legacyTerminalTabs: Array<Partial<LegacyTerminalTabState>> | undefined,
   legacyActiveWorkspaceTabId: string | null | undefined,
   legacyActiveTerminalTabId: string | null | undefined,
   lastRepoPath: string | null,
+  workspaceTabDefaults: WorkspaceTabDefaults,
   fallbackCwd: string,
-): WorkspaceSessionsByContext {
-  const normalizedSessions: WorkspaceSessionsByContext = {};
+): WorkspaceSessionsById {
+  const normalizedSessions: WorkspaceSessionsById = {};
 
   for (const [rawContextKey, workspaceSession] of Object.entries(workspaceSessions ?? {})) {
-    const contextKey = normalizeWorkspaceContextKey(rawContextKey);
-    normalizedSessions[contextKey] = normalizeWorkspaceSessionState(
+    const normalizedWorkspaceId = rawContextKey?.trim();
+    const workspaceId = normalizedWorkspaceId && workspaceDescriptors[normalizedWorkspaceId]
+      ? normalizedWorkspaceId
+      : (() => {
+        const contextKey = normalizeWorkspaceContextKey(rawContextKey);
+        return contextKey === GLOBAL_WORKSPACE_SESSION_KEY
+          ? GLOBAL_WORKSPACE_ID
+          : Object.values(workspaceDescriptors).find((descriptor) => (
+            descriptor.kind === 'project' && descriptor.repoPath === contextKey
+          ))?.id;
+      })();
+
+    if (!workspaceId) {
+      continue;
+    }
+
+    normalizedSessions[workspaceId] = normalizeWorkspaceSessionState(
       workspaceSession,
       undefined,
       undefined,
       undefined,
+      workspaceTabDefaults,
       fallbackCwd,
     );
   }
@@ -252,17 +561,32 @@ function normalizeWorkspaceSessions(
 
   if (hasLegacyWorkspaceTabs) {
     const legacyContextKey = normalizeWorkspaceContextKey(lastRepoPath);
+    const legacyWorkspaceId = legacyContextKey === GLOBAL_WORKSPACE_SESSION_KEY
+      ? GLOBAL_WORKSPACE_ID
+      : Object.values(workspaceDescriptors).find((descriptor) => (
+        descriptor.kind === 'project' && descriptor.repoPath === legacyContextKey
+      ))?.id;
 
-    if (!normalizedSessions[legacyContextKey]) {
-      normalizedSessions[legacyContextKey] = normalizeWorkspaceSessionState(
+    if (legacyWorkspaceId && !normalizedSessions[legacyWorkspaceId]) {
+      normalizedSessions[legacyWorkspaceId] = normalizeWorkspaceSessionState(
         undefined,
         legacyWorkspaceTabs,
         legacyTerminalTabs,
         legacyActiveWorkspaceTabId ?? legacyActiveTerminalTabId,
+        workspaceTabDefaults,
         fallbackCwd,
       );
     }
   }
+
+  Object.keys(workspaceDescriptors).forEach((workspaceId) => {
+    if (!normalizedSessions[workspaceId]) {
+      normalizedSessions[workspaceId] = {
+        tabs: [],
+        activeTabId: null,
+      };
+    }
+  });
 
   return normalizedSessions;
 }
@@ -376,23 +700,175 @@ function normalizeTerminalCommandPresets(
     .filter((preset): preset is TerminalCommandPreset => Boolean(preset));
 }
 
+function normalizePanelLayout(panelLayout: Partial<PanelLayout> | undefined): PanelLayout {
+  return {
+    ...DEFAULT_PANEL_LAYOUT,
+    ...panelLayout,
+  };
+}
+
+function normalizePanelLayoutsByWorkspace(
+  panelLayoutsByWorkspace: Record<string, Partial<PanelLayout>> | undefined,
+  workspaceDescriptors: WorkspaceDescriptorsById,
+  activeWorkspaceId: string,
+  fallbackPanelLayout: PanelLayout,
+): Record<string, PanelLayout> {
+  const normalizedPanelLayouts: Record<string, PanelLayout> = {};
+
+  Object.keys(workspaceDescriptors).forEach((workspaceId) => {
+    const rawPanelLayout = panelLayoutsByWorkspace?.[workspaceId];
+    const nextPanelLayout = normalizePanelLayout(
+      rawPanelLayout ?? (workspaceId === activeWorkspaceId ? fallbackPanelLayout : undefined),
+    );
+
+    normalizedPanelLayouts[workspaceId] = nextPanelLayout;
+  });
+
+  if (!normalizedPanelLayouts[activeWorkspaceId]) {
+    normalizedPanelLayouts[activeWorkspaceId] = normalizePanelLayout(fallbackPanelLayout);
+  }
+
+  return normalizedPanelLayouts;
+}
+
+function normalizeRepoPanelSectionState(
+  sectionState: Partial<Record<RepoPanelSectionId, boolean>> | undefined,
+): RepoPanelSectionState {
+  return {
+    staged: sectionState?.staged ?? false,
+    changed: sectionState?.changed ?? false,
+    untracked: sectionState?.untracked ?? true,
+    conflicts: sectionState?.conflicts ?? false,
+  };
+}
+
+function normalizeWorkspaceRepoPanelState(
+  workspaceRepoPanelState: PartialWorkspaceRepoPanelState | undefined,
+): WorkspaceRepoPanelState {
+  return {
+    fontSize: normalizeNoteFontSize(workspaceRepoPanelState?.fontSize),
+    historyOpen: workspaceRepoPanelState?.historyOpen ?? false,
+    workspaceDetailExpanded: workspaceRepoPanelState?.workspaceDetailExpanded ?? true,
+    files: {
+      expanded: workspaceRepoPanelState?.files?.expanded ?? true,
+      viewMode: workspaceRepoPanelState?.files?.viewMode === 'tree' ? 'tree' : 'list',
+      showAll: workspaceRepoPanelState?.files?.showAll ?? false,
+      collapsedSections: normalizeRepoPanelSectionState(workspaceRepoPanelState?.files?.collapsedSections),
+    },
+  };
+}
+
+function normalizeWorkspaceRepoPanelStates(
+  workspaceRepoPanelStates: Record<string, PartialWorkspaceRepoPanelState> | undefined,
+  workspaceDescriptors: WorkspaceDescriptorsById,
+): Record<string, WorkspaceRepoPanelState> {
+  return Object.fromEntries(
+    Object.keys(workspaceDescriptors).map((workspaceId) => (
+      [workspaceId, normalizeWorkspaceRepoPanelState(workspaceRepoPanelStates?.[workspaceId])]
+    )),
+  );
+}
+
 function normalizeProjectTitleMode(
   mode: ProjectTitleMode | undefined,
   title: string | undefined,
   lastRepoPath: string | null,
 ): ProjectTitleMode {
-  if (mode === 'auto' || mode === 'custom') {
-    return mode;
+  const normalizedTitle = normalizeProjectTitle(title, lastRepoPath);
+
+  if (normalizedTitle) {
+    return 'custom';
   }
 
+  if (mode === 'custom') {
+    return 'auto';
+  }
+
+  return 'auto';
+}
+
+function normalizeProjectTitle(title: string | undefined, lastRepoPath: string | null): string {
   const trimmedTitle = title?.trim();
   const repoName = lastRepoPath ? getRepoName(lastRepoPath) : null;
 
   if (!trimmedTitle || trimmedTitle === DEFAULT_SESSION_DATA.projectTitle || trimmedTitle === repoName) {
-    return 'auto';
+    return '';
   }
 
-  return 'custom';
+  return trimmedTitle;
+}
+
+function normalizeProjectTitlesByContext(
+  projectTitlesByContext: Record<string, string> | undefined,
+  lastRepoPath: string | null,
+  legacyProjectTitle: string | undefined,
+): Record<string, string> {
+  const normalizedTitles = new Map<string, string>();
+
+  for (const [rawContextKey, rawTitle] of Object.entries(projectTitlesByContext ?? {})) {
+    const contextKey = normalizeWorkspaceContextKey(rawContextKey);
+    const title = rawTitle?.trim();
+
+    if (!title || contextKey === GLOBAL_WORKSPACE_SESSION_KEY) {
+      continue;
+    }
+
+    normalizedTitles.set(contextKey, title);
+  }
+
+  const normalizedLegacyTitle = normalizeProjectTitle(legacyProjectTitle, lastRepoPath);
+
+  if (normalizedLegacyTitle && lastRepoPath) {
+    const contextKey = normalizeWorkspaceContextKey(lastRepoPath);
+
+    if (!normalizedTitles.has(contextKey)) {
+      normalizedTitles.set(contextKey, normalizedLegacyTitle);
+    }
+  }
+
+  return Object.fromEntries(normalizedTitles.entries());
+}
+
+function normalizeWorkspaceTabDefaults(
+  workspaceTabDefaults: Partial<WorkspaceTabDefaults> | undefined,
+): WorkspaceTabDefaults {
+  return {
+    shellFontSize: normalizeShellFontSize(workspaceTabDefaults?.shellFontSize),
+    noteFontSize: normalizeNoteFontSize(workspaceTabDefaults?.noteFontSize),
+  };
+}
+
+function normalizeWorktreeDetectionInterval(
+  worktreeDetectionIntervalMs: number | null | undefined,
+): WorktreeDetectionInterval {
+  switch (worktreeDetectionIntervalMs) {
+    case null:
+    case 60_000:
+    case 180_000:
+    case 300_000:
+    case 900_000:
+      return worktreeDetectionIntervalMs;
+    default:
+      return DEFAULT_SESSION_DATA.worktreeDetectionIntervalMs;
+  }
+}
+
+function normalizeDismissedWorktreePaths(
+  dismissedWorktreePaths: Array<string | null | undefined> | undefined,
+): string[] {
+  const normalizedPaths = new Set<string>();
+
+  for (const pathValue of dismissedWorktreePaths ?? []) {
+    const normalizedPath = normalizeStoredPath(pathValue);
+
+    if (!normalizedPath) {
+      continue;
+    }
+
+    normalizedPaths.add(normalizedPath);
+  }
+
+  return [...normalizedPaths.values()];
 }
 
 function normalizeSession(session: LegacySessionData): SessionData {
@@ -402,13 +878,22 @@ function normalizeSession(session: LegacySessionData): SessionData {
     session.recentRepos as Array<string | Partial<RecentRepoEntry>> | undefined,
     lastRepoPath,
   );
+  const workspaceDescriptors = normalizeWorkspaceDescriptors(
+    session.workspaceDescriptors,
+    session.workspaceSessions,
+    recentRepos,
+    lastRepoPath,
+  );
+  const workspaceTabDefaults = normalizeWorkspaceTabDefaults(session.workspaceTabDefaults);
   const workspaceSessions = normalizeWorkspaceSessions(
     session.workspaceSessions,
+    workspaceDescriptors,
     session.workspaceTabs as PartialWorkspaceTabState[] | undefined,
     session.terminalTabs,
     session.activeWorkspaceTabId,
     session.activeTerminalTabId,
     lastRepoPath,
+    workspaceTabDefaults,
     fallbackCwd,
   );
   const hasStoredTerminalCommandPresets = Array.isArray(session.terminalCommandPresets);
@@ -420,18 +905,57 @@ function normalizeSession(session: LegacySessionData): SessionData {
   const terminalCommandPresets = normalizedTerminalCommandPresets.length
     ? normalizedTerminalCommandPresets
     : (hasStoredTerminalCommandPresets ? [] : getDefaultTerminalCommandPresets());
+  const projectTitle = normalizeProjectTitle(session.projectTitle, lastRepoPath);
   const projectTitleMode = normalizeProjectTitleMode(session.projectTitleMode, session.projectTitle, lastRepoPath);
+  const projectTitlesByContext = normalizeProjectTitlesByContext(
+    session.projectTitlesByContext,
+    lastRepoPath,
+    session.projectTitle,
+  );
+  const workspaceOrder = normalizeWorkspaceOrder(session.workspaceOrder, recentRepos, workspaceDescriptors);
+  const activeWorkspaceId = session.activeWorkspaceId && workspaceDescriptors[session.activeWorkspaceId]
+    ? session.activeWorkspaceId
+    : (lastRepoPath
+      ? Object.values(workspaceDescriptors).find((descriptor) => (
+        descriptor.kind === 'project' && descriptor.repoPath === lastRepoPath
+      ))?.id ?? GLOBAL_WORKSPACE_ID
+      : GLOBAL_WORKSPACE_ID);
+  const fallbackPanelLayout = normalizePanelLayout(session.panelLayout);
+  const panelLayoutsByWorkspace = normalizePanelLayoutsByWorkspace(
+    session.panelLayoutsByWorkspace as Record<string, Partial<PanelLayout>> | undefined,
+    workspaceDescriptors,
+    activeWorkspaceId,
+    fallbackPanelLayout,
+  );
+  const workspaceRepoPanelStates = normalizeWorkspaceRepoPanelStates(
+    session.workspaceRepoPanelStates,
+    workspaceDescriptors,
+  );
+  const workspaceIndicatorVisibility = {
+    repo: session.workspaceIndicatorVisibility?.repo ?? DEFAULT_SESSION_DATA.workspaceIndicatorVisibility.repo,
+    activity: session.workspaceIndicatorVisibility?.activity ?? DEFAULT_SESSION_DATA.workspaceIndicatorVisibility.activity,
+    attention: session.workspaceIndicatorVisibility?.attention ?? DEFAULT_SESSION_DATA.workspaceIndicatorVisibility.attention,
+  };
 
   return {
     lastRepoPath,
+    activeWorkspaceId,
     recentRepos,
-    panelLayout: {
-      ...DEFAULT_SESSION_DATA.panelLayout,
-      ...session.panelLayout,
-    },
+    workspaceOrder,
+    workspaceDescriptors,
+    panelLayout: panelLayoutsByWorkspace[activeWorkspaceId] ?? fallbackPanelLayout,
+    panelLayoutsByWorkspace,
+    workspaceRepoPanelStates,
     terminalCwd: fallbackCwd,
-    projectTitle: session.projectTitle?.trim() || DEFAULT_SESSION_DATA.projectTitle,
+    projectTitle,
     projectTitleMode,
+    projectTitlesByContext,
+    appAppearance: normalizeAppAppearance(session.appAppearance),
+    editorTheme: normalizeEditorTheme(session.editorTheme),
+    workspaceIndicatorVisibility,
+    workspaceTabDefaults,
+    worktreeDetectionIntervalMs: normalizeWorktreeDetectionInterval(session.worktreeDetectionIntervalMs),
+    dismissedWorktreePaths: normalizeDismissedWorktreePaths(session.dismissedWorktreePaths),
     soundNotificationsEnabled: session.soundNotificationsEnabled ?? DEFAULT_SESSION_DATA.soundNotificationsEnabled,
     infoNoteLastSeenRevision: session.infoNoteLastSeenRevision?.trim() || null,
     terminalCommandPresets,
@@ -463,7 +987,9 @@ async function getStore(): Promise<SessionStore> {
 
 export async function loadSession(): Promise<SessionData> {
   const store = await getStore();
-  return normalizeSession(store.store as LegacySessionData);
+  const normalizedSession = normalizeSession(store.store as LegacySessionData);
+  store.set(normalizedSession);
+  return normalizedSession;
 }
 
 export async function saveSession(session: Partial<SessionData>): Promise<SessionData> {
@@ -471,10 +997,17 @@ export async function saveSession(session: Partial<SessionData>): Promise<Sessio
   const nextSession = normalizeSession({
     ...(store.store as LegacySessionData),
     ...session,
-    panelLayout: {
-      ...DEFAULT_SESSION_DATA.panelLayout,
+    panelLayout: normalizePanelLayout({
       ...(store.get('panelLayout') ?? {}),
       ...session.panelLayout,
+    }),
+    panelLayoutsByWorkspace: {
+      ...((store.get('panelLayoutsByWorkspace') ?? {}) as Record<string, Partial<PanelLayout>>),
+      ...(session.panelLayoutsByWorkspace as Record<string, Partial<PanelLayout>> | undefined),
+    },
+    workspaceRepoPanelStates: {
+      ...((store.get('workspaceRepoPanelStates') ?? {}) as Record<string, PartialWorkspaceRepoPanelState>),
+      ...(session.workspaceRepoPanelStates as Record<string, PartialWorkspaceRepoPanelState> | undefined),
     },
   });
 

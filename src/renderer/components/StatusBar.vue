@@ -136,7 +136,7 @@ defineEmits<{
   padding: 0.35rem 0.55rem;
   border: 1px solid var(--border-strong);
   border-radius: 12px;
-  background: rgba(11, 15, 20, 0.92);
+  background: var(--status-bar-bg);
   box-shadow: var(--shadow-panel);
   color: var(--text-muted);
   font-size: 0.76rem;
@@ -181,7 +181,7 @@ defineEmits<{
   padding: 0 0.58rem;
   border: 1px solid rgba(110, 197, 255, 0.18);
   border-radius: 10px;
-  background: rgba(8, 13, 18, 0.92);
+  background: var(--status-bar-button-bg);
   color: var(--text-primary);
   font: inherit;
   line-height: 1;
@@ -259,7 +259,7 @@ defineEmits<{
   padding: 0;
   border: 1px solid var(--border-subtle);
   border-radius: 8px;
-  background: rgba(18, 24, 32, 0.92);
+  background: var(--status-bar-toggle-bg);
   color: var(--text-primary);
 }
 

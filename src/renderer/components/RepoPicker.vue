@@ -5,6 +5,7 @@ import type { RecentRepoEntry } from '../../shared/bridgegit';
 interface Props {
   repoPath: string | null;
   recentRepos: RecentRepoEntry[];
+  projectTitlesByContext: Record<string, string>;
   isBusy?: boolean;
 }
 
@@ -30,7 +31,8 @@ const filteredRepos = computed(() => {
   }
 
   return orderedRepos.filter((repo) => {
-    const haystack = `${repo.name} ${repo.path}`.toLowerCase();
+    const displayName = props.projectTitlesByContext[repo.path]?.trim() || repo.name;
+    const haystack = `${displayName} ${repo.name} ${repo.path}`.toLowerCase();
     return haystack.includes(searchTerm);
   });
 });
@@ -109,6 +111,7 @@ onBeforeUnmount(() => {
       <button
         class="repo-picker__path-button"
         type="button"
+        :title="repoPath ?? 'Choose or reopen a repository'"
         :aria-expanded="isMenuOpen"
         aria-haspopup="dialog"
         @click="toggleMenu"
@@ -153,9 +156,10 @@ onBeforeUnmount(() => {
           class="repo-picker__repo"
           :class="{ 'repo-picker__repo--active': repo.path === repoPath }"
           type="button"
+          :title="repo.path"
           @click="handleSelect(repo.path)"
         >
-          <span class="repo-picker__repo-name">{{ repo.name }}</span>
+          <span class="repo-picker__repo-name">{{ projectTitlesByContext[repo.path]?.trim() || repo.name }}</span>
           <span class="repo-picker__repo-path">{{ repo.path }}</span>
           <span class="repo-picker__repo-meta">{{ formatLastUsed(repo.lastUsedAt) }}</span>
         </button>
@@ -217,9 +221,11 @@ onBeforeUnmount(() => {
   color: var(--text-primary);
   font-family: var(--font-mono);
   font-size: 0.8rem;
+  direction: rtl;
   text-align: left;
   text-overflow: ellipsis;
   white-space: nowrap;
+  unicode-bidi: plaintext;
 }
 
 .repo-picker__chevron {
@@ -293,8 +299,11 @@ onBeforeUnmount(() => {
   color: var(--text-muted);
   font-family: var(--font-mono);
   font-size: 0.76rem;
+  direction: rtl;
+  text-align: left;
   text-overflow: ellipsis;
   white-space: nowrap;
+  unicode-bidi: plaintext;
 }
 
 .repo-picker__repo-meta,

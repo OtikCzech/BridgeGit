@@ -1,6 +1,13 @@
 import { ref } from 'vue';
 import {
   DEFAULT_SESSION_DATA,
+  cloneDismissedWorktreePaths,
+  cloneWorkspaceTabDefaults,
+  clonePanelLayoutsByWorkspace,
+  cloneProjectTitlesByContext,
+  cloneWorkspaceIndicatorVisibilitySettings,
+  cloneWorkspaceRepoPanelStates,
+  cloneWorkspaceDescriptors,
   cloneWorkspaceSessions,
   type RecentRepoEntry,
   type SessionData,
@@ -8,15 +15,25 @@ import {
   type TerminalCommandStep,
 } from '../../shared/bridgegit';
 
-type SessionPatch = Partial<Omit<SessionData, 'panelLayout'>> & {
+type SessionPatch = Partial<Omit<SessionData, 'panelLayout' | 'panelLayoutsByWorkspace' | 'workspaceRepoPanelStates'>> & {
   panelLayout?: Partial<SessionData['panelLayout']>;
+  panelLayoutsByWorkspace?: SessionData['panelLayoutsByWorkspace'];
+  workspaceRepoPanelStates?: SessionData['workspaceRepoPanelStates'];
 };
 
 function cloneSession(session: SessionData): SessionData {
   return {
     ...session,
     recentRepos: cloneRecentRepos(session.recentRepos),
+    workspaceDescriptors: cloneWorkspaceDescriptors(session.workspaceDescriptors),
+    workspaceOrder: [...session.workspaceOrder],
     panelLayout: { ...session.panelLayout },
+    panelLayoutsByWorkspace: clonePanelLayoutsByWorkspace(session.panelLayoutsByWorkspace),
+    workspaceRepoPanelStates: cloneWorkspaceRepoPanelStates(session.workspaceRepoPanelStates),
+    projectTitlesByContext: cloneProjectTitlesByContext(session.projectTitlesByContext),
+    workspaceIndicatorVisibility: cloneWorkspaceIndicatorVisibilitySettings(session.workspaceIndicatorVisibility),
+    workspaceTabDefaults: cloneWorkspaceTabDefaults(session.workspaceTabDefaults),
+    dismissedWorktreePaths: cloneDismissedWorktreePaths(session.dismissedWorktreePaths),
     terminalCommandPresets: cloneTerminalCommandPresets(session.terminalCommandPresets),
     workspaceSessions: cloneWorkspaceSessions(session.workspaceSessions),
   };
@@ -52,10 +69,34 @@ function mergeSession(base: SessionData, patch: SessionPatch): SessionData {
     recentRepos: patch.recentRepos
       ? cloneRecentRepos(patch.recentRepos)
       : cloneRecentRepos(base.recentRepos),
+    workspaceDescriptors: patch.workspaceDescriptors
+      ? cloneWorkspaceDescriptors(patch.workspaceDescriptors)
+      : cloneWorkspaceDescriptors(base.workspaceDescriptors),
+    workspaceOrder: patch.workspaceOrder
+      ? [...patch.workspaceOrder]
+      : [...base.workspaceOrder],
     panelLayout: {
       ...base.panelLayout,
       ...patch.panelLayout,
     },
+    panelLayoutsByWorkspace: patch.panelLayoutsByWorkspace
+      ? clonePanelLayoutsByWorkspace(patch.panelLayoutsByWorkspace)
+      : clonePanelLayoutsByWorkspace(base.panelLayoutsByWorkspace),
+    workspaceRepoPanelStates: patch.workspaceRepoPanelStates
+      ? cloneWorkspaceRepoPanelStates(patch.workspaceRepoPanelStates)
+      : cloneWorkspaceRepoPanelStates(base.workspaceRepoPanelStates),
+    projectTitlesByContext: patch.projectTitlesByContext
+      ? cloneProjectTitlesByContext(patch.projectTitlesByContext)
+      : cloneProjectTitlesByContext(base.projectTitlesByContext),
+    workspaceIndicatorVisibility: patch.workspaceIndicatorVisibility
+      ? cloneWorkspaceIndicatorVisibilitySettings(patch.workspaceIndicatorVisibility)
+      : cloneWorkspaceIndicatorVisibilitySettings(base.workspaceIndicatorVisibility),
+    workspaceTabDefaults: patch.workspaceTabDefaults
+      ? cloneWorkspaceTabDefaults(patch.workspaceTabDefaults)
+      : cloneWorkspaceTabDefaults(base.workspaceTabDefaults),
+    dismissedWorktreePaths: patch.dismissedWorktreePaths
+      ? cloneDismissedWorktreePaths(patch.dismissedWorktreePaths)
+      : cloneDismissedWorktreePaths(base.dismissedWorktreePaths),
     terminalCommandPresets: patch.terminalCommandPresets
       ? cloneTerminalCommandPresets(patch.terminalCommandPresets)
       : cloneTerminalCommandPresets(base.terminalCommandPresets),

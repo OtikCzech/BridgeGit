@@ -1,17 +1,30 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch, type ComponentPublicInstance } from 'vue';
+import { computed, defineAsyncComponent, nextTick, onBeforeUnmount, onMounted, ref, watch, type ComponentPublicInstance } from 'vue';
 import type {
+  AppAppearance,
+  CodeNavigationRequest,
+  CodeNavigationTarget,
   NoteFileHandle,
+  NoteFileStat,
+  ResolvedEditorTheme,
   TerminalCommandPreset,
+  ThemeVariant,
+  WorkspaceCodeTabState,
+  WorkspaceExternalFileChangeState,
   WorkspaceNoteTabState,
   WorkspaceShellTabState,
+  WorkspaceTabDefaults,
   WorkspaceTabState,
 } from '../../shared/bridgegit';
-import { DEFAULT_NOTE_FONT_SIZE } from '../../shared/bridgegit';
+import {
+  resolveWorkspaceFileTabType,
+} from '../../shared/bridgegit';
 import { SHORTCUTS, formatCommandSlotShortcut } from '../shortcuts';
 import { playNotificationBeep } from '../utils/notification-audio';
 import NoteTabView from './NoteTabView.vue';
 import TerminalSessionView from './TerminalSessionView.vue';
+
+const CodeTabView = defineAsyncComponent(() => import('./CodeTabView.vue'));
 
 interface TerminalSessionViewExpose {
   reconnect: () => Promise<void>;
@@ -19,9 +32,16 @@ interface TerminalSessionViewExpose {
 }
 
 interface Props {
+  workspaceId: string;
   cwd: string;
+  projectRoot: string | null;
+  appearanceTheme: AppAppearance;
+  appearanceThemeVariant: ThemeVariant;
+  editorThemeVariant: ThemeVariant;
+  editorTheme: ResolvedEditorTheme;
   presets: TerminalCommandPreset[];
   soundNotificationsEnabled: boolean;
+  workspaceTabDefaults: WorkspaceTabDefaults;
   tabs: WorkspaceTabState[];
   activeTabId: string | null;
   canCollapse: boolean;
@@ -30,13 +50,14 @@ interface Props {
 }
 
 const props = defineProps<Props>();
-const CREATION_MENU_ACTION_ORDER = ['shell', 'note', 'open-note'] as const;
+const CREATION_MENU_ACTION_ORDER = ['shell', 'note', 'open-file'] as const;
 type CreationMenuActionId = (typeof CREATION_MENU_ACTION_ORDER)[number];
 
 const emit = defineEmits<{
   'update:tabs': [tabs: WorkspaceTabState[]];
   'update:active-tab-id': [activeTabId: string | null];
-  'update:recent-activity': [recentActivity: Record<string, boolean>];
+  'update:recent-activity': [payload: { workspaceId: string; recentActivity: Record<string, boolean> }];
+  'update:attention': [payload: { workspaceId: string; attention: Record<string, boolean> }];
   'toggle-collapse': [];
   activity: [];
 }>();
@@ -51,21 +72,40 @@ const tabMenu = ref<{ tabId: string; x: number; y: number } | null>(null);
 const creationMenu = ref<{ x: number; y: number } | null>(null);
 const commandMenuOpen = ref(false);
 const noteBusyByTabId = ref<Record<string, boolean>>({});
+const codeNavigationRequestByTabId = ref<Record<string, CodeNavigationRequest>>({});
+const externalFileChangeByTabId = ref<Record<string, WorkspaceExternalFileChangeState>>({});
+const trackedFileSignatureByTabId = ref<Record<string, string>>({});
+const initializedFileTrackingByTabId = ref<Record<string, boolean>>({});
 const tabRecentActivity = ref<Record<string, boolean>>({});
 const tabAttention = ref<Record<string, boolean>>({});
 const tabLastInputAt = ref<Record<string, number>>({});
 const tabLastTypingAt = ref<Record<string, number>>({});
 const tabLastSubmitAt = ref<Record<string, number>>({});
+const interactedShellTabs = ref<Record<string, boolean>>({});
+const startedShellTabs = ref<Record<string, boolean>>({});
 const draggedTabId = ref<string | null>(null);
 const dropTargetTabId = ref<string | null>(null);
+const pendingCloseDialog = ref<{
+  kind: 'note' | 'code' | 'shell';
+  tabId: string;
+  title: string;
+  hasSavedFile: boolean;
+  hasActivity: boolean;
+  hasAttention: boolean;
+} | null>(null);
 const creationButtonRef = ref<HTMLElement | null>(null);
 const creationMenuActiveActionId = ref<CreationMenuActionId>('shell');
 const TAB_ACTIVITY_TIMEOUT_MS = 1600;
 const ACTIVE_SHELL_IDLE_THRESHOLD_MS = 1200;
 const ACTIVE_SHELL_TYPING_WINDOW_MS = 500;
+const EXTERNAL_FILE_POLL_INTERVAL_MS = 2500;
+const MISSING_FILE_SIGNATURE = '__missing__';
 const tabActivityTimers = new Map<string, number>();
 const sessionViewRefs = new Map<string, TerminalSessionViewExpose>();
 const creationMenuItemRefs = new Map<CreationMenuActionId, HTMLButtonElement>();
+let externalFilePollTimer: number | null = null;
+let externalFilePollInFlight = false;
+let nextCodeNavigationToken = 1;
 
 const sortedTabCount = computed(() => tabs.value.length);
 const menuTab = computed(() => (
@@ -102,9 +142,9 @@ const creationMenuActions = computed(() => ([
     key: 'n',
   },
   {
-    id: 'open-note' as const,
-    label: 'Open note file',
-    shortcutDisplay: SHORTCUTS.workspaceOpenNoteFile.display,
+    id: 'open-file' as const,
+    label: 'Open file',
+    shortcutDisplay: SHORTCUTS.workspaceOpenFile.display,
     key: 'o',
   },
 ]));
@@ -117,8 +157,20 @@ function isNoteTab(tab: WorkspaceTabState): tab is WorkspaceNoteTabState {
   return tab.type === 'note';
 }
 
+function isCodeTab(tab: WorkspaceTabState): tab is WorkspaceCodeTabState {
+  return tab.type === 'code';
+}
+
+function isEditableTab(tab: WorkspaceTabState): tab is WorkspaceNoteTabState | WorkspaceCodeTabState {
+  return isNoteTab(tab) || isCodeTab(tab);
+}
+
 function cloneTabs(source: WorkspaceTabState[]): WorkspaceTabState[] {
   return source.map((tab) => ({ ...tab }));
+}
+
+function buildWorkspaceTabRuntimeKey(workspaceId: string, tabId: string) {
+  return `${workspaceId}:${tabId}`;
 }
 
 function getPathLeafName(pathValue: string) {
@@ -131,6 +183,26 @@ function normalizeFileLookup(pathValue: string) {
   return window.bridgegit?.platform === 'win32'
     ? normalizedPath.toLowerCase()
     : normalizedPath;
+}
+
+function buildTrackedFileSignature(fileStat: Pick<NoteFileStat, 'lastModifiedMs' | 'size'> | null) {
+  if (!fileStat) {
+    return MISSING_FILE_SIGNATURE;
+  }
+
+  return `${Math.round(fileStat.lastModifiedMs)}:${fileStat.size}`;
+}
+
+function getEditableTabFilePath(tab: WorkspaceTabState) {
+  if (isNoteTab(tab)) {
+    return tab.filePath;
+  }
+
+  if (isCodeTab(tab)) {
+    return tab.filePath;
+  }
+
+  return null;
 }
 
 function sanitizeNoteFileName(title: string) {
@@ -180,6 +252,7 @@ function buildShellTab(cwd = props.cwd): WorkspaceShellTabState {
     type: 'shell',
     title: `Shell ${getNextTabNumber('shell')}`,
     cwd,
+    fontSize: props.workspaceTabDefaults.shellFontSize,
     launcherProfileId: null,
   };
 }
@@ -195,7 +268,7 @@ function buildNoteTab(): WorkspaceNoteTabState {
     content,
     savedContent: content,
     viewMode: 'split',
-    fontSize: DEFAULT_NOTE_FONT_SIZE,
+    fontSize: props.workspaceTabDefaults.noteFontSize,
   };
 }
 
@@ -203,6 +276,7 @@ function ensureTab() {
   if (!tabs.value.length) {
     const nextTab = buildShellTab(props.cwd);
     syncState([nextTab], nextTab.id);
+    markShellTabAsStarted(nextTab.id);
   }
 }
 
@@ -230,12 +304,44 @@ function setActiveTab(tabId: string) {
   commandMenuOpen.value = false;
 }
 
+function markShellTabAsInteracted(tabId: string) {
+  const tab = getTabById(tabId);
+
+  if (!tab || !isShellTab(tab) || interactedShellTabs.value[tabId]) {
+    return;
+  }
+
+  interactedShellTabs.value = {
+    ...interactedShellTabs.value,
+    [tabId]: true,
+  };
+}
+
+function markShellTabAsStarted(tabId: string) {
+  const tab = getTabById(tabId);
+
+  if (!tab || !isShellTab(tab) || startedShellTabs.value[tabId]) {
+    return;
+  }
+
+  startedShellTabs.value = {
+    ...startedShellTabs.value,
+    [tabId]: true,
+  };
+}
+
 function handleTabClick(tabId: string) {
   if (editingTabId.value === tabId) {
     return;
   }
 
+  markShellTabAsStarted(tabId);
   setActiveTab(tabId);
+}
+
+function handleTerminalViewActivate(tabId: string) {
+  markShellTabAsStarted(tabId);
+  markShellTabAsInteracted(tabId);
 }
 
 function clearTabDragState() {
@@ -435,6 +541,25 @@ function pruneTabActivityState(nextTabs: WorkspaceTabState[]) {
   }
 }
 
+function resetTransientTabState() {
+  tabActivityTimers.forEach((timerId) => {
+    window.clearTimeout(timerId);
+  });
+  tabActivityTimers.clear();
+  tabRecentActivity.value = {};
+  tabAttention.value = {};
+  tabLastInputAt.value = {};
+  tabLastTypingAt.value = {};
+  tabLastSubmitAt.value = {};
+  interactedShellTabs.value = {};
+  startedShellTabs.value = {};
+  noteBusyByTabId.value = {};
+  codeNavigationRequestByTabId.value = {};
+  externalFileChangeByTabId.value = {};
+  trackedFileSignatureByTabId.value = {};
+  initializedFileTrackingByTabId.value = {};
+}
+
 function shouldPlayActivityCompletionSound(tabId: string) {
   if (!props.soundNotificationsEnabled) {
     return false;
@@ -447,16 +572,50 @@ function getTabById(tabId: string) {
   return tabs.value.find((tab) => tab.id === tabId) ?? null;
 }
 
-function isNoteDirty(tab: WorkspaceTabState) {
-  return isNoteTab(tab) && tab.content !== tab.savedContent;
+function isEditableTabDirty(tab: WorkspaceTabState) {
+  return isEditableTab(tab) && tab.content !== tab.savedContent;
 }
 
 function hasAttention(tabId: string) {
-  return Boolean(tabAttention.value[tabId]);
+  return Boolean(tabAttention.value[tabId])
+    && Boolean(tabLastInputAt.value[tabId])
+    && Boolean(interactedShellTabs.value[tabId]);
 }
 
-function noteHasSavedFile(tab: WorkspaceTabState) {
-  return isNoteTab(tab) && Boolean(tab.filePath);
+function shellNeedsCloseConfirmation(tabId: string) {
+  return isTabActive(tabId) || hasAttention(tabId);
+}
+
+function showsShellTabIndicator(tab: WorkspaceTabState) {
+  if (!isShellTab(tab)) {
+    return true;
+  }
+
+  return Boolean(interactedShellTabs.value[tab.id]);
+}
+
+function hasTabActiveChrome(tab: WorkspaceTabState) {
+  if (tab.id !== activeTabId.value) {
+    return false;
+  }
+
+  if (!isShellTab(tab)) {
+    return true;
+  }
+
+  return showsShellTabIndicator(tab);
+}
+
+function shouldMountShellTab(tab: WorkspaceTabState) {
+  if (!isShellTab(tab)) {
+    return false;
+  }
+
+  return Boolean(startedShellTabs.value[tab.id]);
+}
+
+function editableTabHasSavedFile(tab: WorkspaceTabState) {
+  return isEditableTab(tab) && Boolean(tab.filePath);
 }
 
 function tabDisplayTitle(tab: WorkspaceTabState) {
@@ -464,11 +623,11 @@ function tabDisplayTitle(tab: WorkspaceTabState) {
 }
 
 function tabTitleTooltip(tab: WorkspaceTabState) {
-  if (!isNoteTab(tab) || !tab.filePath) {
+  if (!isEditableTab(tab) || !tab.filePath) {
     return tabDisplayTitle(tab);
   }
 
-  return isNoteDirty(tab)
+  return isEditableTabDirty(tab)
     ? `${tab.filePath}\nUnsaved changes`
     : tab.filePath;
 }
@@ -504,9 +663,138 @@ function setNoteBusy(tabId: string, busy: boolean) {
   noteBusyByTabId.value = nextBusy;
 }
 
+function setCodeNavigationRequest(tabId: string, target: CodeNavigationTarget) {
+  codeNavigationRequestByTabId.value = {
+    ...codeNavigationRequestByTabId.value,
+    [tabId]: {
+      ...target,
+      token: nextCodeNavigationToken,
+    },
+  };
+  nextCodeNavigationToken += 1;
+}
+
+function clearCodeNavigationRequest(tabId: string) {
+  if (!(tabId in codeNavigationRequestByTabId.value)) {
+    return;
+  }
+
+  const { [tabId]: _removedRequest, ...nextRequests } = codeNavigationRequestByTabId.value;
+  codeNavigationRequestByTabId.value = nextRequests;
+}
+
+function setTrackedFileSignature(tabId: string, signature: string) {
+  trackedFileSignatureByTabId.value = {
+    ...trackedFileSignatureByTabId.value,
+    [tabId]: signature,
+  };
+}
+
+function markFileTrackingInitialized(tabId: string) {
+  if (initializedFileTrackingByTabId.value[tabId]) {
+    return;
+  }
+
+  initializedFileTrackingByTabId.value = {
+    ...initializedFileTrackingByTabId.value,
+    [tabId]: true,
+  };
+}
+
+function clearTrackedFileState(tabId: string) {
+  if (tabId in trackedFileSignatureByTabId.value) {
+    const { [tabId]: _removedSignature, ...nextSignatures } = trackedFileSignatureByTabId.value;
+    trackedFileSignatureByTabId.value = nextSignatures;
+  }
+
+  if (tabId in initializedFileTrackingByTabId.value) {
+    const { [tabId]: _removedInitialized, ...nextInitialized } = initializedFileTrackingByTabId.value;
+    initializedFileTrackingByTabId.value = nextInitialized;
+  }
+
+  if (tabId in externalFileChangeByTabId.value) {
+    const { [tabId]: _removedChange, ...nextChanges } = externalFileChangeByTabId.value;
+    externalFileChangeByTabId.value = nextChanges;
+  }
+}
+
+function clearExternalFileChange(tabId: string) {
+  if (!(tabId in externalFileChangeByTabId.value)) {
+    return;
+  }
+
+  const { [tabId]: _removedChange, ...nextChanges } = externalFileChangeByTabId.value;
+  externalFileChangeByTabId.value = nextChanges;
+}
+
+function setExternalFileChange(tabId: string, kind: WorkspaceExternalFileChangeState) {
+  if (externalFileChangeByTabId.value[tabId] === kind) {
+    return;
+  }
+
+  externalFileChangeByTabId.value = {
+    ...externalFileChangeByTabId.value,
+    [tabId]: kind,
+  };
+}
+
+function seedTrackedFileState(tabId: string, fileHandle: Pick<NoteFileHandle, 'lastModifiedMs' | 'size'>) {
+  setTrackedFileSignature(tabId, buildTrackedFileSignature(fileHandle));
+  markFileTrackingInitialized(tabId);
+  clearExternalFileChange(tabId);
+}
+
+function pruneExternalFileRuntimeState(nextTabs: WorkspaceTabState[]) {
+  const nextTrackedTabIds = new Set(nextTabs
+    .filter((tab) => isEditableTab(tab) && Boolean(getEditableTabFilePath(tab)))
+    .map((tab) => tab.id));
+
+  Object.keys(trackedFileSignatureByTabId.value).forEach((tabId) => {
+    if (!nextTrackedTabIds.has(tabId)) {
+      clearTrackedFileState(tabId);
+    }
+  });
+}
+
+function pruneCodeNavigationRequests(nextTabs: WorkspaceTabState[]) {
+  const nextTabIds = new Set(nextTabs.map((tab) => tab.id));
+
+  Object.keys(codeNavigationRequestByTabId.value).forEach((tabId) => {
+    if (!nextTabIds.has(tabId)) {
+      clearCodeNavigationRequest(tabId);
+    }
+  });
+}
+
 function updateNoteTabState(tabId: string, patch: Partial<WorkspaceNoteTabState>) {
   const nextTabs = tabs.value.map((tab) => (
     isNoteTab(tab) && tab.id === tabId
+      ? {
+          ...tab,
+          ...patch,
+        }
+      : tab
+  ));
+
+  syncState(nextTabs, activeTabId.value);
+}
+
+function updateCodeTabState(tabId: string, patch: Partial<WorkspaceCodeTabState>) {
+  const nextTabs = tabs.value.map((tab) => (
+    isCodeTab(tab) && tab.id === tabId
+      ? {
+          ...tab,
+          ...patch,
+        }
+      : tab
+  ));
+
+  syncState(nextTabs, activeTabId.value);
+}
+
+function updateShellTabState(tabId: string, patch: Partial<WorkspaceShellTabState>) {
+  const nextTabs = tabs.value.map((tab) => (
+    isShellTab(tab) && tab.id === tabId
       ? {
           ...tab,
           ...patch,
@@ -528,6 +816,16 @@ function findNoteTabByFilePath(filePath: string, excludeTabId?: string | null) {
   )) ?? null;
 }
 
+function findCodeTabByFilePath(filePath: string, excludeTabId?: string | null) {
+  const lookupPath = normalizeFileLookup(filePath);
+
+  return tabs.value.find((tab) => (
+    isCodeTab(tab)
+    && tab.id !== excludeTabId
+    && normalizeFileLookup(tab.filePath) === lookupPath
+  )) ?? null;
+}
+
 function buildFileBackedNoteTab(filePath: string, content: string): WorkspaceNoteTabState {
   return {
     id: createTabId('note'),
@@ -537,7 +835,19 @@ function buildFileBackedNoteTab(filePath: string, content: string): WorkspaceNot
     content,
     savedContent: content,
     viewMode: 'split',
-    fontSize: DEFAULT_NOTE_FONT_SIZE,
+    fontSize: props.workspaceTabDefaults.noteFontSize,
+  };
+}
+
+function buildFileBackedCodeTab(filePath: string, content: string): WorkspaceCodeTabState {
+  return {
+    id: createTabId('code'),
+    type: 'code',
+    title: getPathLeafName(filePath),
+    filePath,
+    content,
+    savedContent: content,
+    fontSize: props.workspaceTabDefaults.noteFontSize,
   };
 }
 
@@ -570,6 +880,7 @@ function isUserTypingInTab(tabId: string) {
 }
 
 function handleTabInput(tabId: string, input: string) {
+  markShellTabAsInteracted(tabId);
   setTabLastInput(tabId);
   clearTabAttention(tabId);
   clearTabActivity(tabId);
@@ -584,6 +895,12 @@ function handleTabInput(tabId: string, input: string) {
 }
 
 function handleTabActivity(tabId: string) {
+  const hasUserInputInCurrentSession = Boolean(tabLastInputAt.value[tabId]);
+
+  if (!hasUserInputInCurrentSession) {
+    return;
+  }
+
   const isActiveVisibleTab = tabId === activeTabId.value && !props.collapsed;
 
   if (isActiveVisibleTab) {
@@ -651,6 +968,10 @@ function handleTabActivity(tabId: string) {
 }
 
 function isTabActive(tabId: string) {
+  if (!interactedShellTabs.value[tabId]) {
+    return false;
+  }
+
   if (!tabRecentActivity.value[tabId]) {
     return false;
   }
@@ -662,6 +983,26 @@ function isTabActive(tabId: string) {
   }
 
   return true;
+}
+
+function buildVisualRecentActivity() {
+  return Object.fromEntries(
+    tabs.value
+      .filter((tab) => isTabActive(tab.id) && Boolean(interactedShellTabs.value[tab.id]))
+      .map((tab) => [tab.id, true]),
+  ) as Record<string, boolean>;
+}
+
+function buildVisualAttention() {
+  return Object.fromEntries(
+    tabs.value
+      .filter((tab) => (
+        Boolean(tabAttention.value[tab.id])
+        && Boolean(tabLastInputAt.value[tab.id])
+        && Boolean(interactedShellTabs.value[tab.id])
+      ))
+      .map((tab) => [tab.id, true]),
+  ) as Record<string, boolean>;
 }
 
 function selectAdjacentTab(direction: -1 | 1) {
@@ -693,7 +1034,7 @@ function addNoteTab() {
   return nextTab;
 }
 
-async function openNoteFile(targetTabId?: string | null) {
+async function openWorkspaceFile(targetTabId?: string | null) {
   creationMenu.value = null;
 
   if (!window.bridgegit?.notes) {
@@ -701,7 +1042,9 @@ async function openNoteFile(targetTabId?: string | null) {
   }
 
   const activeTab = activeTabId.value ? getTabById(activeTabId.value) : null;
-  const resolvedTargetTabId = targetTabId ?? (activeTab && isNoteTab(activeTab) ? activeTab.id : null);
+  const resolvedTargetTabId = targetTabId ?? (
+    activeTab && isEditableTab(activeTab) ? activeTab.id : null
+  );
 
   if (resolvedTargetTabId) {
     setNoteBusy(resolvedTargetTabId, true);
@@ -714,9 +1057,9 @@ async function openNoteFile(targetTabId?: string | null) {
       return null;
     }
 
-    return openResolvedNoteFile(openedFile, resolvedTargetTabId);
+    return openResolvedWorkspaceFile(openedFile, resolvedTargetTabId);
   } catch (error) {
-    console.error('Failed to open note file.', error);
+    console.error('Failed to open workspace file.', error);
     return null;
   } finally {
     if (resolvedTargetTabId) {
@@ -725,30 +1068,56 @@ async function openNoteFile(targetTabId?: string | null) {
   }
 }
 
-function openResolvedNoteFile(openedFile: NoteFileHandle, targetTabId?: string | null) {
-  const existingTab = findNoteTabByFilePath(openedFile.path, targetTabId);
+function openResolvedWorkspaceFile(
+  openedFile: NoteFileHandle,
+  targetTabId?: string | null,
+  preferredType?: 'note' | 'code',
+) {
+  const tabType = preferredType ?? resolveWorkspaceFileTabType(openedFile.path);
 
-  if (existingTab) {
-    setActiveTab(existingTab.id);
-    return existingTab;
+  if (tabType === 'unsupported') {
+    return null;
   }
 
   const targetTab = targetTabId ? getTabById(targetTabId) : null;
 
-  if (targetTab && isNoteTab(targetTab) && !targetTab.filePath && !targetTab.content.trim()) {
-    updateNoteTabState(targetTab.id, {
-      title: getPathLeafName(openedFile.path),
-      filePath: openedFile.path,
-      content: openedFile.content,
-      savedContent: openedFile.content,
-    });
-    setActiveTab(targetTab.id);
-    return targetTab;
+  if (tabType === 'note') {
+    const existingNoteTab = findNoteTabByFilePath(openedFile.path, targetTabId);
+
+    if (existingNoteTab) {
+      setActiveTab(existingNoteTab.id);
+      return existingNoteTab;
+    }
+
+    if (targetTab && isNoteTab(targetTab) && !targetTab.filePath && !targetTab.content.trim()) {
+      updateNoteTabState(targetTab.id, {
+        title: getPathLeafName(openedFile.path),
+        filePath: openedFile.path,
+        content: openedFile.content,
+        savedContent: openedFile.content,
+      });
+      seedTrackedFileState(targetTab.id, openedFile);
+      setActiveTab(targetTab.id);
+      return targetTab;
+    }
+
+    const nextNoteTab = buildFileBackedNoteTab(openedFile.path, openedFile.content);
+    syncState([...tabs.value, nextNoteTab], nextNoteTab.id);
+    seedTrackedFileState(nextNoteTab.id, openedFile);
+    return nextNoteTab;
   }
 
-  const nextTab = buildFileBackedNoteTab(openedFile.path, openedFile.content);
-  syncState([...tabs.value, nextTab], nextTab.id);
-  return nextTab;
+  const existingCodeTab = findCodeTabByFilePath(openedFile.path, targetTabId);
+
+  if (existingCodeTab) {
+    setActiveTab(existingCodeTab.id);
+    return existingCodeTab;
+  }
+
+  const nextCodeTab = buildFileBackedCodeTab(openedFile.path, openedFile.content);
+  syncState([...tabs.value, nextCodeTab], nextCodeTab.id);
+  seedTrackedFileState(nextCodeTab.id, openedFile);
+  return nextCodeTab;
 }
 
 async function openNoteFilePath(filePath: string, targetTabId?: string | null) {
@@ -767,7 +1136,7 @@ async function openNoteFilePath(filePath: string, targetTabId?: string | null) {
 
   try {
     const openedFile = await window.bridgegit.notes.readFile(filePath);
-    return openResolvedNoteFile(openedFile, resolvedTargetTabId);
+    return openResolvedWorkspaceFile(openedFile, resolvedTargetTabId, 'note');
   } catch (error) {
     console.error('Failed to open note file path.', error);
     return null;
@@ -778,12 +1147,221 @@ async function openNoteFilePath(filePath: string, targetTabId?: string | null) {
   }
 }
 
+async function openWorkspaceFilePath(filePath: string, targetTabId?: string | null) {
+  creationMenu.value = null;
+
+  if (!window.bridgegit?.notes) {
+    return null;
+  }
+
+  const activeTab = activeTabId.value ? getTabById(activeTabId.value) : null;
+  const targetType = resolveWorkspaceFileTabType(filePath);
+
+  if (targetType === 'unsupported') {
+    return null;
+  }
+
+  const resolvedTargetTabId = targetTabId ?? (
+    activeTab
+    && ((targetType === 'note' && isNoteTab(activeTab)) || (targetType === 'code' && isCodeTab(activeTab)))
+      ? activeTab.id
+      : null
+  );
+
+  if (resolvedTargetTabId) {
+    setNoteBusy(resolvedTargetTabId, true);
+  }
+
+  try {
+    const openedFile = await window.bridgegit.notes.readFile(filePath);
+    return openResolvedWorkspaceFile(openedFile, resolvedTargetTabId, targetType);
+  } catch (error) {
+    console.error('Failed to open workspace file path.', error);
+    return null;
+  } finally {
+    if (resolvedTargetTabId) {
+      setNoteBusy(resolvedTargetTabId, false);
+    }
+  }
+}
+
+async function openCodeNavigationTarget(target: CodeNavigationTarget) {
+  const openedTab = await openWorkspaceFilePath(target.filePath);
+
+  if (!openedTab) {
+    return null;
+  }
+
+  if (isCodeTab(openedTab) && (target.line || target.column)) {
+    setCodeNavigationRequest(openedTab.id, target);
+  }
+
+  return openedTab;
+}
+
+async function reloadEditableTabFromDisk(tabId: string) {
+  const tab = getTabById(tabId);
+  const filePath = tab ? getEditableTabFilePath(tab) : null;
+
+  if (!tab || !isEditableTab(tab) || !filePath || !window.bridgegit?.notes) {
+    return null;
+  }
+
+  setNoteBusy(tabId, true);
+
+  try {
+    const openedFile = await window.bridgegit.notes.readFile(filePath);
+
+    if (isNoteTab(tab)) {
+      updateNoteTabState(tabId, {
+        title: getPathLeafName(openedFile.path),
+        filePath: openedFile.path,
+        content: openedFile.content,
+        savedContent: openedFile.content,
+      });
+    } else {
+      updateCodeTabState(tabId, {
+        title: getPathLeafName(openedFile.path),
+        filePath: openedFile.path,
+        content: openedFile.content,
+        savedContent: openedFile.content,
+      });
+    }
+
+    seedTrackedFileState(tabId, openedFile);
+    return openedFile.path;
+  } catch (error) {
+    console.error('Failed to reload file from disk.', error);
+    return null;
+  } finally {
+    setNoteBusy(tabId, false);
+  }
+}
+
+async function dismissExternalFileChange(tabId: string) {
+  const tab = getTabById(tabId);
+  const filePath = tab ? getEditableTabFilePath(tab) : null;
+
+  if (!tab || !isEditableTab(tab) || !filePath || !window.bridgegit?.notes) {
+    clearExternalFileChange(tabId);
+    return;
+  }
+
+  const fileStat = await window.bridgegit.notes.statFile(filePath);
+  setTrackedFileSignature(tabId, buildTrackedFileSignature(fileStat));
+  markFileTrackingInitialized(tabId);
+  clearExternalFileChange(tabId);
+}
+
+async function pollExternalFileChanges() {
+  if (externalFilePollInFlight || !window.bridgegit?.notes) {
+    return;
+  }
+
+  externalFilePollInFlight = true;
+
+  try {
+    const fileBackedTabs = tabs.value.filter((tab): tab is WorkspaceNoteTabState | WorkspaceCodeTabState => (
+      isEditableTab(tab) && Boolean(getEditableTabFilePath(tab))
+    ));
+
+    for (const tab of fileBackedTabs) {
+      const filePath = getEditableTabFilePath(tab);
+
+      if (!filePath || noteBusyByTabId.value[tab.id]) {
+        continue;
+      }
+
+      const isInitialized = Boolean(initializedFileTrackingByTabId.value[tab.id]);
+
+      if (!isInitialized) {
+        const inspectedFile = await window.bridgegit.notes.inspectFile(filePath);
+
+        markFileTrackingInitialized(tab.id);
+
+        if (!inspectedFile) {
+          setTrackedFileSignature(tab.id, MISSING_FILE_SIGNATURE);
+          setExternalFileChange(tab.id, 'unavailable');
+          continue;
+        }
+
+        if (inspectedFile.content !== tab.savedContent) {
+          setTrackedFileSignature(tab.id, buildTrackedFileSignature(inspectedFile));
+          setExternalFileChange(tab.id, 'changed');
+          continue;
+        }
+
+        if (tab.content !== tab.savedContent) {
+          seedTrackedFileState(tab.id, inspectedFile);
+          setExternalFileChange(tab.id, 'session-dirty');
+          continue;
+        }
+
+        seedTrackedFileState(tab.id, inspectedFile);
+        continue;
+      }
+
+      const fileStat = await window.bridgegit.notes.statFile(filePath);
+      const nextSignature = buildTrackedFileSignature(fileStat);
+      const previousSignature = trackedFileSignatureByTabId.value[tab.id] ?? MISSING_FILE_SIGNATURE;
+
+      if (nextSignature === previousSignature) {
+        continue;
+      }
+
+      if (!fileStat) {
+        setTrackedFileSignature(tab.id, nextSignature);
+        setExternalFileChange(tab.id, 'unavailable');
+        continue;
+      }
+
+      const inspectedFile = await window.bridgegit.notes.inspectFile(filePath);
+
+      if (!inspectedFile) {
+        setTrackedFileSignature(tab.id, MISSING_FILE_SIGNATURE);
+        setExternalFileChange(tab.id, 'unavailable');
+        continue;
+      }
+
+      setTrackedFileSignature(tab.id, buildTrackedFileSignature(inspectedFile));
+
+      if (inspectedFile.content === tab.savedContent) {
+        clearExternalFileChange(tab.id);
+        continue;
+      }
+
+      setExternalFileChange(tab.id, 'changed');
+    }
+  } finally {
+    externalFilePollInFlight = false;
+  }
+}
+
+function startExternalFilePolling() {
+  if (externalFilePollTimer) {
+    return;
+  }
+
+  externalFilePollTimer = window.setInterval(() => {
+    void pollExternalFileChanges();
+  }, EXTERNAL_FILE_POLL_INTERVAL_MS);
+}
+
+function stopExternalFilePolling() {
+  if (!externalFilePollTimer) {
+    return;
+  }
+
+  window.clearInterval(externalFilePollTimer);
+  externalFilePollTimer = null;
+}
+
 function closeActiveTab() {
   if (!activeTabId.value || tabs.value.length < 2) {
     return;
   }
 
-  closeTab(activeTabId.value);
+  void requestCloseTab(activeTabId.value);
 }
 
 function reconnectTab(tabId: string) {
@@ -850,7 +1428,7 @@ async function activateCreationMenuAction(actionId: CreationMenuActionId) {
     return;
   }
 
-  await openNoteFile();
+  await openWorkspaceFile();
 }
 
 function handleCreationMenuKeydown(event: KeyboardEvent) {
@@ -878,7 +1456,7 @@ function handleCreationMenuKeydown(event: KeyboardEvent) {
 
   if (event.key === 'End') {
     event.preventDefault();
-    setActiveCreationMenuAction(CREATION_MENU_ACTION_ORDER.at(-1) ?? 'open-note');
+    setActiveCreationMenuAction(CREATION_MENU_ACTION_ORDER.at(-1) ?? 'open-file');
     return true;
   }
 
@@ -905,7 +1483,7 @@ function handleCreationMenuKeydown(event: KeyboardEvent) {
   return true;
 }
 
-function closeTab(tabId: string) {
+function performCloseTab(tabId: string) {
   const currentIndex = tabs.value.findIndex((tab) => tab.id === tabId);
 
   if (currentIndex === -1) {
@@ -945,8 +1523,56 @@ function closeTab(tabId: string) {
   syncState(nextTabs, activeTabId.value);
 }
 
+function closePendingCloseDialog() {
+  pendingCloseDialog.value = null;
+}
+
+async function requestCloseTab(tabId: string) {
+  const tab = getTabById(tabId);
+
+  if (!tab) {
+    return;
+  }
+
+  if (isEditableTab(tab) && isEditableTabDirty(tab)) {
+    pendingCloseDialog.value = {
+      kind: tab.type,
+      tabId,
+      title: tab.title,
+      hasSavedFile: Boolean(tab.filePath),
+      hasActivity: false,
+      hasAttention: false,
+    };
+    tabMenu.value = null;
+    creationMenu.value = null;
+    commandMenuOpen.value = false;
+    return;
+  }
+
+  if (isShellTab(tab) && shellNeedsCloseConfirmation(tabId)) {
+    pendingCloseDialog.value = {
+      kind: 'shell',
+      tabId,
+      title: tab.title,
+      hasSavedFile: false,
+      hasActivity: isTabActive(tabId),
+      hasAttention: hasAttention(tabId),
+    };
+    tabMenu.value = null;
+    creationMenu.value = null;
+    commandMenuOpen.value = false;
+    return;
+  }
+
+  performCloseTab(tabId);
+}
+
 function updateNoteContent(tabId: string, content: string) {
   updateNoteTabState(tabId, { content });
+}
+
+function updateCodeContent(tabId: string, content: string) {
+  updateCodeTabState(tabId, { content });
 }
 
 function updateNoteViewMode(tabId: string, viewMode: WorkspaceNoteTabState['viewMode']) {
@@ -955,6 +1581,14 @@ function updateNoteViewMode(tabId: string, viewMode: WorkspaceNoteTabState['view
 
 function updateNoteFontSize(tabId: string, fontSize: number) {
   updateNoteTabState(tabId, { fontSize });
+}
+
+function updateCodeFontSize(tabId: string, fontSize: number) {
+  updateCodeTabState(tabId, { fontSize });
+}
+
+function updateShellFontSize(tabId: string, fontSize: number) {
+  updateShellTabState(tabId, { fontSize });
 }
 
 async function saveNoteFile(tabId: string) {
@@ -972,14 +1606,47 @@ async function saveNoteFile(tabId: string) {
 
   try {
     const savedPath = await window.bridgegit.notes.saveFile(tab.filePath, tab.content);
+    const savedFileStat = await window.bridgegit.notes.statFile(savedPath);
     updateNoteTabState(tabId, {
       filePath: savedPath,
       title: getPathLeafName(savedPath),
       savedContent: tab.content,
     });
+    setTrackedFileSignature(tabId, buildTrackedFileSignature(savedFileStat));
+    markFileTrackingInitialized(tabId);
+    clearExternalFileChange(tabId);
     return savedPath;
   } catch (error) {
     console.error('Failed to save note file.', error);
+    return null;
+  } finally {
+    setNoteBusy(tabId, false);
+  }
+}
+
+async function saveCodeFile(tabId: string) {
+  const tab = getTabById(tabId);
+
+  if (!tab || !isCodeTab(tab) || !window.bridgegit?.notes) {
+    return null;
+  }
+
+  setNoteBusy(tabId, true);
+
+  try {
+    const savedPath = await window.bridgegit.notes.saveFile(tab.filePath, tab.content);
+    const savedFileStat = await window.bridgegit.notes.statFile(savedPath);
+    updateCodeTabState(tabId, {
+      filePath: savedPath,
+      title: getPathLeafName(savedPath),
+      savedContent: tab.content,
+    });
+    setTrackedFileSignature(tabId, buildTrackedFileSignature(savedFileStat));
+    markFileTrackingInitialized(tabId);
+    clearExternalFileChange(tabId);
+    return savedPath;
+  } catch (error) {
+    console.error('Failed to save code file.', error);
     return null;
   } finally {
     setNoteBusy(tabId, false);
@@ -1002,11 +1669,15 @@ async function saveNoteFileAs(tabId: string) {
       return null;
     }
 
+    const savedFileStat = await window.bridgegit.notes.statFile(savedPath);
     updateNoteTabState(tabId, {
       filePath: savedPath,
       title: getPathLeafName(savedPath),
       savedContent: tab.content,
     });
+    setTrackedFileSignature(tabId, buildTrackedFileSignature(savedFileStat));
+    markFileTrackingInitialized(tabId);
+    clearExternalFileChange(tabId);
     return savedPath;
   } catch (error) {
     console.error('Failed to save note file as.', error);
@@ -1014,6 +1685,82 @@ async function saveNoteFileAs(tabId: string) {
   } finally {
     setNoteBusy(tabId, false);
   }
+}
+
+async function saveCodeFileAs(tabId: string) {
+  const tab = getTabById(tabId);
+
+  if (!tab || !isCodeTab(tab) || !window.bridgegit?.notes) {
+    return null;
+  }
+
+  setNoteBusy(tabId, true);
+
+  try {
+    const savedPath = await window.bridgegit.notes.saveFileAs(tab.content, tab.filePath);
+
+    if (!savedPath) {
+      return null;
+    }
+
+    const savedFileStat = await window.bridgegit.notes.statFile(savedPath);
+    updateCodeTabState(tabId, {
+      filePath: savedPath,
+      title: getPathLeafName(savedPath),
+      savedContent: tab.content,
+    });
+    setTrackedFileSignature(tabId, buildTrackedFileSignature(savedFileStat));
+    markFileTrackingInitialized(tabId);
+    clearExternalFileChange(tabId);
+    return savedPath;
+  } catch (error) {
+    console.error('Failed to save code file as.', error);
+    return null;
+  } finally {
+    setNoteBusy(tabId, false);
+  }
+}
+
+async function handlePendingCloseSave() {
+  if (!pendingCloseDialog.value || pendingCloseDialog.value.kind === 'shell') {
+    return;
+  }
+
+  const { kind, tabId } = pendingCloseDialog.value;
+  const savedPath = kind === 'code' ? await saveCodeFile(tabId) : await saveNoteFile(tabId);
+
+  if (!savedPath) {
+    return;
+  }
+
+  closePendingCloseDialog();
+  performCloseTab(tabId);
+}
+
+async function handlePendingCloseSaveAs() {
+  if (!pendingCloseDialog.value || pendingCloseDialog.value.kind === 'shell') {
+    return;
+  }
+
+  const { kind, tabId } = pendingCloseDialog.value;
+  const savedPath = kind === 'code' ? await saveCodeFileAs(tabId) : await saveNoteFileAs(tabId);
+
+  if (!savedPath) {
+    return;
+  }
+
+  closePendingCloseDialog();
+  performCloseTab(tabId);
+}
+
+function handlePendingCloseDiscard() {
+  if (!pendingCloseDialog.value) {
+    return;
+  }
+
+  const { tabId } = pendingCloseDialog.value;
+  closePendingCloseDialog();
+  performCloseTab(tabId);
 }
 
 async function startEditing(tab: WorkspaceTabState) {
@@ -1101,6 +1848,7 @@ function handleDocumentKeydown(event: KeyboardEvent) {
   }
 
   if (event.key === 'Escape') {
+    closePendingCloseDialog();
     closeTabMenu();
     closeCreationMenu();
     closeCommandMenu();
@@ -1113,8 +1861,12 @@ function saveEditing(tabId: string) {
   }
 
   const activeTab = tabs.value.find((tab) => tab.id === tabId);
-  const fallbackTitle = activeTab && isNoteTab(activeTab)
-    ? (activeTab.filePath ? getPathLeafName(activeTab.filePath) : 'Notes')
+  const fallbackTitle = activeTab
+    ? (
+      isEditableTab(activeTab)
+        ? getPathLeafName(activeTab.filePath ?? '') || (activeTab.type === 'note' ? 'Notes' : 'Code')
+        : 'Shell'
+    )
     : 'Shell';
   const nextTitle = draftTitle.value.trim() || fallbackTitle;
   const nextTabs = tabs.value.map((tab) => (
@@ -1188,14 +1940,31 @@ watch(
   (nextTabs) => {
     tabs.value = cloneTabs(nextTabs);
     pruneTabActivityState(nextTabs);
+    pruneExternalFileRuntimeState(nextTabs);
+    pruneCodeNavigationRequests(nextTabs);
+    void pollExternalFileChanges();
   },
   { deep: true },
 );
 
 watch(
-  tabRecentActivity,
-  (nextRecentActivity) => {
-    emit('update:recent-activity', { ...nextRecentActivity });
+  [tabRecentActivity, activeTabId, tabLastTypingAt, () => props.collapsed, tabs, interactedShellTabs],
+  () => {
+    emit('update:recent-activity', {
+      workspaceId: props.workspaceId,
+      recentActivity: buildVisualRecentActivity(),
+    });
+  },
+  { deep: true, immediate: true },
+);
+
+watch(
+  [tabAttention, tabLastInputAt, tabs, interactedShellTabs],
+  () => {
+    emit('update:attention', {
+      workspaceId: props.workspaceId,
+      attention: buildVisualAttention(),
+    });
   },
   { deep: true, immediate: true },
 );
@@ -1204,6 +1973,10 @@ watch(
   () => props.activeTabId,
   (nextActiveTabId) => {
     activeTabId.value = nextActiveTabId ?? props.tabs[0]?.id ?? null;
+
+    if (activeTabId.value) {
+      markShellTabAsStarted(activeTabId.value);
+    }
   },
 );
 
@@ -1217,12 +1990,39 @@ watch(
   },
 );
 
+watch(
+  () => props.workspaceId,
+  (nextWorkspaceId, previousWorkspaceId) => {
+    if (!nextWorkspaceId || nextWorkspaceId === previousWorkspaceId) {
+      return;
+    }
+
+    if (previousWorkspaceId) {
+      emit('update:recent-activity', {
+        workspaceId: previousWorkspaceId,
+        recentActivity: {},
+      });
+      emit('update:attention', {
+        workspaceId: previousWorkspaceId,
+        attention: {},
+      });
+    }
+
+    resetTransientTabState();
+  },
+);
+
 onMounted(async () => {
   tabs.value = cloneTabs(props.tabs);
   activeTabId.value = props.activeTabId ?? props.tabs[0]?.id ?? null;
+  if (activeTabId.value) {
+    markShellTabAsStarted(activeTabId.value);
+  }
   ensureTab();
   document.addEventListener('pointerdown', handleDocumentPointerDown);
   document.addEventListener('keydown', handleDocumentKeydown);
+  startExternalFilePolling();
+  void pollExternalFileChanges();
 
   await nextTick();
 });
@@ -1230,8 +2030,16 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   document.removeEventListener('pointerdown', handleDocumentPointerDown);
   document.removeEventListener('keydown', handleDocumentKeydown);
+  stopExternalFilePolling();
   clearTabDragState();
-  emit('update:recent-activity', {});
+  emit('update:recent-activity', {
+    workspaceId: props.workspaceId,
+    recentActivity: {},
+  });
+  emit('update:attention', {
+    workspaceId: props.workspaceId,
+    attention: {},
+  });
   tabs.value.forEach((tab) => {
     clearTabActivity(tab.id);
     clearTabAttention(tab.id);
@@ -1249,13 +2057,14 @@ defineExpose({
   focusNextTab: () => selectAdjacentTab(1),
   executePresetBySlot,
   openCreationMenu: () => openCreationMenu(),
-  openNoteFile: () => openNoteFile(),
+  openFile: () => openWorkspaceFile(),
   openNoteFilePath: (filePath: string) => openNoteFilePath(filePath),
+  openWorkspaceFilePath: (filePath: string) => openWorkspaceFilePath(filePath),
 });
 </script>
 
 <template>
-  <section class="terminal-panel">
+  <section class="terminal-panel" :data-appearance-theme="props.appearanceTheme">
     <header class="terminal-panel__tabs-header">
       <div class="terminal-panel__tabs" role="tablist" aria-label="Workspace tabs">
         <div
@@ -1263,7 +2072,7 @@ defineExpose({
           :key="tab.id"
           class="terminal-panel__tab"
           :class="{
-            'terminal-panel__tab--active': tab.id === activeTabId,
+            'terminal-panel__tab--active': hasTabActiveChrome(tab),
             'terminal-panel__tab--editing': editingTabId === tab.id,
             'terminal-panel__tab--dragging': tab.id === draggedTabId,
             'terminal-panel__tab--drop-target': tab.id === dropTargetTabId && tab.id !== draggedTabId,
@@ -1279,10 +2088,10 @@ defineExpose({
             <span
               class="terminal-panel__tab-dot"
               :class="{
-                'terminal-panel__tab-dot--note-file': noteHasSavedFile(tab) && !isNoteDirty(tab),
-                'terminal-panel__tab-dot--note-dirty': isNoteDirty(tab),
+                'terminal-panel__tab-dot--note-file': editableTabHasSavedFile(tab) && !isEditableTabDirty(tab),
+                'terminal-panel__tab-dot--note-dirty': isEditableTabDirty(tab),
                 'terminal-panel__tab-dot--attention': hasAttention(tab.id),
-                'terminal-panel__tab-dot--current': tab.id === activeTabId,
+                'terminal-panel__tab-dot--current': tab.id === activeTabId && showsShellTabIndicator(tab),
                 'terminal-panel__tab-dot--active': isTabActive(tab.id),
             }"
             aria-hidden="true"
@@ -1319,7 +2128,7 @@ defineExpose({
             type="button"
             :title="`Close ${tabDisplayTitle(tab)}`"
             :aria-label="`Close ${tabDisplayTitle(tab)}`"
-            @click.stop="closeTab(tab.id)"
+            @click.stop="requestCloseTab(tab.id)"
           >
             <svg viewBox="0 0 16 16" aria-hidden="true">
               <path d="M4 4l8 8" />
@@ -1403,36 +2212,79 @@ defineExpose({
     <div class="terminal-panel__views">
       <template v-for="tab in tabs" :key="tab.id">
         <TerminalSessionView
-          v-if="tab.type === 'shell'"
+          v-if="tab.type === 'shell' && shouldMountShellTab(tab)"
+          :key="buildWorkspaceTabRuntimeKey(props.workspaceId, tab.id)"
           :ref="(instance) => setSessionViewRef(tab.id, instance)"
           class="terminal-panel__view"
           :class="{ 'terminal-panel__view--active': tab.id === activeTabId }"
+          :session-key="buildWorkspaceTabRuntimeKey(props.workspaceId, tab.id)"
           :cwd="tab.cwd"
+          :font-size="tab.fontSize"
+          :appearance-theme="props.appearanceTheme"
+          :appearance-theme-variant="props.appearanceThemeVariant"
           :active="tab.id === activeTabId && !collapsed"
           :reconnect-token="reconnectTokens[tab.id] ?? 0"
+          @activate="handleTerminalViewActivate(tab.id)"
           @activity="handleTabActivity(tab.id)"
           @input="handleTabInput(tab.id, $event)"
+          @update:font-size="updateShellFontSize(tab.id, $event)"
         />
 
         <NoteTabView
-          v-else
+          v-else-if="tab.type === 'note'"
+          :key="buildWorkspaceTabRuntimeKey(props.workspaceId, tab.id)"
           class="terminal-panel__view"
           :class="{ 'terminal-panel__view--active': tab.id === activeTabId }"
           :active="tab.id === activeTabId && !collapsed"
           :busy="Boolean(noteBusyByTabId[tab.id])"
           :content="tab.content"
           :file-path="tab.filePath"
+          :project-root="props.projectRoot"
+          :appearance-theme="props.appearanceTheme"
+          :appearance-theme-variant="props.appearanceThemeVariant"
           :is-dirty="tab.content !== tab.savedContent"
+          :external-change="externalFileChangeByTabId[tab.id] ?? null"
           :view-mode="tab.viewMode"
           :font-size="tab.fontSize"
           @focus-previous-tab="selectAdjacentTab(-1)"
           @focus-next-tab="selectAdjacentTab(1)"
-          @open-file="openNoteFile(tab.id)"
+          @open-file="openWorkspaceFile(tab.id)"
+          @open-note-link="openNoteFilePath($event, tab.id)"
+          @reload-from-disk="reloadEditableTabFromDisk(tab.id)"
           @save-file="saveNoteFile(tab.id)"
           @save-file-as="saveNoteFileAs(tab.id)"
+          @dismiss-external-change="dismissExternalFileChange(tab.id)"
           @update:content="updateNoteContent(tab.id, $event)"
           @update:font-size="updateNoteFontSize(tab.id, $event)"
           @update:view-mode="updateNoteViewMode(tab.id, $event)"
+        />
+
+        <CodeTabView
+          v-else-if="tab.type === 'code'"
+          :key="buildWorkspaceTabRuntimeKey(props.workspaceId, tab.id)"
+          class="terminal-panel__view"
+          :class="{ 'terminal-panel__view--active': tab.id === activeTabId }"
+          :active="tab.id === activeTabId && !collapsed"
+          :busy="Boolean(noteBusyByTabId[tab.id])"
+          :content="tab.content"
+          :file-path="tab.filePath"
+          :project-root="props.projectRoot"
+          :editor-theme="props.editorTheme"
+          :theme-variant="props.editorThemeVariant"
+          :navigation-request="codeNavigationRequestByTabId[tab.id] ?? null"
+          :is-dirty="tab.content !== tab.savedContent"
+          :external-change="externalFileChangeByTabId[tab.id] ?? null"
+          :font-size="tab.fontSize"
+          @focus-previous-tab="selectAdjacentTab(-1)"
+          @focus-next-tab="selectAdjacentTab(1)"
+          @open-file="openWorkspaceFile(tab.id)"
+          @open-navigation-target="openCodeNavigationTarget($event)"
+          @reload-from-disk="reloadEditableTabFromDisk(tab.id)"
+          @save-file="saveCodeFile(tab.id)"
+          @save-file-as="saveCodeFileAs(tab.id)"
+          @dismiss-external-change="dismissExternalFileChange(tab.id)"
+          @update:content="updateCodeContent(tab.id, $event)"
+          @update:font-size="updateCodeFontSize(tab.id, $event)"
         />
       </template>
     </div>
@@ -1464,10 +2316,79 @@ defineExpose({
         v-if="sortedTabCount > 1"
         class="terminal-panel__menu-item terminal-panel__menu-item--danger"
         type="button"
-        @click="closeTab(menuTab.id)"
+        @click="requestCloseTab(menuTab.id)"
       >
         Close tab
       </button>
+    </div>
+
+    <div
+      v-if="pendingCloseDialog"
+      class="terminal-panel__dialog-backdrop"
+      @click="closePendingCloseDialog"
+    >
+      <section
+        class="terminal-panel__dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-label="Confirm tab close"
+        @click.stop
+      >
+        <span class="terminal-panel__dialog-eyebrow">
+          {{ pendingCloseDialog.kind === 'shell'
+            ? 'Shell activity'
+            : (pendingCloseDialog.kind === 'code' ? 'Unsaved file' : 'Unsaved note') }}
+        </span>
+        <h3 class="terminal-panel__dialog-title">
+          Close {{ pendingCloseDialog.title }}?
+        </h3>
+        <p class="terminal-panel__dialog-copy">
+          {{ pendingCloseDialog.kind === 'note'
+            ? (pendingCloseDialog.hasSavedFile
+              ? 'This note has unsaved changes. Save it before closing, save a copy under a new file name, or discard the changes.'
+              : 'This scratch note has unsaved changes. Save it before closing or discard the changes.')
+            : pendingCloseDialog.kind === 'code'
+              ? 'This file has unsaved changes. Save it before closing, save a copy under a new file name, or discard the changes.'
+              : (pendingCloseDialog.hasAttention
+                ? 'This shell tab still needs attention. Close it anyway?'
+                : 'This shell tab still shows recent activity. Close it anyway?') }}
+        </p>
+
+        <div class="terminal-panel__dialog-actions">
+          <template v-if="pendingCloseDialog.kind !== 'shell'">
+            <button
+              class="terminal-panel__dialog-button terminal-panel__dialog-button--primary"
+              type="button"
+              @click="handlePendingCloseSave"
+            >
+              Save
+            </button>
+            <button
+              v-if="pendingCloseDialog.hasSavedFile"
+              class="terminal-panel__dialog-button"
+              type="button"
+              @click="handlePendingCloseSaveAs"
+            >
+              Save As
+            </button>
+          </template>
+
+          <button
+            class="terminal-panel__dialog-button terminal-panel__dialog-button--danger"
+            type="button"
+            @click="handlePendingCloseDiscard"
+          >
+            {{ pendingCloseDialog.kind === 'shell' ? 'Close anyway' : 'Discard' }}
+          </button>
+          <button
+            class="terminal-panel__dialog-button"
+            type="button"
+            @click="closePendingCloseDialog"
+          >
+            Cancel
+          </button>
+        </div>
+      </section>
     </div>
 
     <div
@@ -1506,11 +2427,93 @@ defineExpose({
 
 <style scoped lang="scss">
 .terminal-panel {
+  --terminal-panel-tab-bg: rgba(13, 18, 24, 0.84);
+  --terminal-panel-tab-active-bg: rgba(21, 29, 39, 0.96);
+  --terminal-panel-tab-hover-bg: rgba(18, 25, 33, 0.92);
+  --terminal-panel-close-hover-bg: rgba(255, 255, 255, 0.08);
+  --terminal-panel-close-hover-color: #f6fbff;
+  --terminal-panel-close-focus-bg: rgba(110, 197, 255, 0.16);
+  --terminal-panel-control-bg: rgba(14, 20, 27, 0.88);
+  --terminal-panel-menu-bg: rgba(10, 14, 19, 0.98);
+  --terminal-panel-menu-hover-bg: rgba(24, 33, 43, 0.92);
+  --terminal-panel-menu-shortcut-bg: rgba(8, 12, 17, 0.42);
+  --terminal-panel-dialog-backdrop: rgba(2, 5, 8, 0.5);
+  --terminal-panel-dialog-bg:
+    linear-gradient(160deg, rgba(69, 151, 250, 0.08), transparent 34%),
+    rgba(10, 14, 19, 0.98);
   position: relative;
   display: grid;
   grid-template-rows: auto 1fr;
   height: 100%;
   min-height: 0;
+}
+
+.terminal-panel[data-appearance-theme='bridgegit-light'] {
+  --terminal-panel-tab-bg: rgba(236, 242, 249, 0.96);
+  --terminal-panel-tab-active-bg: rgba(224, 234, 244, 0.98);
+  --terminal-panel-tab-hover-bg: rgba(230, 238, 247, 0.98);
+  --terminal-panel-close-hover-bg: rgba(45, 124, 216, 0.1);
+  --terminal-panel-close-hover-color: #1d3b5d;
+  --terminal-panel-close-focus-bg: rgba(45, 124, 216, 0.14);
+  --terminal-panel-control-bg: rgba(236, 242, 249, 0.98);
+  --terminal-panel-menu-bg: rgba(255, 255, 255, 0.98);
+  --terminal-panel-menu-hover-bg: rgba(230, 238, 247, 0.98);
+  --terminal-panel-menu-shortcut-bg: rgba(236, 242, 249, 0.98);
+  --terminal-panel-dialog-backdrop: rgba(214, 224, 237, 0.58);
+  --terminal-panel-dialog-bg:
+    linear-gradient(160deg, rgba(88, 154, 225, 0.08), transparent 34%),
+    rgba(248, 251, 255, 0.98);
+}
+
+.terminal-panel[data-appearance-theme='github-dark'] {
+  --terminal-panel-tab-bg: #161b22;
+  --terminal-panel-tab-active-bg: #21262d;
+  --terminal-panel-tab-hover-bg: #30363d;
+  --terminal-panel-close-hover-bg: rgba(88, 166, 255, 0.12);
+  --terminal-panel-close-hover-color: #c9d1d9;
+  --terminal-panel-close-focus-bg: rgba(88, 166, 255, 0.16);
+  --terminal-panel-control-bg: #21262d;
+  --terminal-panel-menu-bg: #161b22;
+  --terminal-panel-menu-hover-bg: #21262d;
+  --terminal-panel-menu-shortcut-bg: rgba(13, 17, 23, 0.42);
+  --terminal-panel-dialog-backdrop: rgba(1, 4, 9, 0.58);
+  --terminal-panel-dialog-bg:
+    linear-gradient(160deg, rgba(56, 139, 253, 0.08), transparent 34%),
+    #0d1117;
+}
+
+.terminal-panel[data-appearance-theme='github-light'] {
+  --terminal-panel-tab-bg: #f6f8fa;
+  --terminal-panel-tab-active-bg: #eef2f6;
+  --terminal-panel-tab-hover-bg: #f0f3f6;
+  --terminal-panel-close-hover-bg: rgba(9, 105, 218, 0.12);
+  --terminal-panel-close-hover-color: #1f3f63;
+  --terminal-panel-close-focus-bg: rgba(9, 105, 218, 0.16);
+  --terminal-panel-control-bg: #f6f8fa;
+  --terminal-panel-menu-bg: #ffffff;
+  --terminal-panel-menu-hover-bg: #eef2f6;
+  --terminal-panel-menu-shortcut-bg: rgba(246, 248, 250, 0.98);
+  --terminal-panel-dialog-backdrop: rgba(208, 215, 222, 0.46);
+  --terminal-panel-dialog-bg:
+    linear-gradient(160deg, rgba(9, 105, 218, 0.06), transparent 34%),
+    #ffffff;
+}
+
+.terminal-panel[data-appearance-theme='nord'] {
+  --terminal-panel-tab-bg: rgba(59, 66, 82, 0.94);
+  --terminal-panel-tab-active-bg: rgba(67, 76, 94, 0.98);
+  --terminal-panel-tab-hover-bg: rgba(76, 86, 106, 0.98);
+  --terminal-panel-close-hover-bg: rgba(136, 192, 208, 0.14);
+  --terminal-panel-close-hover-color: #e5e9f0;
+  --terminal-panel-close-focus-bg: rgba(136, 192, 208, 0.18);
+  --terminal-panel-control-bg: rgba(67, 76, 94, 0.96);
+  --terminal-panel-menu-bg: rgba(46, 52, 64, 0.98);
+  --terminal-panel-menu-hover-bg: rgba(59, 66, 82, 0.96);
+  --terminal-panel-menu-shortcut-bg: rgba(46, 52, 64, 0.5);
+  --terminal-panel-dialog-backdrop: rgba(36, 41, 51, 0.58);
+  --terminal-panel-dialog-bg:
+    linear-gradient(160deg, rgba(136, 192, 208, 0.08), transparent 34%),
+    rgba(46, 52, 64, 0.98);
 }
 
 .terminal-panel__tabs-header {
@@ -1548,7 +2551,7 @@ defineExpose({
   min-width: 0;
   border: 1px solid var(--border-subtle);
   border-radius: 12px;
-  background: rgba(13, 18, 24, 0.84);
+  background: var(--terminal-panel-tab-bg);
   padding: 3px 6px 3px 10px;
   cursor: pointer;
   transition:
@@ -1559,13 +2562,13 @@ defineExpose({
 
 .terminal-panel__tab--active {
   border-color: rgba(110, 197, 255, 0.36);
-  background: rgba(21, 29, 39, 0.96);
+  background: var(--terminal-panel-tab-active-bg);
   box-shadow: inset 0 0 0 1px rgba(110, 197, 255, 0.08);
 }
 
 .terminal-panel__tab:hover {
   border-color: rgba(110, 197, 255, 0.18);
-  background: rgba(18, 25, 33, 0.92);
+  background: var(--terminal-panel-tab-hover-bg);
 }
 
 .terminal-panel__tab--editing {
@@ -1698,18 +2701,18 @@ defineExpose({
 .terminal-panel__commands-button:hover,
 .terminal-panel__collapse:hover {
   border-color: rgba(110, 197, 255, 0.2);
-  background: rgba(24, 33, 43, 0.92);
+  background: var(--terminal-panel-menu-hover-bg);
 }
 
 .terminal-panel__tab-close:hover {
-  color: #f6fbff;
-  background: rgba(255, 255, 255, 0.08);
+  color: var(--terminal-panel-close-hover-color);
+  background: var(--terminal-panel-close-hover-bg);
 }
 
 .terminal-panel__tab-close:focus-visible {
   outline: none;
-  background: rgba(110, 197, 255, 0.16);
-  color: #f6fbff;
+  background: var(--terminal-panel-close-focus-bg);
+  color: var(--terminal-panel-close-hover-color);
   opacity: 1;
 }
 
@@ -1734,19 +2737,19 @@ defineExpose({
 
 .terminal-panel__add {
   border: 1px solid var(--border-subtle);
-  background: rgba(14, 20, 27, 0.88);
+  background: var(--terminal-panel-control-bg);
   color: var(--text-primary);
 }
 
 .terminal-panel__collapse {
   border: 1px solid var(--border-subtle);
-  background: rgba(14, 20, 27, 0.88);
+  background: var(--terminal-panel-control-bg);
   color: var(--text-primary);
 }
 
 .terminal-panel__commands-button {
   border: 1px solid var(--border-subtle);
-  background: rgba(14, 20, 27, 0.88);
+  background: var(--terminal-panel-control-bg);
   color: var(--text-primary);
 }
 
@@ -1782,7 +2785,7 @@ defineExpose({
   padding: 6px;
   border: 1px solid var(--border-strong);
   border-radius: 12px;
-  background: rgba(10, 14, 19, 0.98);
+  background: var(--terminal-panel-menu-bg);
   box-shadow: 0 18px 42px rgba(0, 0, 0, 0.36);
 }
 
@@ -1822,11 +2825,11 @@ defineExpose({
 }
 
 .terminal-panel__menu-item:hover {
-  background: rgba(24, 33, 43, 0.92);
+  background: var(--terminal-panel-menu-hover-bg);
 }
 
 .terminal-panel__menu-item--selected {
-  background: rgba(24, 33, 43, 0.92);
+  background: var(--terminal-panel-menu-hover-bg);
 }
 
 .terminal-panel__menu-item:focus-visible {
@@ -1857,11 +2860,85 @@ defineExpose({
   padding: 0.14rem 0.42rem;
   border: 1px solid rgba(108, 124, 148, 0.12);
   border-radius: 8px;
-  background: rgba(8, 12, 17, 0.42);
+  background: var(--terminal-panel-menu-shortcut-bg);
   color: rgba(173, 184, 197, 0.78);
   font-family: var(--font-mono);
   font-size: 0.72rem;
   white-space: nowrap;
+}
+
+.terminal-panel__dialog-backdrop {
+  position: absolute;
+  inset: 0;
+  z-index: 20;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: var(--terminal-panel-dialog-backdrop);
+  backdrop-filter: blur(3px);
+}
+
+.terminal-panel__dialog {
+  display: grid;
+  gap: 12px;
+  width: min(460px, 100%);
+  padding: 18px;
+  border: 1px solid var(--border-strong);
+  border-radius: 18px;
+  background: var(--terminal-panel-dialog-bg);
+  box-shadow: 0 22px 48px rgba(0, 0, 0, 0.38);
+}
+
+.terminal-panel__dialog-eyebrow {
+  color: var(--text-dim);
+  font-size: 0.72rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.terminal-panel__dialog-title {
+  margin: 0;
+  color: var(--text-primary);
+  font-family: var(--font-display);
+  font-size: 1.08rem;
+}
+
+.terminal-panel__dialog-copy {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 0.82rem;
+  line-height: 1.5;
+}
+
+.terminal-panel__dialog-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.terminal-panel__dialog-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.55rem 0.82rem;
+  border: 1px solid var(--border-subtle);
+  border-radius: 10px;
+  background: rgba(17, 23, 31, 0.9);
+  color: var(--text-primary);
+  font-size: 0.78rem;
+  font-weight: 600;
+}
+
+.terminal-panel__dialog-button--primary {
+  border-color: rgba(110, 197, 255, 0.28);
+  background: rgba(69, 151, 250, 0.16);
+  color: #b9dcff;
+}
+
+.terminal-panel__dialog-button--danger {
+  border-color: rgba(188, 87, 87, 0.24);
+  background: rgba(188, 87, 87, 0.14);
+  color: #ffb3ad;
 }
 
 .terminal-panel__view {

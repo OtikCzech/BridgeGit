@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { html as renderDiffHtml } from 'diff2html';
 import { ColorSchemeType } from 'diff2html/lib/types';
+import type { GitDiffMode } from '../../shared/bridgegit';
 import { computed, ref } from 'vue';
 
 interface Props {
@@ -10,6 +11,7 @@ interface Props {
   titleMeta?: string | null;
   hasTarget: boolean;
   diff: string;
+  gitDiffMode: GitDiffMode;
   isLoading: boolean;
   error: string | null;
   changePosition: number;
@@ -17,6 +19,8 @@ interface Props {
   canSelectPrevious: boolean;
   canSelectNext: boolean;
   canStageCurrent: boolean;
+  canDiscardCurrent: boolean;
+  canOpenCurrentFile: boolean;
   stageActionLabel: string;
   canCollapse: boolean;
   collapseShortcutDisplay: string;
@@ -27,8 +31,29 @@ const emit = defineEmits<{
   'select-previous': [];
   'select-next': [];
   'stage-current': [];
+  'discard-current': [];
+  'open-current-file': [];
+  'discard-hunk': [patch: string];
   'toggle-collapse': [];
 }>();
+
+interface DiffHunkSection {
+  id: string;
+  patch: string;
+  renderedHtml: string;
+  lineActions: Array<{
+    id: string;
+    label: string;
+    patch: string;
+  }>;
+}
+
+interface ParsedHunkLine {
+  prefix: ' ' | '+' | '-' | '\\';
+  raw: string;
+  oldLineNumber: number | null;
+  newLineNumber: number | null;
+}
 
 const viewMode = ref<'side-by-side' | 'line-by-line'>('side-by-side');
 const isCommitMode = computed(() => props.viewerMode === 'commit');
@@ -41,6 +66,7 @@ const collapseButtonTitle = computed(() => (
     ? `Collapse diff panel ${props.collapseShortcutDisplay}`
     : 'Diff panel cannot be collapsed while it is the last visible panel'
 ));
+const canDiscardHunks = computed(() => !isCommitMode.value && props.gitDiffMode !== 'working-tree' ? true : !isCommitMode.value);
 
 const hasDiff = computed(() => props.diff.includes('diff --git'));
 const renderedDiff = computed(() => {
@@ -56,8 +82,212 @@ const renderedDiff = computed(() => {
   });
 });
 
+const hunkSections = computed<DiffHunkSection[]>(() => {
+  if (!hasDiff.value || isCommitMode.value) {
+    return [];
+  }
+
+  const normalizedDiff = props.diff.replace(/\r\n/g, '\n');
+  const diffLines = normalizedDiff.split('\n');
+  const diffHeaders = diffLines.filter((line) => line.startsWith('diff --git '));
+
+  if (diffHeaders.length !== 1) {
+    return [];
+  }
+
+  const firstHunkIndex = diffLines.findIndex((line) => line.startsWith('@@ '));
+
+  if (firstHunkIndex < 0) {
+    return [];
+  }
+
+  const headerLines = diffLines.slice(0, firstHunkIndex);
+
+  if (headerLines.some((line) => /^new file mode |^deleted file mode |^Binary files /.test(line))) {
+    return [];
+  }
+
+  const hunks: string[][] = [];
+  let currentHunk: string[] = [];
+
+  diffLines.slice(firstHunkIndex).forEach((line) => {
+    if (line.startsWith('@@ ') && currentHunk.length > 0) {
+      hunks.push(currentHunk);
+      currentHunk = [];
+    }
+
+    currentHunk.push(line);
+  });
+
+  if (currentHunk.length > 0) {
+    hunks.push(currentHunk);
+  }
+
+  return hunks.map((hunkLines, index) => {
+    const patch = [...headerLines, ...hunkLines].join('\n');
+    const lineActions = buildLineActions(headerLines, hunkLines, index);
+    return {
+      id: `hunk-${index + 1}`,
+      patch,
+      renderedHtml: renderDiffHtml(patch, {
+        colorScheme: ColorSchemeType.DARK,
+        drawFileList: false,
+        matching: 'lines',
+        outputFormat: viewMode.value,
+      }),
+      lineActions,
+    };
+  });
+});
+
+const shouldRenderHunkSections = computed(() => hunkSections.value.length > 0);
+
 function toggleViewMode() {
   viewMode.value = isSideBySide.value ? 'line-by-line' : 'side-by-side';
+}
+
+function formatHunkRange(start: number, count: number) {
+  return count === 1 ? `${start}` : `${start},${count}`;
+}
+
+function parseHunkHeader(hunkHeader: string) {
+  const match = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(hunkHeader);
+
+  if (!match) {
+    return null;
+  }
+
+  return {
+    oldStart: Number(match[1]),
+    oldCount: Number(match[2] ?? 1),
+    newStart: Number(match[3]),
+    newCount: Number(match[4] ?? 1),
+  };
+}
+
+function parseHunkLines(hunkLines: string[]) {
+  const parsedHeader = parseHunkHeader(hunkLines[0] ?? '');
+
+  if (!parsedHeader) {
+    return [];
+  }
+
+  const parsedLines: ParsedHunkLine[] = [];
+  let oldLineNumber = parsedHeader.oldStart;
+  let newLineNumber = parsedHeader.newStart;
+
+  hunkLines.slice(1).forEach((line) => {
+    if (line.startsWith(' ')) {
+      parsedLines.push({
+        prefix: ' ',
+        raw: line,
+        oldLineNumber,
+        newLineNumber,
+      });
+      oldLineNumber += 1;
+      newLineNumber += 1;
+      return;
+    }
+
+    if (line.startsWith('-')) {
+      parsedLines.push({
+        prefix: '-',
+        raw: line,
+        oldLineNumber,
+        newLineNumber: null,
+      });
+      oldLineNumber += 1;
+      return;
+    }
+
+    if (line.startsWith('+')) {
+      parsedLines.push({
+        prefix: '+',
+        raw: line,
+        oldLineNumber: null,
+        newLineNumber,
+      });
+      newLineNumber += 1;
+      return;
+    }
+
+    parsedLines.push({
+      prefix: '\\',
+      raw: line,
+      oldLineNumber: null,
+      newLineNumber: null,
+    });
+  });
+
+  return parsedLines;
+}
+
+function buildLineActions(headerLines: string[], hunkLines: string[], hunkIndex: number) {
+  const parsedLines = parseHunkLines(hunkLines);
+  const lineActions: DiffHunkSection['lineActions'] = [];
+  let lineActionIndex = 0;
+
+  for (let index = 0; index < parsedLines.length; index += 1) {
+    const currentLine = parsedLines[index];
+
+    if (currentLine.prefix === ' ' || currentLine.prefix === '\\') {
+      continue;
+    }
+
+    const blockStart = index;
+    let blockEnd = index;
+
+    while (blockEnd + 1 < parsedLines.length) {
+      const nextLine = parsedLines[blockEnd + 1];
+
+      if (nextLine.prefix === ' ' || nextLine.prefix === '\\') {
+        break;
+      }
+
+      blockEnd += 1;
+    }
+
+    const sliceStart = blockStart > 0 && parsedLines[blockStart - 1]?.prefix === ' '
+      ? blockStart - 1
+      : blockStart;
+    const sliceEnd = blockEnd + 1 < parsedLines.length && parsedLines[blockEnd + 1]?.prefix === ' '
+      ? blockEnd + 1
+      : blockEnd;
+    const sliceLines = parsedLines.slice(sliceStart, sliceEnd + 1).filter((line) => line.prefix !== '\\');
+    const firstOldLineNumber = sliceLines.find((line) => line.oldLineNumber !== null)?.oldLineNumber;
+    const firstNewLineNumber = sliceLines.find((line) => line.newLineNumber !== null)?.newLineNumber;
+
+    if (firstOldLineNumber === undefined || firstOldLineNumber === null || firstNewLineNumber === undefined || firstNewLineNumber === null) {
+      index = blockEnd;
+      continue;
+    }
+
+    const oldCount = sliceLines.filter((line) => line.prefix !== '+').length;
+    const newCount = sliceLines.filter((line) => line.prefix !== '-').length;
+    const firstChangedLine = parsedLines[blockStart];
+    const targetLineNumber = firstChangedLine.newLineNumber ?? firstChangedLine.oldLineNumber;
+
+    if (!targetLineNumber) {
+      index = blockEnd;
+      continue;
+    }
+
+    const patch = [
+      ...headerLines,
+      `@@ -${formatHunkRange(firstOldLineNumber, oldCount)} +${formatHunkRange(firstNewLineNumber, newCount)} @@`,
+      ...sliceLines.map((line) => line.raw),
+    ].join('\n');
+
+    lineActions.push({
+      id: `hunk-${hunkIndex + 1}-line-${lineActionIndex + 1}`,
+      label: `Discard line ${targetLineNumber}`,
+      patch,
+    });
+    lineActionIndex += 1;
+    index = blockEnd;
+  }
+
+  return lineActions;
 }
 </script>
 
@@ -112,6 +342,24 @@ function toggleViewMode() {
           @click="emit('stage-current')"
         >
           {{ stageActionLabel }}
+        </button>
+
+        <button
+          class="diff-viewer__stage diff-viewer__stage--danger"
+          type="button"
+          :disabled="!canDiscardCurrent"
+          @click="emit('discard-current')"
+        >
+          Discard current
+        </button>
+
+        <button
+          class="diff-viewer__stage diff-viewer__stage--neutral"
+          type="button"
+          :disabled="!canOpenCurrentFile"
+          @click="emit('open-current-file')"
+        >
+          Open file
         </button>
       </div>
 
@@ -172,6 +420,40 @@ function toggleViewMode() {
 
     <div v-else-if="!hasDiff" class="diff-viewer__empty">
       No textual diff is available for this file yet. Untracked files usually show content after staging.
+    </div>
+
+    <div v-else-if="shouldRenderHunkSections" class="diff-viewer__rendered diff-viewer__rendered--hunks">
+      <section
+        v-for="(hunk, index) in hunkSections"
+        :key="hunk.id"
+        class="diff-viewer__hunk"
+      >
+        <header class="diff-viewer__hunk-header">
+          <span class="diff-viewer__hunk-label">Hunk {{ index + 1 }}</span>
+          <div class="diff-viewer__hunk-actions">
+            <button
+              v-if="canDiscardHunks"
+              class="diff-viewer__hunk-action"
+              type="button"
+              @click="emit('discard-hunk', hunk.patch)"
+            >
+              Discard hunk
+            </button>
+          </div>
+        </header>
+        <div v-if="hunk.lineActions.length" class="diff-viewer__line-actions">
+          <button
+            v-for="lineAction in hunk.lineActions"
+            :key="lineAction.id"
+            class="diff-viewer__line-action"
+            type="button"
+            @click="emit('discard-hunk', lineAction.patch)"
+          >
+            {{ lineAction.label }}
+          </button>
+        </div>
+        <div class="diff-viewer__hunk-rendered" v-html="hunk.renderedHtml" />
+      </section>
     </div>
 
     <div v-else class="diff-viewer__rendered" v-html="renderedDiff" />
@@ -284,6 +566,18 @@ function toggleViewMode() {
   font-weight: 600;
 }
 
+.diff-viewer__stage--danger {
+  border-color: rgba(188, 87, 87, 0.24);
+  background: rgba(188, 87, 87, 0.14);
+  color: #ffb3ad;
+}
+
+.diff-viewer__stage--neutral {
+  border-color: rgba(123, 208, 255, 0.24);
+  background: rgba(123, 208, 255, 0.1);
+  color: #c6eeff;
+}
+
 .diff-viewer__meta {
   flex-wrap: wrap;
   gap: 8px;
@@ -334,6 +628,77 @@ function toggleViewMode() {
 
 .diff-viewer__rendered {
   padding: 14px;
+}
+
+.diff-viewer__rendered--hunks {
+  display: grid;
+  gap: 16px;
+}
+
+.diff-viewer__hunk {
+  display: grid;
+  gap: 10px;
+}
+
+.diff-viewer__hunk-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.diff-viewer__hunk-actions,
+.diff-viewer__line-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.diff-viewer__hunk-label {
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: 0.74rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.diff-viewer__hunk-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.45rem 0.72rem;
+  border: 1px solid rgba(188, 87, 87, 0.24);
+  border-radius: 10px;
+  background: rgba(188, 87, 87, 0.14);
+  color: #ffb3ad;
+  font-size: 0.74rem;
+  font-weight: 600;
+}
+
+.diff-viewer__hunk-action:hover {
+  background: rgba(188, 87, 87, 0.2);
+}
+
+.diff-viewer__line-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.38rem 0.62rem;
+  border: 1px solid rgba(188, 87, 87, 0.16);
+  border-radius: 999px;
+  background: rgba(188, 87, 87, 0.1);
+  color: #ffc1ba;
+  font-size: 0.7rem;
+  font-weight: 600;
+}
+
+.diff-viewer__line-action:hover {
+  background: rgba(188, 87, 87, 0.16);
+}
+
+.diff-viewer__hunk-rendered {
+  min-width: 0;
 }
 
 :deep(.d2h-wrapper) {

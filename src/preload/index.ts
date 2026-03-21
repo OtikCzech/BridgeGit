@@ -1,13 +1,19 @@
 import { contextBridge, ipcRenderer } from 'electron';
 import type {
   BranchSummary,
+  GitChange,
+  GitDiffMode,
   GitLogResult,
   GitStatusSummary,
+  GitTextSearchMatch,
+  GitWorktreeSummary,
   NoteFileHandle,
+  NoteFileStat,
   PtyCreateOptions,
   PtyDataEvent,
   PtyExitEvent,
   PtySessionInfo,
+  RepoDirectoryEntry,
   SessionData,
 } from '../shared/bridgegit';
 
@@ -19,11 +25,16 @@ const bridgegitApi = {
     node: process.versions.node,
   },
   dialog: {
-    openRepo: () => ipcRenderer.invoke('dialog:openRepo') as Promise<string | null>,
+    openRepo: (defaultPath?: string | null) =>
+      ipcRenderer.invoke('dialog:openRepo', defaultPath) as Promise<string | null>,
   },
   notes: {
     openFile: () => ipcRenderer.invoke('notes:openFile') as Promise<NoteFileHandle | null>,
     readFile: (filePath: string) => ipcRenderer.invoke('notes:readFile', filePath) as Promise<NoteFileHandle>,
+    inspectFile: (filePath: string) => ipcRenderer.invoke('notes:inspectFile', filePath) as Promise<NoteFileHandle | null>,
+    statFile: (filePath: string) => ipcRenderer.invoke('notes:statFile', filePath) as Promise<NoteFileStat | null>,
+    resolveLink: (baseFilePath: string | null, href: string) =>
+      ipcRenderer.invoke('notes:resolveLink', baseFilePath, href) as Promise<string | null>,
     saveFile: (filePath: string, content: string) =>
       ipcRenderer.invoke('notes:saveFile', filePath, content) as Promise<string>,
     saveFileAs: (content: string, defaultPath?: string | null) =>
@@ -44,12 +55,22 @@ const bridgegitApi = {
       ipcRenderer.invoke('session:save', session) as Promise<SessionData>,
   },
   git: {
+    isRepository: (repoPath: string) =>
+      ipcRenderer.invoke('git:isRepository', repoPath) as Promise<boolean>,
     status: (repoPath: string) =>
       ipcRenderer.invoke('git:status', repoPath) as Promise<GitStatusSummary>,
     branches: (repoPath: string) =>
       ipcRenderer.invoke('git:branches', repoPath) as Promise<BranchSummary>,
-    diff: (repoPath: string, filePath?: string) =>
-      ipcRenderer.invoke('git:diff', repoPath, filePath) as Promise<string>,
+    listDirectory: (repoPath: string, relativePath?: string) =>
+      ipcRenderer.invoke('git:listDirectory', repoPath, relativePath) as Promise<RepoDirectoryEntry[]>,
+    searchFiles: (repoPath: string, query: string, limit?: number) =>
+      ipcRenderer.invoke('git:searchFiles', repoPath, query, limit) as Promise<string[]>,
+    searchText: (repoPath: string, query: string, limit?: number, wholeWord?: boolean) =>
+      ipcRenderer.invoke('git:searchText', repoPath, query, limit, wholeWord) as Promise<GitTextSearchMatch[]>,
+    worktrees: (repoPath: string) =>
+      ipcRenderer.invoke('git:worktrees', repoPath) as Promise<GitWorktreeSummary[]>,
+    diff: (repoPath: string, filePath?: string, mode?: GitDiffMode) =>
+      ipcRenderer.invoke('git:diff', repoPath, filePath, mode) as Promise<string>,
     commitDiff: (repoPath: string, commitHash: string, parentHash?: string | null) =>
       ipcRenderer.invoke('git:commitDiff', repoPath, commitHash, parentHash) as Promise<string>,
     log: (repoPath: string, limit?: number) =>
@@ -58,6 +79,10 @@ const bridgegitApi = {
       ipcRenderer.invoke('git:stage', repoPath, files) as Promise<GitStatusSummary>,
     unstage: (repoPath: string, files: string[]) =>
       ipcRenderer.invoke('git:unstage', repoPath, files) as Promise<GitStatusSummary>,
+    discard: (repoPath: string, change: GitChange) =>
+      ipcRenderer.invoke('git:discard', repoPath, change) as Promise<GitStatusSummary>,
+    discardHunk: (repoPath: string, patch: string, mode: GitDiffMode) =>
+      ipcRenderer.invoke('git:discardHunk', repoPath, patch, mode) as Promise<GitStatusSummary>,
     commit: (repoPath: string, message: string) =>
       ipcRenderer.invoke('git:commit', repoPath, message) as Promise<GitStatusSummary>,
     checkout: (repoPath: string, branchName: string) =>

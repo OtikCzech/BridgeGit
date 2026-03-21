@@ -1,18 +1,46 @@
 <script setup lang="ts">
 import { computed, defineAsyncComponent, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import {
+  DEFAULT_SESSION_DATA,
   DEFAULT_PANEL_LAYOUT,
+  GLOBAL_WORKSPACE_ID,
   GLOBAL_WORKSPACE_SESSION_KEY,
+  cloneDismissedWorktreePaths,
+  clonePanelLayoutsByWorkspace,
+  cloneProjectTitlesByContext,
+  cloneWorkspaceIndicatorVisibilitySettings,
+  cloneWorkspaceTabDefaults,
+  cloneWorkspaceRepoPanelState,
+  cloneWorkspaceRepoPanelStates,
+  cloneWorkspaceDescriptors,
   cloneWorkspaceSessionState,
   cloneWorkspaceSessions,
+  normalizeAppAppearance,
+  normalizeEditorTheme,
+  resolveThemeVariant,
+  resolveWorkspaceFileTabType,
+  type AppAppearance,
+  type EditorTheme,
+  type ResolvedEditorTheme,
+  type GitDiffMode,
+  type GitChange,
   type GitLogEntry,
-  type ProjectTitleMode,
-  type ProjectSettingsFormData,
   type GitStatusSummary,
+  type GitWorktreeSummary,
+  type PanelLayout,
+  type ProjectSettingsFormData,
+  type RepoPanelSectionState,
   type RecentRepoEntry,
   type TerminalCommandPreset,
+  type WorktreeDetectionInterval,
+  type WorkspaceIndicatorVisibilitySettings,
+  type WorkspaceTabDefaults,
+  type WorkspaceDescriptor,
+  type WorkspaceDescriptorsById,
+  type WorkspaceOverviewItem,
+  type WorkspaceRepoPanelState,
   type WorkspaceSessionState,
-  type WorkspaceSessionsByContext,
+  type WorkspaceSessionsById,
   type WorkspaceTabState,
 } from '../shared/bridgegit';
 import { useGit } from './composables/useGit';
@@ -43,8 +71,9 @@ const terminalPanelRef = ref<{
   focusNextTab: () => void;
   executePresetBySlot: (slot: number) => Promise<boolean>;
   openCreationMenu: () => void;
-  openNoteFile: () => Promise<unknown>;
+  openFile: () => Promise<unknown>;
   openNoteFilePath: (filePath: string) => Promise<unknown>;
+  openWorkspaceFilePath: (filePath: string) => Promise<unknown>;
 } | null>(null);
 const sidebarWidth = ref(DEFAULT_PANEL_LAYOUT.sidebarWidth);
 const terminalHeight = ref(DEFAULT_PANEL_LAYOUT.terminalHeight);
@@ -53,8 +82,23 @@ const contentLayout = ref(DEFAULT_PANEL_LAYOUT.contentLayout);
 const sidebarCollapsed = ref(DEFAULT_PANEL_LAYOUT.sidebarCollapsed);
 const diffCollapsed = ref(DEFAULT_PANEL_LAYOUT.diffCollapsed);
 const terminalCollapsed = ref(DEFAULT_PANEL_LAYOUT.terminalCollapsed);
-const projectTitle = ref('BridgeGit');
-const projectTitleMode = ref<ProjectTitleMode>('auto');
+const panelLayoutsByWorkspace = ref<Record<string, PanelLayout>>({});
+const workspaceRepoPanelStates = ref<Record<string, WorkspaceRepoPanelState>>({});
+const projectTitlesByContext = ref<Record<string, string>>({});
+const appAppearance = ref<AppAppearance>(DEFAULT_SESSION_DATA.appAppearance);
+const editorTheme = ref<EditorTheme>(DEFAULT_SESSION_DATA.editorTheme);
+const workspaceIndicatorVisibility = ref<WorkspaceIndicatorVisibilitySettings>(
+  cloneWorkspaceIndicatorVisibilitySettings(DEFAULT_SESSION_DATA.workspaceIndicatorVisibility),
+);
+const workspaceTabDefaults = ref<WorkspaceTabDefaults>(
+  cloneWorkspaceTabDefaults(DEFAULT_SESSION_DATA.workspaceTabDefaults),
+);
+const worktreeDetectionIntervalMs = ref<WorktreeDetectionInterval>(
+  DEFAULT_SESSION_DATA.worktreeDetectionIntervalMs,
+);
+const dismissedWorktreePaths = ref<string[]>(
+  cloneDismissedWorktreePaths(DEFAULT_SESSION_DATA.dismissedWorktreePaths),
+);
 const soundNotificationsEnabled = ref(true);
 const projectTitleSaveToast = ref<string | null>(null);
 const isSettingsOpen = ref(false);
@@ -62,14 +106,28 @@ const isCommitHistoryOpen = ref(false);
 const commitHistorySearchToken = ref(0);
 const commitMessage = ref('');
 const recentRepos = ref<RecentRepoEntry[]>([]);
+const workspaceDescriptors = ref<WorkspaceDescriptorsById>({});
+const workspaceOrder = ref<string[]>([]);
 const terminalCommandPresets = ref<TerminalCommandPreset[]>([]);
-const workspaceSessions = ref<WorkspaceSessionsByContext>({});
+const workspaceSessions = ref<WorkspaceSessionsById>({});
 const workspaceTabs = ref<WorkspaceTabState[]>([]);
 const workspaceRecentActivityByTabId = ref<Record<string, boolean>>({});
+const workspaceRecentActivityByWorkspaceId = ref<Record<string, Record<string, boolean>>>({});
+const workspaceAttentionByWorkspaceId = ref<Record<string, Record<string, boolean>>>({});
+const activeWorkspaceId = ref<string | null>(GLOBAL_WORKSPACE_ID);
 const activeWorkspaceTabId = ref<string | null>(null);
+const workspaceGitSummaryById = ref<Record<string, {
+  branch: string | null;
+  changedCount: number | null;
+  untrackedCount: number | null;
+  conflictedCount: number | null;
+}>>({});
+const gitRepositoryValidityByPath = ref<Record<string, boolean>>({});
 const infoNoteLastSeenRevision = ref<string | null>(null);
+const detectedWorktrees = ref<GitWorktreeSummary[]>([]);
 const sessionReady = ref(false);
 const isSwitchingWorkspaceContext = ref(false);
+const isCheckingWorktrees = ref(false);
 
 const runtimeInfo = window.bridgegit ?? {
   platform: 'unknown',
@@ -87,6 +145,7 @@ const {
   branches,
   log,
   selectedPath,
+  selectedDiffMode,
   selectedCommit,
   diff,
   commitDiff,
@@ -95,13 +154,16 @@ const {
   isLoadingCommitDiff,
   error,
   commitDiffError,
-  refresh,
+  refresh: refreshRepoStatus,
   loadLog,
   setRepoPath,
+  ensureFullStatus,
   selectFile,
   openCommitDiff,
   stageFiles,
   unstageFiles,
+  discardFile,
+  discardHunk,
   commitChanges,
   checkoutBranch,
   dispose,
@@ -111,8 +173,11 @@ type PanelId = 'sidebar' | 'diff' | 'terminal';
 type ResizeTarget = 'sidebar' | 'content' | null;
 
 const activeResize = ref<ResizeTarget>(null);
+const INACTIVE_WORKSPACE_GIT_SUMMARY_POLL_MS = 15_000;
 let persistTimer: number | null = null;
 let projectTitleSaveToastTimer: number | null = null;
+let inactiveWorkspaceGitSummaryTimer: number | null = null;
+let worktreeDetectionTimer: number | null = null;
 const commitDiffDateFormatter = new Intl.DateTimeFormat('en', {
   month: 'short',
   day: 'numeric',
@@ -131,6 +196,13 @@ const showContentDivider = computed(() => !diffCollapsed.value && !terminalColla
 const canCollapseSidebar = computed(() => !sidebarCollapsed.value && visiblePanelCount.value > 1);
 const canCollapseDiff = computed(() => !diffCollapsed.value && visiblePanelCount.value > 1);
 const canCollapseTerminal = computed(() => !terminalCollapsed.value && visiblePanelCount.value > 1);
+const appThemeVariant = computed(() => resolveThemeVariant(appAppearance.value));
+const resolvedEditorTheme = computed<ResolvedEditorTheme>(() => (
+  editorTheme.value === 'follow-app' ? appAppearance.value : editorTheme.value
+));
+const resolvedEditorThemeVariant = computed(() => (
+  resolveThemeVariant(resolvedEditorTheme.value)
+));
 const collapsedPanels = computed(() => {
   const panels: Array<{ id: PanelId; label: string; shortcut: string }> = [];
 
@@ -143,7 +215,11 @@ const collapsedPanels = computed(() => {
   }
 
   if (terminalCollapsed.value) {
-    panels.push({ id: 'terminal', label: 'Workspace', shortcut: SHORTCUTS.panelTerminalToggle.display });
+    panels.push({
+      id: 'terminal',
+      label: repoPath.value ? getRepoName(repoPath.value) : 'Workspace',
+      shortcut: SHORTCUTS.panelTerminalToggle.display,
+    });
   }
 
   return panels;
@@ -156,6 +232,203 @@ const terminalTabIndicators = computed(() => (
     hasRecentActivity: Boolean(workspaceRecentActivityByTabId.value[tab.id]),
   }))
 ));
+
+function getWorkspaceTabsSnapshot(nextWorkspaceId: string) {
+  if (nextWorkspaceId === getCurrentWorkspaceId()) {
+    return workspaceTabs.value;
+  }
+
+  return workspaceSessions.value[nextWorkspaceId]?.tabs ?? [];
+}
+
+function getWorkspacePanelIndicators(nextWorkspaceId: string) {
+  const tabs = getWorkspaceTabsSnapshot(nextWorkspaceId);
+  const recentActivity = workspaceRecentActivityByWorkspaceId.value[nextWorkspaceId] ?? {};
+  const attention = workspaceAttentionByWorkspaceId.value[nextWorkspaceId] ?? {};
+
+  return {
+    hasPanelActivity: tabs.some((tab) => Boolean(recentActivity[tab.id])),
+    hasPanelAttention: tabs.some((tab) => Boolean(attention[tab.id])),
+  };
+}
+
+function buildWorkspaceGitSummary(nextStatus: GitStatusSummary, nextBranch: string | null) {
+  return {
+    branch: nextStatus.currentBranch ?? nextBranch ?? null,
+    changedCount: nextStatus.staged.length + nextStatus.unstaged.length + nextStatus.conflicted.length,
+    untrackedCount: nextStatus.untracked.length,
+    conflictedCount: nextStatus.conflicted.length,
+  };
+}
+
+async function isGitRepositoryPath(nextRepoPath: string | null): Promise<boolean> {
+  if (!nextRepoPath || !window.bridgegit?.git) {
+    return false;
+  }
+
+  const cachedValidity = gitRepositoryValidityByPath.value[nextRepoPath];
+
+  if (cachedValidity !== undefined) {
+    return cachedValidity;
+  }
+
+  const isRepository = await window.bridgegit.git.isRepository(nextRepoPath);
+  gitRepositoryValidityByPath.value = {
+    ...gitRepositoryValidityByPath.value,
+    [nextRepoPath]: isRepository,
+  };
+
+  return isRepository;
+}
+
+async function loadWorkspaceGitSummary(nextWorkspaceId: string, nextRepoPath: string) {
+  if (!window.bridgegit?.git || !(await isGitRepositoryPath(nextRepoPath))) {
+    workspaceGitSummaryById.value = {
+      ...workspaceGitSummaryById.value,
+      [nextWorkspaceId]: {
+        branch: null,
+        changedCount: null,
+        untrackedCount: null,
+        conflictedCount: null,
+      },
+    };
+    return;
+  }
+
+  try {
+    const [nextStatus, nextBranches] = await Promise.all([
+      window.bridgegit.git.status(nextRepoPath),
+      window.bridgegit.git.branches(nextRepoPath),
+    ]);
+
+    workspaceGitSummaryById.value = {
+      ...workspaceGitSummaryById.value,
+      [nextWorkspaceId]: buildWorkspaceGitSummary(nextStatus, nextBranches.current),
+    };
+  } catch {
+    // Keep the last known summary if refresh fails.
+  }
+}
+
+async function loadAllWorkspaceGitSummaries() {
+  const workspaceEntries = Object.values(workspaceDescriptors.value)
+    .filter((workspaceDescriptor) => workspaceDescriptor.kind === 'project' && workspaceDescriptor.repoPath)
+    .map((workspaceDescriptor) => ({
+      workspaceId: workspaceDescriptor.id,
+      repoPath: workspaceDescriptor.repoPath!,
+    }));
+
+  await Promise.all(
+    workspaceEntries.map((workspaceEntry) => (
+      loadWorkspaceGitSummary(workspaceEntry.workspaceId, workspaceEntry.repoPath)
+    )),
+  );
+}
+
+async function loadInactiveWorkspaceGitSummaries() {
+  const currentWorkspaceId = getCurrentWorkspaceId();
+  const workspaceEntries = Object.values(workspaceDescriptors.value)
+    .filter((workspaceDescriptor) => (
+      workspaceDescriptor.kind === 'project'
+      && workspaceDescriptor.repoPath
+      && workspaceDescriptor.id !== currentWorkspaceId
+    ))
+    .map((workspaceDescriptor) => ({
+      workspaceId: workspaceDescriptor.id,
+      repoPath: workspaceDescriptor.repoPath!,
+    }));
+
+  await Promise.all(
+    workspaceEntries.map((workspaceEntry) => (
+      loadWorkspaceGitSummary(workspaceEntry.workspaceId, workspaceEntry.repoPath)
+    )),
+  );
+}
+
+function startInactiveWorkspaceGitSummaryPolling() {
+  if (inactiveWorkspaceGitSummaryTimer) {
+    window.clearInterval(inactiveWorkspaceGitSummaryTimer);
+  }
+
+  inactiveWorkspaceGitSummaryTimer = window.setInterval(() => {
+    if (!sessionReady.value || isSwitchingWorkspaceContext.value || document.visibilityState !== 'visible') {
+      return;
+    }
+
+    void loadInactiveWorkspaceGitSummaries();
+  }, INACTIVE_WORKSPACE_GIT_SUMMARY_POLL_MS);
+}
+
+function handleWorkspaceRecentActivityUpdate(nextWorkspaceId: string, nextRecentActivity: Record<string, boolean>) {
+  workspaceRecentActivityByWorkspaceId.value = {
+    ...workspaceRecentActivityByWorkspaceId.value,
+    [nextWorkspaceId]: { ...nextRecentActivity },
+  };
+
+  if (nextWorkspaceId === getCurrentWorkspaceId()) {
+    workspaceRecentActivityByTabId.value = { ...nextRecentActivity };
+  }
+}
+
+function handleWorkspaceAttentionUpdate(nextWorkspaceId: string, nextAttention: Record<string, boolean>) {
+  workspaceAttentionByWorkspaceId.value = {
+    ...workspaceAttentionByWorkspaceId.value,
+    [nextWorkspaceId]: { ...nextAttention },
+  };
+}
+const workspaceOverviewItems = computed<WorkspaceOverviewItem[]>(() => {
+  const recentRepoMap = new Map(recentRepos.value.map((entry) => [entry.path, entry]));
+  const seenWorkspaceIds = new Set<string>();
+  const orderedWorkspaceIds: string[] = [];
+
+  workspaceOrder.value.forEach((workspaceId) => {
+    if (!workspaceId || seenWorkspaceIds.has(workspaceId) || !workspaceDescriptors.value[workspaceId]) {
+      return;
+    }
+
+    seenWorkspaceIds.add(workspaceId);
+    orderedWorkspaceIds.push(workspaceId);
+  });
+
+  Object.keys(workspaceDescriptors.value).forEach((workspaceId) => {
+    if (workspaceId === GLOBAL_WORKSPACE_ID || seenWorkspaceIds.has(workspaceId)) {
+      return;
+    }
+
+    seenWorkspaceIds.add(workspaceId);
+    orderedWorkspaceIds.push(workspaceId);
+  });
+
+  return orderedWorkspaceIds.flatMap((workspaceId) => {
+    const workspaceDescriptor = workspaceDescriptors.value[workspaceId];
+
+    if (!workspaceDescriptor || workspaceDescriptor.kind !== 'project' || !workspaceDescriptor.repoPath) {
+      return [];
+    }
+
+    const recentRepoEntry = recentRepoMap.get(workspaceDescriptor.repoPath);
+    const title = resolveProjectTitleFromContext(workspaceDescriptor.id, workspaceDescriptor.repoPath)
+      || recentRepoEntry?.name
+      || resolveAutoProjectTitle(workspaceDescriptor.repoPath);
+    const cachedSummary = workspaceGitSummaryById.value[workspaceId];
+    const panelIndicators = getWorkspacePanelIndicators(workspaceId);
+
+    return [{
+      workspaceId,
+      path: workspaceDescriptor.repoPath,
+      title,
+      repoName: getRepoName(workspaceDescriptor.repoPath),
+      branch: cachedSummary?.branch ?? null,
+      changedCount: cachedSummary?.changedCount ?? null,
+      untrackedCount: cachedSummary?.untrackedCount ?? null,
+      conflictedCount: cachedSummary?.conflictedCount ?? null,
+      hasPanelActivity: panelIndicators.hasPanelActivity,
+      hasPanelAttention: panelIndicators.hasPanelAttention,
+      isCurrent: workspaceId === getCurrentWorkspaceId(),
+    }];
+  });
+});
+const activeDetectedWorktree = computed(() => detectedWorktrees.value[0] ?? null);
 const hasUnreadInfoNote = computed(() => infoNoteLastSeenRevision.value !== CURRENT_INFO_NOTE_REVISION);
 const shellColumns = computed(() => {
   if (sidebarCollapsed.value) {
@@ -213,7 +486,6 @@ const changedCount = computed(() => {
   return (
     status.value.staged.length +
     status.value.unstaged.length +
-    status.value.untracked.length +
     status.value.conflicted.length
   );
 });
@@ -232,8 +504,16 @@ const repoDockSummary = computed(() => {
     isClean: status.value.isClean,
   };
 });
-const branch = computed(() => status.value?.currentBranch ?? branches.value?.current ?? 'no repo');
-const displayProjectTitle = computed(() => projectTitle.value.trim() || 'BridgeGit');
+const branch = computed(() => (
+  status.value?.currentBranch
+  ?? branches.value?.current
+  ?? workspaceGitSummaryById.value[getCurrentWorkspaceId()]?.branch
+  ?? 'no repo'
+));
+const currentProjectTitle = computed(() => {
+  return resolveProjectTitleFromContext(getCurrentWorkspaceId(), repoPath.value);
+});
+const displayProjectTitle = computed(() => currentProjectTitle.value || resolveAutoProjectTitle(repoPath.value));
 const repoName = computed(() => {
   if (!repoPath.value) {
     return 'No repo';
@@ -310,6 +590,27 @@ const canStageCurrentDiff = computed(() => {
 
   return [...status.value.unstaged, ...status.value.untracked].some((item) => item.path === selectedPath.value);
 });
+const currentDiscardableChange = computed(() => {
+  if (diffCollapsed.value || !status.value || !selectedPath.value) {
+    return null;
+  }
+
+  if (selectedDiffMode.value === 'staged') {
+    return status.value.staged.find((item) => item.path === selectedPath.value) ?? null;
+  }
+
+  return status.value.untracked.find((item) => item.path === selectedPath.value)
+    ?? status.value.unstaged.find((item) => item.path === selectedPath.value)
+    ?? status.value.conflicted.find((item) => item.path === selectedPath.value)
+    ?? status.value.staged.find((item) => item.path === selectedPath.value)
+    ?? null;
+});
+const canDiscardCurrentDiff = computed(() => !isCommitDiffMode.value && Boolean(currentDiscardableChange.value));
+const canOpenCurrentDiffInEditor = computed(() => (
+  Boolean(selectedPath.value)
+  && !isCommitDiffMode.value
+  && resolveWorkspaceFileTabType(selectedPath.value ?? '') !== 'unsupported'
+));
 const stageActionLabel = computed(() => (
   canSelectNextDiff.value ? 'Stage & next' : 'Stage current'
 ));
@@ -319,8 +620,62 @@ function getRepoName(nextRepoPath: string): string {
   return parts.at(-1) ?? nextRepoPath;
 }
 
-function getWorkspaceContextKey(nextRepoPath: string | null): string {
-  return nextRepoPath ?? GLOBAL_WORKSPACE_SESSION_KEY;
+function getProjectTitleContextKeys(
+  nextWorkspaceId: string | null | undefined,
+  nextRepoPath: string | null,
+): string[] {
+  const contextKeys = [
+    nextWorkspaceId && nextWorkspaceId !== GLOBAL_WORKSPACE_ID ? nextWorkspaceId : null,
+    nextRepoPath,
+  ].filter((contextKey): contextKey is string => Boolean(contextKey));
+
+  return [...new Set(contextKeys)];
+}
+
+function getWorkspaceContextKey(
+  nextWorkspaceId: string | null | undefined,
+  nextRepoPath: string | null,
+): string {
+  return getProjectTitleContextKeys(nextWorkspaceId, nextRepoPath)[0] ?? GLOBAL_WORKSPACE_SESSION_KEY;
+}
+
+function resolveProjectTitleFromContext(
+  nextWorkspaceId: string | null | undefined,
+  nextRepoPath: string | null,
+): string {
+  return getProjectTitleContextKeys(nextWorkspaceId, nextRepoPath)
+    .map((contextKey) => projectTitlesByContext.value[contextKey]?.trim() ?? '')
+    .find(Boolean) ?? '';
+}
+
+function buildProjectWorkspaceId(nextRepoPath: string) {
+  const baseWorkspaceId = `workspace:${nextRepoPath}`;
+
+  if (!workspaceDescriptors.value[baseWorkspaceId]) {
+    return baseWorkspaceId;
+  }
+
+  let duplicateIndex = 2;
+  let nextWorkspaceId = `${baseWorkspaceId}#${duplicateIndex}`;
+
+  while (workspaceDescriptors.value[nextWorkspaceId]) {
+    duplicateIndex += 1;
+    nextWorkspaceId = `${baseWorkspaceId}#${duplicateIndex}`;
+  }
+
+  return nextWorkspaceId;
+}
+
+function getWorkspaceDescriptorById(workspaceId: string | null | undefined): WorkspaceDescriptor | null {
+  if (!workspaceId) {
+    return null;
+  }
+
+  return workspaceDescriptors.value[workspaceId] ?? null;
+}
+
+function getCurrentWorkspaceId() {
+  return activeWorkspaceId.value ?? GLOBAL_WORKSPACE_ID;
 }
 
 function buildWorkspaceSessionState(
@@ -333,14 +688,14 @@ function buildWorkspaceSessionState(
   });
 }
 
-function buildPersistedWorkspaceSessions(): WorkspaceSessionsByContext {
+function buildPersistedWorkspaceSessions(): WorkspaceSessionsById {
   const nextWorkspaceSessions = cloneWorkspaceSessions(workspaceSessions.value);
-  nextWorkspaceSessions[getWorkspaceContextKey(repoPath.value)] = buildWorkspaceSessionState();
+  nextWorkspaceSessions[getCurrentWorkspaceId()] = buildWorkspaceSessionState();
   return nextWorkspaceSessions;
 }
 
-function applyWorkspaceSession(nextRepoPath: string | null) {
-  const workspaceSession = workspaceSessions.value[getWorkspaceContextKey(nextRepoPath)];
+function applyWorkspaceSession(nextWorkspaceId: string | null) {
+  const workspaceSession = workspaceSessions.value[nextWorkspaceId ?? GLOBAL_WORKSPACE_ID];
   const nextWorkspaceSession = workspaceSession
     ? cloneWorkspaceSessionState(workspaceSession)
     : {
@@ -352,33 +707,320 @@ function applyWorkspaceSession(nextRepoPath: string | null) {
   activeWorkspaceTabId.value = nextWorkspaceSession.activeTabId;
 }
 
-function captureWorkspaceSession(nextRepoPath: string | null) {
+function captureWorkspaceSession(nextWorkspaceId: string | null) {
   workspaceSessions.value = {
     ...workspaceSessions.value,
-    [getWorkspaceContextKey(nextRepoPath)]: buildWorkspaceSessionState(),
+    [nextWorkspaceId ?? GLOBAL_WORKSPACE_ID]: buildWorkspaceSessionState(),
   };
+}
+
+function buildDefaultRepoPanelSectionState(): RepoPanelSectionState {
+  return {
+    staged: false,
+    changed: false,
+    untracked: true,
+    conflicts: false,
+  };
+}
+
+function buildDefaultWorkspaceRepoPanelState(): WorkspaceRepoPanelState {
+  return {
+    fontSize: DEFAULT_SESSION_DATA.workspaceTabDefaults.noteFontSize,
+    historyOpen: false,
+    workspaceDetailExpanded: true,
+    files: {
+      expanded: true,
+      viewMode: 'list',
+      showAll: false,
+      collapsedSections: buildDefaultRepoPanelSectionState(),
+    },
+  };
+}
+
+function currentWorkspaceRepoPanelStateValue(): WorkspaceRepoPanelState {
+  return cloneWorkspaceRepoPanelState(
+    workspaceRepoPanelStates.value[getCurrentWorkspaceId()]
+    ?? buildDefaultWorkspaceRepoPanelState(),
+  );
+}
+
+const currentWorkspaceRepoPanelState = computed(() => currentWorkspaceRepoPanelStateValue());
+
+function getWorkspaceRepoPanelStateValue(nextWorkspaceId: string | null | undefined): WorkspaceRepoPanelState {
+  return cloneWorkspaceRepoPanelState(
+    workspaceRepoPanelStates.value[nextWorkspaceId ?? GLOBAL_WORKSPACE_ID]
+    ?? buildDefaultWorkspaceRepoPanelState(),
+  );
+}
+
+function buildCurrentPanelLayout(): PanelLayout {
+  return {
+    sidebarWidth: sidebarWidth.value,
+    terminalHeight: terminalHeight.value,
+    terminalWidth: terminalWidth.value,
+    contentLayout: contentLayout.value,
+    sidebarCollapsed: sidebarCollapsed.value,
+    diffCollapsed: diffCollapsed.value,
+    terminalCollapsed: terminalCollapsed.value,
+  };
+}
+
+function applyPanelLayout(nextPanelLayout: PanelLayout) {
+  sidebarWidth.value = nextPanelLayout.sidebarWidth;
+  terminalHeight.value = nextPanelLayout.terminalHeight;
+  terminalWidth.value = nextPanelLayout.terminalWidth;
+  contentLayout.value = nextPanelLayout.contentLayout;
+  sidebarCollapsed.value = nextPanelLayout.sidebarCollapsed;
+  diffCollapsed.value = nextPanelLayout.diffCollapsed;
+  terminalCollapsed.value = nextPanelLayout.terminalCollapsed;
+}
+
+function buildPersistedPanelLayoutsByWorkspace(): Record<string, PanelLayout> {
+  return {
+    ...clonePanelLayoutsByWorkspace(panelLayoutsByWorkspace.value),
+    [getCurrentWorkspaceId()]: buildCurrentPanelLayout(),
+  };
+}
+
+function buildPersistedWorkspaceRepoPanelStates(): Record<string, WorkspaceRepoPanelState> {
+  return {
+    ...cloneWorkspaceRepoPanelStates(workspaceRepoPanelStates.value),
+    [getCurrentWorkspaceId()]: currentWorkspaceRepoPanelStateValue(),
+  };
+}
+
+function buildKnownProjectRepoPaths(): Set<string> {
+  const knownProjectRepoPaths = new Set<string>();
+
+  recentRepos.value.forEach((recentRepo) => {
+    knownProjectRepoPaths.add(recentRepo.path);
+  });
+
+  Object.values(workspaceDescriptors.value).forEach((workspaceDescriptor) => {
+    if (workspaceDescriptor.kind === 'project' && workspaceDescriptor.repoPath) {
+      knownProjectRepoPaths.add(workspaceDescriptor.repoPath);
+    }
+  });
+
+  return knownProjectRepoPaths;
+}
+
+function buildVisibleWorktreeSuggestions(
+  worktrees: GitWorktreeSummary[],
+  options: { includeDismissed?: boolean } = {},
+): GitWorktreeSummary[] {
+  const knownProjectRepoPaths = buildKnownProjectRepoPaths();
+  const includeDismissed = options.includeDismissed ?? false;
+
+  return worktrees.filter((worktree) => {
+    if (!worktree.path || worktree.current || worktree.path === repoPath.value) {
+      return false;
+    }
+
+    if (knownProjectRepoPaths.has(worktree.path)) {
+      return false;
+    }
+
+    if (!includeDismissed && dismissedWorktreePaths.value.includes(worktree.path)) {
+      return false;
+    }
+
+    return true;
+  });
+}
+
+function resolvePersistedLastRepoPath(nextRepoPath: string | null = repoPath.value) {
+  if (nextRepoPath) {
+    return nextRepoPath;
+  }
+
+  const activeWorkspaceDescriptor = getWorkspaceDescriptorById(activeWorkspaceId.value);
+
+  if (activeWorkspaceDescriptor?.kind === 'project') {
+    return activeWorkspaceDescriptor.repoPath;
+  }
+
+  return session.value.lastRepoPath ?? recentRepos.value[0]?.path ?? null;
+}
+
+function buildSessionSavePayload(
+  options: {
+    activeWorkspaceId?: string | null;
+    lastRepoPath?: string | null;
+  } = {},
+) {
+  const hasExplicitLastRepoPath = Object.prototype.hasOwnProperty.call(options, 'lastRepoPath');
+
+  return {
+    lastRepoPath: resolvePersistedLastRepoPath(
+      hasExplicitLastRepoPath ? options.lastRepoPath ?? null : repoPath.value,
+    ),
+    activeWorkspaceId: options.activeWorkspaceId ?? activeWorkspaceId.value,
+    recentRepos: recentRepos.value,
+    workspaceDescriptors: workspaceDescriptors.value,
+    workspaceOrder: workspaceOrder.value,
+    terminalCwd: terminalCwd.value,
+    projectTitle: '',
+    projectTitleMode: 'auto' as const,
+    projectTitlesByContext: projectTitlesByContext.value,
+    appAppearance: appAppearance.value,
+    editorTheme: editorTheme.value,
+    workspaceIndicatorVisibility: workspaceIndicatorVisibility.value,
+    workspaceTabDefaults: workspaceTabDefaults.value,
+    worktreeDetectionIntervalMs: worktreeDetectionIntervalMs.value,
+    dismissedWorktreePaths: dismissedWorktreePaths.value,
+    soundNotificationsEnabled: soundNotificationsEnabled.value,
+    infoNoteLastSeenRevision: infoNoteLastSeenRevision.value,
+    terminalCommandPresets: terminalCommandPresets.value,
+    workspaceSessions: buildPersistedWorkspaceSessions(),
+    panelLayout: buildCurrentPanelLayout(),
+    panelLayoutsByWorkspace: buildPersistedPanelLayoutsByWorkspace(),
+    workspaceRepoPanelStates: buildPersistedWorkspaceRepoPanelStates(),
+  };
+}
+
+function applyWorkspacePanelLayout(nextWorkspaceId: string | null) {
+  const currentSidebarWidth = sidebarWidth.value;
+  applyPanelLayout(
+    panelLayoutsByWorkspace.value[nextWorkspaceId ?? GLOBAL_WORKSPACE_ID]
+    ?? session.value.panelLayout,
+  );
+  sidebarWidth.value = currentSidebarWidth;
+}
+
+function captureWorkspacePanelLayout(nextWorkspaceId: string | null) {
+  panelLayoutsByWorkspace.value = {
+    ...panelLayoutsByWorkspace.value,
+    [nextWorkspaceId ?? GLOBAL_WORKSPACE_ID]: buildCurrentPanelLayout(),
+  };
+}
+
+function applyWorkspaceRepoPanelState(nextWorkspaceId: string | null) {
+  const nextRepoPanelState = cloneWorkspaceRepoPanelState(
+    workspaceRepoPanelStates.value[nextWorkspaceId ?? GLOBAL_WORKSPACE_ID]
+    ?? buildDefaultWorkspaceRepoPanelState(),
+  );
+
+  isCommitHistoryOpen.value = nextRepoPanelState.historyOpen;
+}
+
+function applyAppTheme(nextAppearance: AppAppearance) {
+  const normalizedAppearance = normalizeAppAppearance(nextAppearance);
+  document.documentElement.dataset.appTheme = normalizedAppearance;
+  document.documentElement.style.colorScheme = resolveThemeVariant(normalizedAppearance);
+}
+
+function captureWorkspaceRepoPanelState(nextWorkspaceId: string | null) {
+  workspaceRepoPanelStates.value = {
+    ...workspaceRepoPanelStates.value,
+    [nextWorkspaceId ?? GLOBAL_WORKSPACE_ID]: currentWorkspaceRepoPanelStateValue(),
+  };
+}
+
+function shouldLoadDetailedGitStatus(repoPanelState: WorkspaceRepoPanelState): boolean {
+  return repoPanelState.workspaceDetailExpanded
+    && repoPanelState.files.expanded
+    && Object.values(repoPanelState.files.collapsedSections).some((isCollapsed) => !isCollapsed);
+}
+
+async function updateCurrentWorkspaceRepoPanelState(nextRepoPanelState: WorkspaceRepoPanelState) {
+  workspaceRepoPanelStates.value = {
+    ...workspaceRepoPanelStates.value,
+    [getCurrentWorkspaceId()]: cloneWorkspaceRepoPanelState(nextRepoPanelState),
+  };
+
+  if (repoPath.value && shouldLoadDetailedGitStatus(nextRepoPanelState) && !status.value && !isLoading.value) {
+    void ensureFullStatus();
+  }
+}
+
+function mergeWorkspaceOrder(...workspaceLists: Array<Array<string | null | undefined>>) {
+  const nextOrder: string[] = [];
+  const seenWorkspaceIds = new Set<string>();
+
+  workspaceLists.forEach((workspaceList) => {
+    workspaceList.forEach((workspaceId) => {
+      if (!workspaceId || seenWorkspaceIds.has(workspaceId)) {
+        return;
+      }
+
+      seenWorkspaceIds.add(workspaceId);
+      nextOrder.push(workspaceId);
+    });
+  });
+
+  return nextOrder;
+}
+
+function omitRecordEntry<T>(entries: Record<string, T>, entryKey: string) {
+  const nextEntries = { ...entries };
+  delete nextEntries[entryKey];
+  return nextEntries;
+}
+
+function appendWorkspaceToOrder(nextWorkspaceId: string | null) {
+  if (!nextWorkspaceId) {
+    return workspaceOrder.value;
+  }
+
+  return mergeWorkspaceOrder(workspaceOrder.value, [nextWorkspaceId]);
+}
+
+function ensureProjectWorkspace(
+  nextRepoPath: string,
+  options: { allowDuplicate?: boolean } = {},
+): WorkspaceDescriptor {
+  const existingWorkspace = !options.allowDuplicate
+    ? Object.values(workspaceDescriptors.value).find((workspaceDescriptor) => (
+      workspaceDescriptor.kind === 'project' && workspaceDescriptor.repoPath === nextRepoPath
+    ))
+    : null;
+
+  if (existingWorkspace) {
+    return existingWorkspace;
+  }
+
+  const nextWorkspaceDescriptor: WorkspaceDescriptor = {
+    id: buildProjectWorkspaceId(nextRepoPath),
+    kind: 'project',
+    repoPath: nextRepoPath,
+  };
+
+  workspaceDescriptors.value = {
+    ...workspaceDescriptors.value,
+    [nextWorkspaceDescriptor.id]: nextWorkspaceDescriptor,
+  };
+
+  return nextWorkspaceDescriptor;
 }
 
 function resolveAutoProjectTitle(nextRepoPath: string | null): string {
   return nextRepoPath ? getRepoName(nextRepoPath) : 'BridgeGit';
 }
 
-function resolveInitialProjectTitle(
-  savedTitle: string,
-  lastRepoPath: string | null,
-  mode: ProjectTitleMode,
-): string {
-  if (mode === 'auto') {
-    return resolveAutoProjectTitle(lastRepoPath);
+function buildProjectTitlesByContext(
+  titlesByContext: Record<string, string>,
+  nextWorkspaceId: string | null | undefined,
+  nextRepoPath: string | null,
+): Record<string, string> {
+  const nextTitlesByContext = cloneProjectTitlesByContext(titlesByContext);
+
+  if (!nextRepoPath) {
+    return nextTitlesByContext;
   }
 
-  const trimmedTitle = savedTitle.trim();
+  const contextKey = getWorkspaceContextKey(nextWorkspaceId, nextRepoPath);
+  const currentTitle = getProjectTitleContextKeys(nextWorkspaceId, nextRepoPath)
+    .map((currentContextKey) => nextTitlesByContext[currentContextKey]?.trim() ?? '')
+    .find(Boolean);
 
-  if (!trimmedTitle) {
-    return resolveAutoProjectTitle(lastRepoPath);
+  if (currentTitle) {
+    nextTitlesByContext[contextKey] = currentTitle;
+    return nextTitlesByContext;
   }
 
-  return trimmedTitle;
+  nextTitlesByContext[contextKey] = getRepoName(nextRepoPath);
+  return nextTitlesByContext;
 }
 
 function buildDiffPathQueue(nextStatus: GitStatusSummary | null): string[] {
@@ -591,27 +1233,87 @@ function scheduleSessionSave() {
   }
 
   persistTimer = window.setTimeout(() => {
-    void saveSession({
-      lastRepoPath: repoPath.value,
-      recentRepos: recentRepos.value,
-      terminalCwd: terminalCwd.value,
-      projectTitle: projectTitle.value,
-      projectTitleMode: projectTitleMode.value,
-      soundNotificationsEnabled: soundNotificationsEnabled.value,
-      infoNoteLastSeenRevision: infoNoteLastSeenRevision.value,
-      terminalCommandPresets: terminalCommandPresets.value,
-      workspaceSessions: buildPersistedWorkspaceSessions(),
-      panelLayout: {
-        sidebarWidth: sidebarWidth.value,
-        terminalHeight: terminalHeight.value,
-        terminalWidth: terminalWidth.value,
-        contentLayout: contentLayout.value,
-        sidebarCollapsed: sidebarCollapsed.value,
-        diffCollapsed: diffCollapsed.value,
-        terminalCollapsed: terminalCollapsed.value,
-      },
-    });
+    void saveSession(buildSessionSavePayload());
   }, 180);
+}
+
+async function detectWorktrees(
+  options: { includeDismissed?: boolean } = {},
+) {
+  const currentRepoPath = repoPath.value;
+
+  if (!currentRepoPath || !window.bridgegit?.git) {
+    detectedWorktrees.value = [];
+    return;
+  }
+
+  if (isCheckingWorktrees.value) {
+    return;
+  }
+
+  isCheckingWorktrees.value = true;
+
+  try {
+    const nextWorktrees = await window.bridgegit.git.worktrees(currentRepoPath);
+
+    if (repoPath.value !== currentRepoPath) {
+      return;
+    }
+
+    detectedWorktrees.value = buildVisibleWorktreeSuggestions(nextWorktrees, options);
+  } catch {
+    if (repoPath.value === currentRepoPath) {
+      detectedWorktrees.value = [];
+    }
+  } finally {
+    if (repoPath.value === currentRepoPath) {
+      isCheckingWorktrees.value = false;
+    } else {
+      isCheckingWorktrees.value = false;
+    }
+  }
+}
+
+function startWorktreeDetectionPolling() {
+  if (worktreeDetectionTimer) {
+    window.clearInterval(worktreeDetectionTimer);
+  }
+
+  if (!worktreeDetectionIntervalMs.value) {
+    return;
+  }
+
+  worktreeDetectionTimer = window.setInterval(() => {
+    if (!sessionReady.value || isSwitchingWorkspaceContext.value || !repoPath.value || document.visibilityState !== 'visible') {
+      return;
+    }
+
+    void detectWorktrees();
+  }, worktreeDetectionIntervalMs.value);
+}
+
+async function handleRefreshRepo() {
+  await refreshRepoStatus();
+  await detectWorktrees({ includeDismissed: true });
+}
+
+async function handleDismissDetectedWorktree(path: string) {
+  const nextDismissedWorktreePaths = cloneDismissedWorktreePaths([
+    ...new Set([...dismissedWorktreePaths.value, path]),
+  ]);
+
+  dismissedWorktreePaths.value = nextDismissedWorktreePaths;
+  detectedWorktrees.value = detectedWorktrees.value.filter((worktree) => worktree.path !== path);
+  const savedSession = await saveSession({
+    dismissedWorktreePaths: nextDismissedWorktreePaths,
+  });
+  dismissedWorktreePaths.value = cloneDismissedWorktreePaths(savedSession.dismissedWorktreePaths);
+}
+
+async function handleAddDetectedWorktree(path: string) {
+  dismissedWorktreePaths.value = dismissedWorktreePaths.value.filter((dismissedPath) => dismissedPath !== path);
+  detectedWorktrees.value = detectedWorktrees.value.filter((worktree) => worktree.path !== path);
+  await handleSelectRepo(path);
 }
 
 function startResize(target: Exclude<ResizeTarget, null>, event: PointerEvent) {
@@ -643,7 +1345,7 @@ function toggleContentLayout() {
 }
 
 function handleOpenWelcomeNote() {
-  workspaceTabs.value = upsertWelcomeNoteTab(workspaceTabs.value);
+  workspaceTabs.value = upsertWelcomeNoteTab(workspaceTabs.value, workspaceTabDefaults.value);
   activeWorkspaceTabId.value = WELCOME_NOTE_TAB_ID;
   infoNoteLastSeenRevision.value = CURRENT_INFO_NOTE_REVISION;
   void saveSession({
@@ -673,38 +1375,73 @@ function markInfoNoteAsSeenWhenActive() {
 
 async function handleSaveSettings(nextSettings: ProjectSettingsFormData) {
   const trimmedTitle = nextSettings.projectTitle.trim();
-  const nextMode: ProjectTitleMode = trimmedTitle ? 'custom' : 'auto';
-  const nextProjectTitle = nextMode === 'custom'
-    ? trimmedTitle
-    : resolveAutoProjectTitle(repoPath.value);
+  const nextWorkspaceRepoPanelState = {
+    ...currentWorkspaceRepoPanelStateValue(),
+    fontSize: nextSettings.workspacePanelFontSize,
+  };
+  const nextProjectTitlesByContext = repoPath.value
+    ? {
+        ...projectTitlesByContext.value,
+        [getWorkspaceContextKey(getCurrentWorkspaceId(), repoPath.value)]: trimmedTitle || getRepoName(repoPath.value),
+      }
+    : projectTitlesByContext.value;
 
-  projectTitle.value = nextProjectTitle;
-  projectTitleMode.value = nextMode;
+  projectTitlesByContext.value = nextProjectTitlesByContext;
   contentLayout.value = nextSettings.contentLayout;
+  appAppearance.value = normalizeAppAppearance(nextSettings.appAppearance);
+  editorTheme.value = normalizeEditorTheme(nextSettings.editorTheme);
+  applyAppTheme(appAppearance.value);
+  workspaceRepoPanelStates.value = {
+    ...workspaceRepoPanelStates.value,
+    [getCurrentWorkspaceId()]: cloneWorkspaceRepoPanelState(nextWorkspaceRepoPanelState),
+  };
+  workspaceIndicatorVisibility.value = cloneWorkspaceIndicatorVisibilitySettings(nextSettings.workspaceIndicatorVisibility);
+  workspaceTabDefaults.value = cloneWorkspaceTabDefaults(nextSettings.workspaceTabDefaults);
+  worktreeDetectionIntervalMs.value = nextSettings.worktreeDetectionIntervalMs;
   soundNotificationsEnabled.value = nextSettings.soundNotificationsEnabled;
   terminalCommandPresets.value = nextSettings.terminalCommandPresets;
 
   const savedSession = await saveSession({
-    projectTitle: nextProjectTitle,
-    projectTitleMode: nextMode,
+    activeWorkspaceId: activeWorkspaceId.value,
+    projectTitle: '',
+    projectTitleMode: 'auto',
+    projectTitlesByContext: nextProjectTitlesByContext,
+    appAppearance: nextSettings.appAppearance,
+    editorTheme: nextSettings.editorTheme,
+    workspaceIndicatorVisibility: nextSettings.workspaceIndicatorVisibility,
+    workspaceTabDefaults: nextSettings.workspaceTabDefaults,
+    worktreeDetectionIntervalMs: nextSettings.worktreeDetectionIntervalMs,
     soundNotificationsEnabled: nextSettings.soundNotificationsEnabled,
     infoNoteLastSeenRevision: infoNoteLastSeenRevision.value,
     terminalCommandPresets: nextSettings.terminalCommandPresets,
     workspaceSessions: buildPersistedWorkspaceSessions(),
-    panelLayout: {
-      contentLayout: nextSettings.contentLayout,
+    workspaceDescriptors: workspaceDescriptors.value,
+    workspaceOrder: workspaceOrder.value,
+    panelLayout: buildCurrentPanelLayout(),
+    panelLayoutsByWorkspace: buildPersistedPanelLayoutsByWorkspace(),
+    workspaceRepoPanelStates: {
+      ...buildPersistedWorkspaceRepoPanelStates(),
+      [getCurrentWorkspaceId()]: cloneWorkspaceRepoPanelState(nextWorkspaceRepoPanelState),
     },
   });
 
-  projectTitle.value = resolveInitialProjectTitle(
-    savedSession.projectTitle,
-    savedSession.lastRepoPath,
-    savedSession.projectTitleMode,
-  );
-  projectTitleMode.value = savedSession.projectTitleMode;
+  projectTitlesByContext.value = cloneProjectTitlesByContext(savedSession.projectTitlesByContext);
+  appAppearance.value = savedSession.appAppearance;
+  editorTheme.value = savedSession.editorTheme;
+  applyAppTheme(savedSession.appAppearance);
+  workspaceIndicatorVisibility.value = cloneWorkspaceIndicatorVisibilitySettings(savedSession.workspaceIndicatorVisibility);
+  workspaceTabDefaults.value = cloneWorkspaceTabDefaults(savedSession.workspaceTabDefaults);
+  worktreeDetectionIntervalMs.value = savedSession.worktreeDetectionIntervalMs;
+  dismissedWorktreePaths.value = cloneDismissedWorktreePaths(savedSession.dismissedWorktreePaths);
   soundNotificationsEnabled.value = savedSession.soundNotificationsEnabled;
-  contentLayout.value = savedSession.panelLayout.contentLayout;
+  panelLayoutsByWorkspace.value = clonePanelLayoutsByWorkspace(savedSession.panelLayoutsByWorkspace);
+  workspaceRepoPanelStates.value = cloneWorkspaceRepoPanelStates(savedSession.workspaceRepoPanelStates);
+  applyWorkspacePanelLayout(savedSession.activeWorkspaceId);
+  applyWorkspaceRepoPanelState(savedSession.activeWorkspaceId);
   terminalCommandPresets.value = savedSession.terminalCommandPresets;
+  activeWorkspaceId.value = savedSession.activeWorkspaceId;
+  workspaceDescriptors.value = cloneWorkspaceDescriptors(savedSession.workspaceDescriptors);
+  workspaceOrder.value = [...savedSession.workspaceOrder];
   workspaceSessions.value = cloneWorkspaceSessions(savedSession.workspaceSessions);
   isSettingsOpen.value = false;
   showProjectTitleSavedToast('Settings saved locally');
@@ -720,55 +1457,304 @@ function buildRecentRepos(nextRepoPath: string): RecentRepoEntry[] {
   return [nextEntry, ...recentRepos.value.filter((repo) => repo.path !== nextRepoPath)].slice(0, 12);
 }
 
-async function handleSelectRepo(nextRepoPath: string) {
-  const nextRepoName = getRepoName(nextRepoPath);
-  const previousRepoPath = repoPath.value;
+async function activateWorkspace(nextWorkspaceId: string | null) {
+  const previousWorkspaceId = getCurrentWorkspaceId();
+  const nextWorkspaceDescriptor = getWorkspaceDescriptorById(nextWorkspaceId ?? GLOBAL_WORKSPACE_ID);
+  const requestedRepoPath = nextWorkspaceDescriptor?.kind === 'project' ? nextWorkspaceDescriptor.repoPath : null;
+  const nextRepoPath = await isGitRepositoryPath(requestedRepoPath) ? requestedRepoPath : null;
+  const nextWorkspaceOrder = appendWorkspaceToOrder(nextWorkspaceId);
+  const nextRepoPanelState = getWorkspaceRepoPanelStateValue(nextWorkspaceId ?? GLOBAL_WORKSPACE_ID);
+  const shouldForceOpenWorkspaceDetail = previousWorkspaceId !== (nextWorkspaceDescriptor?.id ?? GLOBAL_WORKSPACE_ID)
+    && nextWorkspaceDescriptor?.kind === 'project';
+  const nextRepoPanelStateForActivation = shouldForceOpenWorkspaceDetail
+    ? {
+        ...nextRepoPanelState,
+        workspaceDetailExpanded: true,
+      }
+    : nextRepoPanelState;
 
-  isCommitHistoryOpen.value = false;
   commitMessage.value = '';
   isSwitchingWorkspaceContext.value = true;
 
   try {
-    captureWorkspaceSession(previousRepoPath);
-    await setRepoPath(nextRepoPath);
-    applyWorkspaceSession(nextRepoPath);
-    recentRepos.value = buildRecentRepos(nextRepoPath);
+    captureWorkspaceSession(previousWorkspaceId);
+    captureWorkspacePanelLayout(previousWorkspaceId);
+    captureWorkspaceRepoPanelState(previousWorkspaceId);
+    isCommitHistoryOpen.value = false;
+    activeWorkspaceId.value = nextWorkspaceDescriptor?.id ?? GLOBAL_WORKSPACE_ID;
+    if (shouldForceOpenWorkspaceDetail) {
+      workspaceRepoPanelStates.value = {
+        ...workspaceRepoPanelStates.value,
+        [activeWorkspaceId.value]: cloneWorkspaceRepoPanelState(nextRepoPanelStateForActivation),
+      };
+    }
+    applyWorkspaceSession(activeWorkspaceId.value);
+    workspaceRecentActivityByTabId.value = {
+      ...(workspaceRecentActivityByWorkspaceId.value[activeWorkspaceId.value] ?? {}),
+    };
+    applyWorkspacePanelLayout(activeWorkspaceId.value);
+    applyWorkspaceRepoPanelState(activeWorkspaceId.value);
+    workspaceOrder.value = nextWorkspaceOrder;
 
-    if (projectTitleMode.value === 'auto') {
-      projectTitle.value = nextRepoName;
+    if (requestedRepoPath && nextRepoPath) {
+      recentRepos.value = buildRecentRepos(nextRepoPath);
     }
 
-    const savedSession = await saveSession({
+    const nextProjectTitlesByContext = buildProjectTitlesByContext(
+      projectTitlesByContext.value,
+      activeWorkspaceId.value,
+      requestedRepoPath,
+    );
+    projectTitlesByContext.value = nextProjectTitlesByContext;
+    await saveSession(buildSessionSavePayload({
+      activeWorkspaceId: activeWorkspaceId.value,
       lastRepoPath: nextRepoPath,
-      recentRepos: recentRepos.value,
-      terminalCwd: nextRepoPath,
-      projectTitle: projectTitle.value,
-      projectTitleMode: projectTitleMode.value,
-      soundNotificationsEnabled: soundNotificationsEnabled.value,
-      infoNoteLastSeenRevision: infoNoteLastSeenRevision.value,
-      terminalCommandPresets: terminalCommandPresets.value,
-      workspaceSessions: buildPersistedWorkspaceSessions(),
-      panelLayout: {
-        sidebarWidth: sidebarWidth.value,
-        terminalHeight: terminalHeight.value,
-        terminalWidth: terminalWidth.value,
-        contentLayout: contentLayout.value,
-        sidebarCollapsed: sidebarCollapsed.value,
-        diffCollapsed: diffCollapsed.value,
-        terminalCollapsed: terminalCollapsed.value,
-      },
+    }));
+    await setRepoPath(nextRepoPath, {
+      loadMode: 'branches',
     });
-    workspaceSessions.value = cloneWorkspaceSessions(savedSession.workspaceSessions);
+    await detectWorktrees();
+
+    if (nextWorkspaceDescriptor?.id && requestedRepoPath) {
+      void loadWorkspaceGitSummary(nextWorkspaceDescriptor.id, requestedRepoPath);
+    }
+
+    if (nextRepoPath && shouldLoadDetailedGitStatus(nextRepoPanelStateForActivation)) {
+      void ensureFullStatus();
+    }
   } finally {
     isSwitchingWorkspaceContext.value = false;
   }
 }
 
+async function handleSelectWorkspace(nextWorkspaceId: string | null) {
+  await activateWorkspace(nextWorkspaceId);
+}
+
+async function handleRenameWorkspace(workspaceId: string, title: string) {
+  const workspaceDescriptor = getWorkspaceDescriptorById(workspaceId);
+
+  if (!workspaceDescriptor?.repoPath) {
+    return;
+  }
+
+  const nextProjectTitlesByContext = {
+    ...projectTitlesByContext.value,
+    [getWorkspaceContextKey(workspaceId, workspaceDescriptor.repoPath)]:
+      title.trim() || getRepoName(workspaceDescriptor.repoPath),
+  };
+
+  projectTitlesByContext.value = nextProjectTitlesByContext;
+
+  const savedSession = await saveSession({
+    ...buildSessionSavePayload(),
+    projectTitlesByContext: nextProjectTitlesByContext,
+  });
+
+  projectTitlesByContext.value = cloneProjectTitlesByContext(savedSession.projectTitlesByContext);
+  showProjectTitleSavedToast('Workspace renamed locally');
+}
+
+async function handleRemoveWorkspace(workspaceId: string) {
+  const workspaceDescriptor = getWorkspaceDescriptorById(workspaceId);
+
+  if (!workspaceDescriptor || workspaceDescriptor.kind !== 'project') {
+    return;
+  }
+
+  const previousWorkspaceOrder = [...workspaceOrder.value];
+  const nextWorkspaceDescriptors = omitRecordEntry(workspaceDescriptors.value, workspaceId);
+  const nextWorkspaceOrder = workspaceOrder.value.filter((entryWorkspaceId) => entryWorkspaceId !== workspaceId);
+  const nextWorkspaceSessions = omitRecordEntry(workspaceSessions.value, workspaceId);
+  const nextPanelLayoutsByWorkspace = omitRecordEntry(panelLayoutsByWorkspace.value, workspaceId);
+  const nextWorkspaceRepoPanelStates = omitRecordEntry(workspaceRepoPanelStates.value, workspaceId);
+  const nextWorkspaceGitSummaryById = omitRecordEntry(workspaceGitSummaryById.value, workspaceId);
+  const nextWorkspaceRecentActivityByWorkspaceId = omitRecordEntry(workspaceRecentActivityByWorkspaceId.value, workspaceId);
+  const nextWorkspaceAttentionByWorkspaceId = omitRecordEntry(workspaceAttentionByWorkspaceId.value, workspaceId);
+  const nextProjectTitlesByContext = cloneProjectTitlesByContext(projectTitlesByContext.value);
+
+  if (workspaceDescriptor.repoPath) {
+    delete nextProjectTitlesByContext[getWorkspaceContextKey(workspaceId, workspaceDescriptor.repoPath)];
+
+    const hasRemainingWorkspaceForRepoPath = Object.values(nextWorkspaceDescriptors).some((descriptor) => (
+      descriptor.kind === 'project' && descriptor.repoPath === workspaceDescriptor.repoPath
+    ));
+
+    if (!hasRemainingWorkspaceForRepoPath) {
+      delete nextProjectTitlesByContext[workspaceDescriptor.repoPath];
+      recentRepos.value = recentRepos.value.filter((entry) => entry.path !== workspaceDescriptor.repoPath);
+    }
+  }
+
+  workspaceDescriptors.value = nextWorkspaceDescriptors;
+  workspaceOrder.value = nextWorkspaceOrder;
+  workspaceSessions.value = nextWorkspaceSessions;
+  panelLayoutsByWorkspace.value = nextPanelLayoutsByWorkspace;
+  workspaceRepoPanelStates.value = nextWorkspaceRepoPanelStates;
+  workspaceGitSummaryById.value = nextWorkspaceGitSummaryById;
+  workspaceRecentActivityByWorkspaceId.value = nextWorkspaceRecentActivityByWorkspaceId;
+  workspaceAttentionByWorkspaceId.value = nextWorkspaceAttentionByWorkspaceId;
+  projectTitlesByContext.value = nextProjectTitlesByContext;
+
+  if (workspaceId !== getCurrentWorkspaceId()) {
+    await saveSession({
+      ...buildSessionSavePayload(),
+      workspaceDescriptors: nextWorkspaceDescriptors,
+      workspaceOrder: nextWorkspaceOrder,
+      workspaceSessions: nextWorkspaceSessions,
+      panelLayoutsByWorkspace: nextPanelLayoutsByWorkspace,
+      workspaceRepoPanelStates: nextWorkspaceRepoPanelStates,
+      projectTitlesByContext: nextProjectTitlesByContext,
+    });
+    showProjectTitleSavedToast('Workspace removed from list');
+    return;
+  }
+
+  const currentWorkspaceIndex = previousWorkspaceOrder.indexOf(workspaceId);
+  const nextActiveWorkspaceId = nextWorkspaceOrder[currentWorkspaceIndex] ?? nextWorkspaceOrder[currentWorkspaceIndex - 1] ?? GLOBAL_WORKSPACE_ID;
+  const nextActiveWorkspaceDescriptor = nextWorkspaceDescriptors[nextActiveWorkspaceId] ?? null;
+  const nextRepoPath = nextActiveWorkspaceDescriptor?.kind === 'project' ? nextActiveWorkspaceDescriptor.repoPath : null;
+
+  isSwitchingWorkspaceContext.value = true;
+
+  try {
+    isCommitHistoryOpen.value = false;
+    activeWorkspaceId.value = nextActiveWorkspaceId;
+    applyWorkspaceSession(nextActiveWorkspaceId);
+    workspaceRecentActivityByTabId.value = {
+      ...(nextWorkspaceRecentActivityByWorkspaceId[nextActiveWorkspaceId] ?? {}),
+    };
+    applyWorkspacePanelLayout(nextActiveWorkspaceId);
+    applyWorkspaceRepoPanelState(nextActiveWorkspaceId);
+
+    const savedSession = await saveSession({
+      ...buildSessionSavePayload({
+        activeWorkspaceId: nextActiveWorkspaceId,
+        lastRepoPath: nextRepoPath,
+      }),
+      workspaceDescriptors: nextWorkspaceDescriptors,
+      workspaceOrder: nextWorkspaceOrder,
+      workspaceSessions: nextWorkspaceSessions,
+      panelLayoutsByWorkspace: nextPanelLayoutsByWorkspace,
+      workspaceRepoPanelStates: nextWorkspaceRepoPanelStates,
+      projectTitlesByContext: nextProjectTitlesByContext,
+    });
+
+    activeWorkspaceId.value = savedSession.activeWorkspaceId;
+    workspaceDescriptors.value = cloneWorkspaceDescriptors(savedSession.workspaceDescriptors);
+    workspaceOrder.value = [...savedSession.workspaceOrder];
+    workspaceSessions.value = cloneWorkspaceSessions(savedSession.workspaceSessions);
+    panelLayoutsByWorkspace.value = clonePanelLayoutsByWorkspace(savedSession.panelLayoutsByWorkspace);
+    workspaceRepoPanelStates.value = cloneWorkspaceRepoPanelStates(savedSession.workspaceRepoPanelStates);
+    projectTitlesByContext.value = cloneProjectTitlesByContext(savedSession.projectTitlesByContext);
+    await setRepoPath(nextRepoPath, {
+      loadMode: 'branches',
+    });
+
+    if (nextActiveWorkspaceId !== GLOBAL_WORKSPACE_ID && nextRepoPath) {
+      void loadWorkspaceGitSummary(nextActiveWorkspaceId, nextRepoPath);
+    }
+  } finally {
+    isSwitchingWorkspaceContext.value = false;
+  }
+
+  showProjectTitleSavedToast('Workspace removed from list');
+}
+
+async function handleSelectRepo(nextRepoPath: string, options: { allowDuplicate?: boolean } = {}) {
+  const workspaceDescriptor = ensureProjectWorkspace(nextRepoPath, options);
+  await activateWorkspace(workspaceDescriptor.id);
+}
+
+function buildWorkspaceSummaryPlaceholder() {
+  return {
+    branch: null,
+    changedCount: null,
+    untrackedCount: null,
+    conflictedCount: null,
+  };
+}
+
+async function handleChangeWorkspaceRepo(workspaceId: string) {
+  const workspaceDescriptor = getWorkspaceDescriptorById(workspaceId);
+
+  if (!workspaceDescriptor || workspaceDescriptor.kind !== 'project') {
+    return;
+  }
+
+  const nextRepoPath = await window.bridgegit?.dialog.openRepo(workspaceDescriptor.repoPath);
+
+  if (!nextRepoPath || nextRepoPath === workspaceDescriptor.repoPath) {
+    return;
+  }
+
+  const nextWorkspaceDescriptors = {
+    ...workspaceDescriptors.value,
+    [workspaceId]: {
+      ...workspaceDescriptor,
+      repoPath: nextRepoPath,
+    },
+  };
+  const nextProjectTitlesByContextBase = cloneProjectTitlesByContext(projectTitlesByContext.value);
+
+  if (workspaceDescriptor.repoPath) {
+    const hasRemainingWorkspaceForPreviousRepoPath = Object.values(nextWorkspaceDescriptors).some((descriptor) => (
+      descriptor.id !== workspaceId
+      && descriptor.kind === 'project'
+      && descriptor.repoPath === workspaceDescriptor.repoPath
+    ));
+
+    if (!hasRemainingWorkspaceForPreviousRepoPath) {
+      delete nextProjectTitlesByContextBase[workspaceDescriptor.repoPath];
+    }
+  }
+
+  const nextProjectTitlesByContext = buildProjectTitlesByContext(
+    nextProjectTitlesByContextBase,
+    workspaceId,
+    nextRepoPath,
+  );
+
+  workspaceDescriptors.value = nextWorkspaceDescriptors;
+  projectTitlesByContext.value = nextProjectTitlesByContext;
+  recentRepos.value = buildRecentRepos(nextRepoPath);
+  workspaceGitSummaryById.value = {
+    ...workspaceGitSummaryById.value,
+    [workspaceId]: buildWorkspaceSummaryPlaceholder(),
+  };
+
+  if (workspaceId === getCurrentWorkspaceId()) {
+    await activateWorkspace(workspaceId);
+  } else {
+    const savedSession = await saveSession({
+      ...buildSessionSavePayload(),
+      workspaceDescriptors: nextWorkspaceDescriptors,
+      projectTitlesByContext: nextProjectTitlesByContext,
+      recentRepos: recentRepos.value,
+    });
+
+    recentRepos.value = [...savedSession.recentRepos];
+    workspaceDescriptors.value = cloneWorkspaceDescriptors(savedSession.workspaceDescriptors);
+    projectTitlesByContext.value = cloneProjectTitlesByContext(savedSession.projectTitlesByContext);
+    workspaceSessions.value = cloneWorkspaceSessions(savedSession.workspaceSessions);
+    panelLayoutsByWorkspace.value = clonePanelLayoutsByWorkspace(savedSession.panelLayoutsByWorkspace);
+    workspaceRepoPanelStates.value = cloneWorkspaceRepoPanelStates(savedSession.workspaceRepoPanelStates);
+    workspaceOrder.value = [...savedSession.workspaceOrder];
+  }
+
+  void loadWorkspaceGitSummary(workspaceId, nextRepoPath);
+  showProjectTitleSavedToast('Workspace repository updated');
+}
+
+function handleReorderWorkspaces(nextWorkspaceIds: string[]) {
+  workspaceOrder.value = mergeWorkspaceOrder(nextWorkspaceIds);
+}
+
 async function handleOpenRepo() {
-  const nextRepoPath = await window.bridgegit?.dialog.openRepo();
+  const nextRepoPath = await window.bridgegit?.dialog.openRepo(repoPath.value);
 
   if (nextRepoPath) {
-    await handleSelectRepo(nextRepoPath);
+    await handleSelectRepo(nextRepoPath, { allowDuplicate: true });
   }
 }
 
@@ -779,8 +1765,13 @@ async function handleToggleCommitHistory() {
 
   const nextState = !isCommitHistoryOpen.value;
   isCommitHistoryOpen.value = nextState;
+  await updateCurrentWorkspaceRepoPanelState({
+    ...currentWorkspaceRepoPanelStateValue(),
+    historyOpen: nextState,
+  });
 
   if (nextState) {
+    await ensureFullStatus();
     await loadLog();
   }
 }
@@ -791,6 +1782,11 @@ async function handleOpenCommitHistory() {
   }
 
   isCommitHistoryOpen.value = true;
+  await updateCurrentWorkspaceRepoPanelState({
+    ...currentWorkspaceRepoPanelStateValue(),
+    historyOpen: true,
+  });
+  await ensureFullStatus();
   await loadLog();
 }
 
@@ -803,26 +1799,35 @@ async function focusCommitHistorySearch() {
 
   if (!isCommitHistoryOpen.value) {
     isCommitHistoryOpen.value = true;
+    await updateCurrentWorkspaceRepoPanelState({
+      ...currentWorkspaceRepoPanelStateValue(),
+      historyOpen: true,
+    });
   }
 
   commitHistorySearchToken.value += 1;
 
   if (shouldLoadLog) {
+    await ensureFullStatus();
     await loadLog();
   }
 }
 
-async function handleSelectFile(filePath: string) {
+async function handleSelectFile(filePath: string, diffMode?: GitDiffMode) {
   if (diffCollapsed.value) {
     diffCollapsed.value = false;
     scheduleSessionSave();
   }
 
-  await selectFile(filePath);
+  await selectFile(filePath, { diffMode });
 }
 
 async function handleOpenCommitDiff(commit: GitLogEntry) {
   isCommitHistoryOpen.value = false;
+  void updateCurrentWorkspaceRepoPanelState({
+    ...currentWorkspaceRepoPanelStateValue(),
+    historyOpen: false,
+  });
 
   if (diffCollapsed.value) {
     diffCollapsed.value = false;
@@ -837,6 +1842,10 @@ function handleGlobalKeydown(event: KeyboardEvent) {
     if (isCommitHistoryOpen.value) {
       event.preventDefault();
       isCommitHistoryOpen.value = false;
+      void updateCurrentWorkspaceRepoPanelState({
+        ...currentWorkspaceRepoPanelStateValue(),
+        historyOpen: false,
+      });
       return;
     }
 
@@ -967,7 +1976,7 @@ function resolveRepoFilePath(repoRoot: string, relativePath: string) {
   return `${repoRoot}${separator}${normalizedRelativePath}`;
 }
 
-async function handleOpenRepoFileInNotes(relativePath: string) {
+async function handleOpenWorkspaceFile(relativePath: string) {
   if (!repoPath.value || !sessionReady.value) {
     return;
   }
@@ -978,7 +1987,15 @@ async function handleOpenRepoFileInNotes(relativePath: string) {
   }
 
   const filePath = resolveRepoFilePath(repoPath.value, relativePath);
-  await terminalPanelRef.value?.openNoteFilePath(filePath);
+  await terminalPanelRef.value?.openWorkspaceFilePath(filePath);
+}
+
+async function handleOpenCurrentDiffInWorkspace() {
+  if (!selectedPath.value) {
+    return;
+  }
+
+  await handleOpenWorkspaceFile(selectedPath.value);
 }
 
 async function handleCommit() {
@@ -1001,6 +2018,22 @@ async function handleCheckout(branchName: string) {
   }
 
   await checkoutBranch(branchName);
+}
+
+async function handleDiscardFile(change: GitChange) {
+  await discardFile(change);
+}
+
+async function handleDiscardCurrentDiff() {
+  if (!currentDiscardableChange.value) {
+    return;
+  }
+
+  await discardFile(currentDiscardableChange.value);
+}
+
+async function handleDiscardHunk(patch: string) {
+  await discardHunk(patch, selectedDiffMode.value);
 }
 
 async function handleSelectAdjacentDiff(direction: -1 | 1) {
@@ -1035,15 +2068,65 @@ watch([sidebarWidth, terminalHeight, terminalWidth, contentLayout, sidebarCollap
 });
 
 watch(repoPath, () => {
+  if (!repoPath.value) {
+    detectedWorktrees.value = [];
+  }
+
   scheduleSessionSave();
 });
 
-watch([recentRepos, soundNotificationsEnabled, terminalCommandPresets, workspaceTabs, activeWorkspaceTabId], () => {
+watch([recentRepos, workspaceOrder, appAppearance, editorTheme, workspaceIndicatorVisibility, workspaceTabDefaults, soundNotificationsEnabled, terminalCommandPresets, workspaceTabs, activeWorkspaceTabId, workspaceRepoPanelStates], () => {
   scheduleSessionSave();
 }, { deep: true });
 
+watch([worktreeDetectionIntervalMs, repoPath], () => {
+  if (!sessionReady.value) {
+    return;
+  }
+
+  startWorktreeDetectionPolling();
+});
+
+watch(
+  () => [
+    getCurrentWorkspaceId(),
+    repoPath.value,
+    status.value?.currentBranch ?? branches.value?.current ?? null,
+    status.value?.staged.length ?? null,
+    status.value?.unstaged.length ?? null,
+    status.value?.untracked.length ?? null,
+    status.value?.conflicted.length ?? null,
+  ],
+  () => {
+    if (!repoPath.value) {
+      return;
+    }
+
+    workspaceGitSummaryById.value = {
+      ...workspaceGitSummaryById.value,
+      [getCurrentWorkspaceId()]: {
+        branch: status.value?.currentBranch ?? branches.value?.current ?? null,
+        changedCount: status.value ? status.value.staged.length + status.value.unstaged.length + status.value.conflicted.length : null,
+        untrackedCount: status.value ? status.value.untracked.length : null,
+        conflictedCount: status.value ? status.value.conflicted.length : null,
+      },
+    };
+  },
+);
+
 watch(infoNoteLastSeenRevision, () => {
   scheduleSessionSave();
+});
+
+watch(isCommitHistoryOpen, (nextIsOpen) => {
+  if (isSwitchingWorkspaceContext.value) {
+    return;
+  }
+
+  void updateCurrentWorkspaceRepoPanelState({
+    ...currentWorkspaceRepoPanelStateValue(),
+    historyOpen: nextIsOpen,
+  });
 });
 
 watch([workspaceTabs, activeWorkspaceTabId], () => {
@@ -1053,6 +2136,7 @@ watch([workspaceTabs, activeWorkspaceTabId], () => {
 onMounted(async () => {
   window.addEventListener('keydown', handleGlobalKeydown, true);
   window.addEventListener('contextmenu', handleGlobalEditableContextMenu, true);
+  applyAppTheme(appAppearance.value);
 
   let initialSession = await loadSession();
 
@@ -1064,38 +2148,75 @@ onMounted(async () => {
     initialSession = await saveSession({
       terminalCwd: initialSession.terminalCwd ?? onboardingCwd,
       infoNoteLastSeenRevision: initialSession.infoNoteLastSeenRevision,
-      workspaceSessions: buildOnboardingWorkspaceSessions(initialSession.lastRepoPath, onboardingCwd),
+      workspaceSessions: buildOnboardingWorkspaceSessions(
+        initialSession.lastRepoPath,
+        onboardingCwd,
+        initialSession.workspaceTabDefaults,
+      ),
     });
   }
 
-  sidebarWidth.value = initialSession.panelLayout.sidebarWidth;
-  terminalHeight.value = initialSession.panelLayout.terminalHeight;
-  terminalWidth.value = initialSession.panelLayout.terminalWidth;
-  contentLayout.value = initialSession.panelLayout.contentLayout;
-  sidebarCollapsed.value = initialSession.panelLayout.sidebarCollapsed;
-  diffCollapsed.value = initialSession.panelLayout.diffCollapsed;
-  terminalCollapsed.value = initialSession.panelLayout.terminalCollapsed;
-  projectTitleMode.value = initialSession.projectTitleMode;
   soundNotificationsEnabled.value = initialSession.soundNotificationsEnabled;
-  projectTitle.value = resolveInitialProjectTitle(
-    initialSession.projectTitle,
-    initialSession.lastRepoPath,
-    initialSession.projectTitleMode,
-  );
+  projectTitlesByContext.value = cloneProjectTitlesByContext(initialSession.projectTitlesByContext);
+  appAppearance.value = initialSession.appAppearance;
+  editorTheme.value = initialSession.editorTheme;
+  applyAppTheme(initialSession.appAppearance);
+  workspaceIndicatorVisibility.value = cloneWorkspaceIndicatorVisibilitySettings(initialSession.workspaceIndicatorVisibility);
+  workspaceTabDefaults.value = cloneWorkspaceTabDefaults(initialSession.workspaceTabDefaults);
+  worktreeDetectionIntervalMs.value = initialSession.worktreeDetectionIntervalMs;
+  dismissedWorktreePaths.value = cloneDismissedWorktreePaths(initialSession.dismissedWorktreePaths);
   recentRepos.value = initialSession.recentRepos;
+  activeWorkspaceId.value = initialSession.activeWorkspaceId;
+  workspaceDescriptors.value = cloneWorkspaceDescriptors(initialSession.workspaceDescriptors);
+  workspaceOrder.value = [...initialSession.workspaceOrder];
+  panelLayoutsByWorkspace.value = clonePanelLayoutsByWorkspace(initialSession.panelLayoutsByWorkspace);
+  workspaceRepoPanelStates.value = cloneWorkspaceRepoPanelStates(initialSession.workspaceRepoPanelStates);
   terminalCommandPresets.value = initialSession.terminalCommandPresets;
   workspaceSessions.value = cloneWorkspaceSessions(initialSession.workspaceSessions);
   infoNoteLastSeenRevision.value = initialSession.infoNoteLastSeenRevision;
-  applyWorkspaceSession(null);
+  sidebarWidth.value = initialSession.panelLayout.sidebarWidth;
+  applyWorkspaceSession(initialSession.activeWorkspaceId ?? GLOBAL_WORKSPACE_ID);
+  workspaceRecentActivityByTabId.value = {
+    ...(workspaceRecentActivityByWorkspaceId.value[initialSession.activeWorkspaceId ?? GLOBAL_WORKSPACE_ID] ?? {}),
+  };
+  applyWorkspacePanelLayout(initialSession.activeWorkspaceId ?? GLOBAL_WORKSPACE_ID);
+  applyWorkspaceRepoPanelState(initialSession.activeWorkspaceId ?? GLOBAL_WORKSPACE_ID);
 
-  if (initialSession.lastRepoPath) {
-    await setRepoPath(initialSession.lastRepoPath);
-    applyWorkspaceSession(initialSession.lastRepoPath);
-  }
+  const initialWorkspaceDescriptor = getWorkspaceDescriptorById(initialSession.activeWorkspaceId);
+  const requestedInitialRepoPath = initialWorkspaceDescriptor?.kind === 'project'
+    ? initialWorkspaceDescriptor.repoPath
+    : null;
+  const initialRepoPath = await isGitRepositoryPath(requestedInitialRepoPath) ? requestedInitialRepoPath : null;
+  const initialRepoPanelState = getWorkspaceRepoPanelStateValue(initialSession.activeWorkspaceId ?? GLOBAL_WORKSPACE_ID);
+  void loadAllWorkspaceGitSummaries();
+
+    if (requestedInitialRepoPath) {
+      const nextProjectTitlesByContext = buildProjectTitlesByContext(
+        projectTitlesByContext.value,
+        initialSession.activeWorkspaceId ?? GLOBAL_WORKSPACE_ID,
+        requestedInitialRepoPath,
+      );
+      projectTitlesByContext.value = nextProjectTitlesByContext;
+    }
+
+    if (initialRepoPath) {
+      await setRepoPath(initialRepoPath, {
+        loadMode: 'branches',
+      });
+      await detectWorktrees();
+
+      if (shouldLoadDetailedGitStatus(initialRepoPanelState)) {
+        void ensureFullStatus();
+      }
+    } else {
+      await setRepoPath(null);
+    }
 
   markInfoNoteAsSeenWhenActive();
 
   sessionReady.value = true;
+  startInactiveWorkspaceGitSummaryPolling();
+  startWorktreeDetectionPolling();
 });
 
 onBeforeUnmount(() => {
@@ -1111,6 +2232,14 @@ onBeforeUnmount(() => {
   if (projectTitleSaveToastTimer) {
     window.clearTimeout(projectTitleSaveToastTimer);
   }
+
+  if (inactiveWorkspaceGitSummaryTimer) {
+    window.clearInterval(inactiveWorkspaceGitSummaryTimer);
+  }
+
+  if (worktreeDetectionTimer) {
+    window.clearInterval(worktreeDetectionTimer);
+  }
 });
 </script>
 
@@ -1121,7 +2250,14 @@ onBeforeUnmount(() => {
         <RepoPanel
           :project-title="displayProjectTitle"
           :repo-path="repoPath"
+          :appearance-theme="appAppearance"
+          :appearance-theme-variant="appThemeVariant"
           :recent-repos="recentRepos"
+          :workspace-items="workspaceOverviewItems"
+          :workspace-indicator-visibility="workspaceIndicatorVisibility"
+          :repo-panel-state="currentWorkspaceRepoPanelState"
+          :project-titles-by-context="projectTitlesByContext"
+          :detected-worktree="activeDetectedWorktree"
           :status="status"
           :branches="branches"
           :log="log"
@@ -1137,14 +2273,23 @@ onBeforeUnmount(() => {
           @open-settings="isSettingsOpen = true"
           @open-repo="handleOpenRepo"
           @select-repo="handleSelectRepo"
-          @refresh="refresh"
+          @select-workspace="handleSelectWorkspace"
+          @rename-workspace="handleRenameWorkspace"
+          @remove-workspace="handleRemoveWorkspace"
+          @change-workspace-repo="handleChangeWorkspaceRepo"
+          @reorder-workspaces="handleReorderWorkspaces"
+          @update:repo-panel-state="updateCurrentWorkspaceRepoPanelState($event)"
+          @refresh="handleRefreshRepo"
           @toggle-history="handleToggleCommitHistory"
           @toggle-collapse="togglePanel('sidebar')"
           @select-file="handleSelectFile"
-          @open-file-in-notes="handleOpenRepoFileInNotes"
+          @open-workspace-file="handleOpenWorkspaceFile"
           @stage="stageFiles"
           @unstage="unstageFiles"
+          @discard-file="handleDiscardFile"
           @checkout="handleCheckout"
+          @add-detected-worktree="handleAddDetectedWorktree"
+          @dismiss-detected-worktree="handleDismissDetectedWorktree"
           @update:commit-message="commitMessage = $event"
           @commit="handleCommit"
         />
@@ -1167,6 +2312,7 @@ onBeforeUnmount(() => {
             :title-meta="diffViewerTitleMeta"
             :has-target="diffHasTarget"
             :diff="activeDiff"
+            :git-diff-mode="selectedDiffMode"
             :is-loading="activeDiffLoading"
             :error="activeDiffError"
             :change-position="currentDiffPosition"
@@ -1174,12 +2320,17 @@ onBeforeUnmount(() => {
             :can-select-previous="canSelectPreviousDiff"
             :can-select-next="canSelectNextDiff"
             :can-stage-current="canStageCurrentDiff"
+            :can-discard-current="canDiscardCurrentDiff"
+            :can-open-current-file="canOpenCurrentDiffInEditor"
             :stage-action-label="stageActionLabel"
             :can-collapse="canCollapseDiff"
             :collapse-shortcut-display="SHORTCUTS.panelDiffToggle.display"
             @select-previous="handleSelectAdjacentDiff(-1)"
             @select-next="handleSelectAdjacentDiff(1)"
             @stage-current="handleStageCurrentAndAdvance"
+            @discard-current="handleDiscardCurrentDiff"
+            @open-current-file="handleOpenCurrentDiffInWorkspace"
+            @discard-hunk="handleDiscardHunk"
             @toggle-collapse="togglePanel('diff')"
           />
         </div>
@@ -1197,9 +2348,16 @@ onBeforeUnmount(() => {
           <TerminalPanel
             ref="terminalPanelRef"
             v-if="sessionReady"
+            :workspace-id="getCurrentWorkspaceId()"
             :cwd="terminalCwd"
+            :project-root="repoPath"
+            :appearance-theme="appAppearance"
+            :appearance-theme-variant="appThemeVariant"
+            :editor-theme-variant="resolvedEditorThemeVariant"
+            :editor-theme="resolvedEditorTheme"
             :presets="terminalCommandPresets"
             :sound-notifications-enabled="soundNotificationsEnabled"
+            :workspace-tab-defaults="workspaceTabDefaults"
             :tabs="workspaceTabs"
             :active-tab-id="activeWorkspaceTabId"
             :can-collapse="canCollapseTerminal"
@@ -1207,7 +2365,8 @@ onBeforeUnmount(() => {
             :collapsed="terminalCollapsed"
             @update:tabs="workspaceTabs = $event"
             @update:active-tab-id="activeWorkspaceTabId = $event"
-            @update:recent-activity="workspaceRecentActivityByTabId = $event"
+            @update:recent-activity="handleWorkspaceRecentActivityUpdate($event.workspaceId, $event.recentActivity)"
+            @update:attention="handleWorkspaceAttentionUpdate($event.workspaceId, $event.attention)"
             @toggle-collapse="togglePanel('terminal')"
           />
         </div>
@@ -1240,8 +2399,14 @@ onBeforeUnmount(() => {
 
     <ProjectSettingsDialog
       v-model="isSettingsOpen"
-      :project-title="displayProjectTitle"
+      :project-title="currentProjectTitle"
       :content-layout="contentLayout"
+      :app-appearance="appAppearance"
+      :editor-theme="editorTheme"
+      :workspace-panel-font-size="currentWorkspaceRepoPanelState.fontSize"
+      :workspace-indicator-visibility="workspaceIndicatorVisibility"
+      :workspace-tab-defaults="workspaceTabDefaults"
+      :worktree-detection-interval-ms="worktreeDetectionIntervalMs"
       :sound-notifications-enabled="soundNotificationsEnabled"
       :terminal-command-presets="terminalCommandPresets"
       @save="handleSaveSettings"
@@ -1286,6 +2451,7 @@ onBeforeUnmount(() => {
 .app__sidebar {
   min-width: 0;
   min-height: 0;
+  overflow: hidden;
 }
 
 .app__content {

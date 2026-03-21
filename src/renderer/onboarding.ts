@@ -1,9 +1,11 @@
 import {
+  DEFAULT_SHELL_FONT_SIZE,
   DEFAULT_NOTE_FONT_SIZE,
-  GLOBAL_WORKSPACE_SESSION_KEY,
+  GLOBAL_WORKSPACE_ID,
+  type WorkspaceTabDefaults,
   type WorkspaceNoteTabState,
   type WorkspaceSessionState,
-  type WorkspaceSessionsByContext,
+  type WorkspaceSessionsById,
   type WorkspaceTabState,
 } from '../shared/bridgegit';
 import welcomeNoteContent from './assets/welcome-note.md?raw';
@@ -12,30 +14,35 @@ export const WELCOME_NOTE_TAB_ID = 'note-welcome';
 export const CURRENT_INFO_NOTE_REVISION = 'welcome-0.1.0';
 const WELCOME_SHELL_TAB_ID = 'shell-main';
 
-export function hasWorkspaceTabs(workspaceSessions: WorkspaceSessionsByContext): boolean {
+export function hasWorkspaceTabs(workspaceSessions: WorkspaceSessionsById): boolean {
   return Object.values(workspaceSessions).some((workspaceSession) => workspaceSession.tabs.length > 0);
 }
 
 export function buildOnboardingWorkspaceSessions(
   repoPath: string | null,
   cwd: string,
-): WorkspaceSessionsByContext {
-  const contextKey = repoPath ?? GLOBAL_WORKSPACE_SESSION_KEY;
+  workspaceTabDefaults?: WorkspaceTabDefaults,
+): WorkspaceSessionsById {
+  const workspaceId = repoPath ? `workspace:${repoPath}` : GLOBAL_WORKSPACE_ID;
 
   return {
-    [contextKey]: buildOnboardingWorkspaceSession(cwd),
+    [workspaceId]: buildOnboardingWorkspaceSession(cwd, workspaceTabDefaults),
   };
 }
 
-function buildOnboardingWorkspaceSession(cwd: string): WorkspaceSessionState {
+function buildOnboardingWorkspaceSession(
+  cwd: string,
+  workspaceTabDefaults?: WorkspaceTabDefaults,
+): WorkspaceSessionState {
   return {
     tabs: [
-      buildWelcomeNoteTab(),
+      buildWelcomeNoteTab(workspaceTabDefaults),
       {
         id: WELCOME_SHELL_TAB_ID,
         type: 'shell',
         title: 'Shell 1',
         cwd,
+        fontSize: workspaceTabDefaults?.shellFontSize ?? DEFAULT_SHELL_FONT_SIZE,
         launcherProfileId: null,
       },
     ],
@@ -43,7 +50,7 @@ function buildOnboardingWorkspaceSession(cwd: string): WorkspaceSessionState {
   };
 }
 
-export function buildWelcomeNoteTab(): WorkspaceNoteTabState {
+export function buildWelcomeNoteTab(workspaceTabDefaults?: WorkspaceTabDefaults): WorkspaceNoteTabState {
   return {
     id: WELCOME_NOTE_TAB_ID,
     type: 'note',
@@ -52,12 +59,15 @@ export function buildWelcomeNoteTab(): WorkspaceNoteTabState {
     content: welcomeNoteContent,
     savedContent: welcomeNoteContent,
     viewMode: 'preview',
-    fontSize: DEFAULT_NOTE_FONT_SIZE,
+    fontSize: workspaceTabDefaults?.noteFontSize ?? DEFAULT_NOTE_FONT_SIZE,
   };
 }
 
-export function upsertWelcomeNoteTab(tabs: WorkspaceTabState[]): WorkspaceTabState[] {
-  const welcomeTab = buildWelcomeNoteTab();
+export function upsertWelcomeNoteTab(
+  tabs: WorkspaceTabState[],
+  workspaceTabDefaults?: WorkspaceTabDefaults,
+): WorkspaceTabState[] {
+  const welcomeTab = buildWelcomeNoteTab(workspaceTabDefaults);
   const existingIndex = tabs.findIndex((tab) => tab.id === WELCOME_NOTE_TAB_ID && tab.type === 'note');
 
   if (existingIndex === -1) {

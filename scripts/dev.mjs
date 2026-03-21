@@ -4,8 +4,8 @@ import { access } from 'node:fs/promises';
 import { constants as fsConstants } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import electronPath from 'electron';
 import { createServer } from 'vite';
+import { launchElectron as spawnElectronProcess } from './electron-launch.mjs';
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const mainEntry = resolve(projectRoot, 'dist/main/index.js');
@@ -38,6 +38,10 @@ async function waitForArtifacts() {
 }
 
 function launchElectron(devServerUrl) {
+  launchElectronForMode(devServerUrl, 'auto');
+}
+
+function launchElectronForMode(devServerUrl, dbusMode) {
   if (shutdownRequested) {
     return;
   }
@@ -47,16 +51,24 @@ function launchElectron(devServerUrl) {
     electronProcess.kill();
   }
 
-  electronProcess = spawn(electronPath, ['.'], {
+  electronProcess = spawnElectronProcess({
     cwd: projectRoot,
-    stdio: 'inherit',
-    env: {
-      ...process.env,
+    extraEnv: {
       VITE_DEV_SERVER_URL: devServerUrl,
     },
+    dbusMode,
   });
+  const startedAt = Date.now();
 
   electronProcess.on('exit', (code) => {
+    const exitedQuickly = Date.now() - startedAt < 2500;
+
+    if (!shutdownRequested && dbusMode === 'auto' && code && exitedQuickly) {
+      console.warn('[electron] DBus session wrapper failed, retrying without it');
+      launchElectronForMode(devServerUrl, 'off');
+      return;
+    }
+
     if (!shutdownRequested && code && code !== 0) {
       console.error(`[electron] exited with code ${code}`);
     }

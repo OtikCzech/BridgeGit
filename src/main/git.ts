@@ -1,14 +1,58 @@
 import { ipcMain } from 'electron';
+import { execFile } from 'node:child_process';
+import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join, relative, resolve } from 'node:path';
+import { promisify } from 'node:util';
 import { simpleGit, type FileStatusResult, type SimpleGit } from 'simple-git';
 import type {
   BranchSummary,
   GitChange,
   GitChangeKind,
   GitCommitRef,
+  GitDiffMode,
   GitLogResult,
   GitStatusSummary,
+  GitTextSearchMatch,
+  GitWorktreeSummary,
+  RepoDirectoryEntry,
 } from '../shared/bridgegit';
-import { normalizeStoredPath } from './path-utils';
+import { normalizeStoredPath, parseWindowsWslPath } from './path-utils';
+
+const execFileAsync = promisify(execFile);
+const GIT_OUTPUT_BUFFER_BYTES = 64 * 1024 * 1024;
+const FILE_TREE_IGNORED_DIRECTORIES = new Set(['.git']);
+const FILE_SEARCH_RESULT_LIMIT = 200;
+const TEXT_SEARCH_IGNORED_DIRECTORIES = new Set([
+  '.git',
+  '.cache',
+  '.next',
+  '.nuxt',
+  '.svelte-kit',
+  '.turbo',
+  'build',
+  'coverage',
+  'dist',
+  'node_modules',
+  'release',
+  'vendor',
+]);
+const IDENTIFIER_PART_PATTERN = /[A-Za-z0-9_$\u00A0-\uFFFF]/;
+
+interface NativeRepositoryContext {
+  mode: 'native';
+  repoPath: string;
+  git: SimpleGit;
+}
+
+interface WslRepositoryContext {
+  mode: 'wsl';
+  repoPath: string;
+  distro: string;
+  linuxPath: string;
+}
+
+type RepositoryContext = NativeRepositoryContext | WslRepositoryContext;
 
 function resolveRepoPath(repoPath: string): string {
   const normalizedRepoPath = normalizeStoredPath(repoPath);
@@ -28,15 +72,273 @@ function getGit(repoPath: string): SimpleGit {
   });
 }
 
-async function resolveRepository(repoPath: string): Promise<SimpleGit> {
+function createRepositoryError(error: unknown): Error {
+  if (
+    error
+    && typeof error === 'object'
+    && ('stderr' in error || 'stdout' in error)
+  ) {
+    const gitError = error as { stderr?: unknown; stdout?: unknown };
+    const stderr = typeof gitError.stderr === 'string' ? gitError.stderr.trim() : '';
+    const stdout = typeof gitError.stdout === 'string' ? gitError.stdout.trim() : '';
+    const message = stderr || stdout;
+
+    if (message) {
+      return new Error(message);
+    }
+  }
+
+  if (error instanceof Error) {
+    return error;
+  }
+
+  return new Error('Git operation failed.');
+}
+
+async function runWslCommand(context: WslRepositoryContext, args: string[]): Promise<string> {
+  try {
+    const { stdout } = await execFileAsync(
+      'wsl.exe',
+      ['-d', context.distro, '--cd', context.linuxPath, ...args],
+      {
+        encoding: 'utf8',
+        windowsHide: true,
+        maxBuffer: GIT_OUTPUT_BUFFER_BYTES,
+      },
+    );
+
+    return stdout;
+  } catch (error) {
+    throw createRepositoryError(error);
+  }
+}
+
+async function runWslGit(context: WslRepositoryContext, args: string[]): Promise<string> {
+  return runWslCommand(context, ['git', ...args]);
+}
+
+function normalizeDiffPath(filePath: string): string {
+  return filePath.replace(/\\/g, '/');
+}
+
+function createUntrackedDiff(filePath: string, fileContent: string): string {
+  const normalizedPath = normalizeDiffPath(filePath);
+  const normalizedContent = fileContent.replace(/\r\n/g, '\n');
+
+  if (!normalizedContent.length) {
+    return '';
+  }
+
+  const hasTrailingNewline = normalizedContent.endsWith('\n');
+  const lines = normalizedContent.split('\n');
+
+  if (hasTrailingNewline) {
+    lines.pop();
+  }
+
+  const patch = [
+    `diff --git a/${normalizedPath} b/${normalizedPath}`,
+    'new file mode 100644',
+    '--- /dev/null',
+    `+++ b/${normalizedPath}`,
+    `@@ -0,0 +1,${lines.length} @@`,
+    ...lines.map((line) => `+${line}`),
+  ].join('\n');
+
+  return hasTrailingNewline
+    ? `${patch}\n`
+    : `${patch}\n\\ No newline at end of file\n`;
+}
+
+async function createNativeUntrackedDiff(
+  repository: NativeRepositoryContext,
+  filePath: string,
+): Promise<string> {
+  const rawStatus = await repository.git.raw(['status', '--porcelain', '-z', '-u', '--', filePath]);
+  const firstToken = rawStatus.split('\0').find(Boolean) ?? '';
+
+  if (!firstToken.startsWith('?? ')) {
+    return '';
+  }
+
+  const fileContent = await readFile(join(repository.repoPath, filePath), 'utf8');
+
+  if (fileContent.includes('\0')) {
+    return '';
+  }
+
+  return createUntrackedDiff(filePath, fileContent);
+}
+
+async function createWslUntrackedDiff(
+  repository: WslRepositoryContext,
+  filePath: string,
+): Promise<string> {
+  const rawStatus = await runWslGit(repository, ['status', '--porcelain', '-z', '-u', '--', filePath]);
+  const firstToken = rawStatus.split('\0').find(Boolean) ?? '';
+
+  if (!firstToken.startsWith('?? ')) {
+    return '';
+  }
+
+  const fileContent = await runWslCommand(repository, ['cat', '--', filePath]);
+
+  if (fileContent.includes('\0')) {
+    return '';
+  }
+
+  return createUntrackedDiff(filePath, fileContent);
+}
+
+function parseStatusBranchHeader(
+  headerLine: string,
+): Pick<GitStatusSummary, 'currentBranch' | 'trackingBranch' | 'ahead' | 'behind'> {
+  const aheadReg = /ahead (\d+)/;
+  const behindReg = /behind (\d+)/;
+  const currentReg = /^(.+?(?=(?:\.{3}|\s|$)))/;
+  const trackingReg = /\.{3}(\S*)/;
+  const onEmptyBranchReg = /\son\s(\S+?)(?=\.{3}|$)/;
+
+  let currentBranch = currentReg.exec(headerLine)?.[1] ?? null;
+  const trackingBranch = trackingReg.exec(headerLine)?.[1] ?? null;
+  const onEmptyBranch = onEmptyBranchReg.exec(headerLine)?.[1];
+
+  if (onEmptyBranch) {
+    currentBranch = onEmptyBranch;
+  }
+
+  return {
+    currentBranch,
+    trackingBranch,
+    ahead: Number(aheadReg.exec(headerLine)?.[1] ?? 0),
+    behind: Number(behindReg.exec(headerLine)?.[1] ?? 0),
+  };
+}
+
+function parseWslStatusSummary(rawStatus: string): GitStatusSummary {
+  const tokens = rawStatus.split('\0');
+  const staged: GitChange[] = [];
+  const unstaged: GitChange[] = [];
+  const untracked: GitChange[] = [];
+  const conflicted: GitChange[] = [];
+  let currentBranch: string | null = null;
+  let trackingBranch: string | null = null;
+  let ahead = 0;
+  let behind = 0;
+
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index];
+
+    if (!token) {
+      continue;
+    }
+
+    if (token.startsWith('## ')) {
+      ({
+        currentBranch,
+        trackingBranch,
+        ahead,
+        behind,
+      } = parseStatusBranchHeader(token.slice(3).trim()));
+      continue;
+    }
+
+    const statusCode = token.slice(0, 2);
+    const file: FileStatusResult = {
+      path: token.slice(3),
+      index: statusCode[0] ?? ' ',
+      working_dir: statusCode[1] ?? ' ',
+    };
+
+    if (statusCode.includes('R') || statusCode.includes('C')) {
+      file.from = tokens[index + 1] ?? '';
+      index += 1;
+    }
+
+    const isConflicted = file.index === 'U' || file.working_dir === 'U';
+
+    if (isConflicted) {
+      conflicted.push(createChange(file, 'U'));
+      continue;
+    }
+
+    const isUntracked = file.index === '?' || file.working_dir === '?';
+
+    if (isUntracked) {
+      untracked.push(createChange(file, '?'));
+      continue;
+    }
+
+    if (file.index && file.index !== ' ') {
+      staged.push(createChange(file, file.index));
+    }
+
+    if (file.working_dir && file.working_dir !== ' ') {
+      unstaged.push(createChange(file, file.working_dir));
+    }
+  }
+
+  const dedupedStaged = sortAndDedupe(staged);
+  const dedupedUnstaged = sortAndDedupe(unstaged);
+  const dedupedUntracked = sortAndDedupe(untracked);
+  const dedupedConflicted = sortAndDedupe(conflicted);
+
+  return {
+    currentBranch,
+    trackingBranch,
+    ahead,
+    behind,
+    isClean:
+      dedupedStaged.length === 0
+      && dedupedUnstaged.length === 0
+      && dedupedUntracked.length === 0
+      && dedupedConflicted.length === 0,
+    staged: dedupedStaged,
+    unstaged: dedupedUnstaged,
+    untracked: dedupedUntracked,
+    conflicted: dedupedConflicted,
+  };
+}
+
+async function resolveRepository(repoPath: string): Promise<RepositoryContext> {
   const normalizedRepoPath = resolveRepoPath(repoPath);
+  const wslPath = process.platform === 'win32' ? parseWindowsWslPath(normalizedRepoPath) : null;
+
+  if (wslPath) {
+    const context: WslRepositoryContext = {
+      mode: 'wsl',
+      repoPath: normalizedRepoPath,
+      distro: wslPath.distro,
+      linuxPath: wslPath.linuxPath,
+    };
+
+    if ((await runWslGit(context, ['rev-parse', '--is-inside-work-tree'])).trim() !== 'true') {
+      throw new Error(`${normalizedRepoPath} is not a git repository.`);
+    }
+
+    return context;
+  }
+
   const git = getGit(repoPath);
 
   if (!(await git.checkIsRepo())) {
     throw new Error(`${normalizedRepoPath} is not a git repository.`);
   }
 
-  return git;
+  return {
+    mode: 'native',
+    repoPath: normalizedRepoPath,
+    git,
+  };
+}
+
+async function isRepository(repoPath: string): Promise<boolean> {
+  try {
+    await resolveRepository(repoPath);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function mapStatusCode(code: string): GitChangeKind {
@@ -84,6 +386,93 @@ function sortAndDedupe(changes: GitChange[]): GitChange[] {
   }
 
   return [...unique.values()].sort((left, right) => left.path.localeCompare(right.path));
+}
+
+function parseBranchSummary(rawBranches: string): BranchSummary {
+  const all = rawBranches
+    .split('\n')
+    .map((line) => line.trimEnd())
+    .filter(Boolean)
+    .map((line) => {
+      const current = line.startsWith('* ');
+      const name = line.slice(2).trim();
+      return {
+        name,
+        current,
+      };
+    })
+    .filter((branch) => branch.name && !branch.name.startsWith('('));
+
+  return {
+    current: all.find((branch) => branch.current)?.name ?? null,
+    all,
+  };
+}
+
+function parseWorktreeSummary(rawWorktrees: string, currentRepoPath: string): GitWorktreeSummary[] {
+  const worktrees: GitWorktreeSummary[] = [];
+  const lines = rawWorktrees.split('\n');
+  let path: string | null = null;
+  let branch: string | null = null;
+  let head: string | null = null;
+  let detached = false;
+  let bare = false;
+
+  function commitCurrentBlock() {
+    if (!path) {
+      return;
+    }
+
+    worktrees.push({
+      path,
+      branch,
+      head,
+      detached,
+      bare,
+      current: path === currentRepoPath,
+    });
+  }
+
+  for (const line of [...lines, '']) {
+    if (!line.trim()) {
+      commitCurrentBlock();
+      path = null;
+      branch = null;
+      head = null;
+      detached = false;
+      bare = false;
+      continue;
+    }
+
+    if (line.startsWith('worktree ')) {
+      path = normalizeStoredPath(line.slice('worktree '.length).trim());
+      continue;
+    }
+
+    if (line.startsWith('branch ')) {
+      branch = line
+        .slice('branch '.length)
+        .trim()
+        .replace(/^refs\/heads\//, '') || null;
+      continue;
+    }
+
+    if (line.startsWith('HEAD ')) {
+      head = line.slice('HEAD '.length).trim() || null;
+      continue;
+    }
+
+    if (line === 'detached') {
+      detached = true;
+      continue;
+    }
+
+    if (line === 'bare') {
+      bare = true;
+    }
+  }
+
+  return worktrees;
 }
 
 function normalizeRefShortName(name: string): string {
@@ -172,8 +561,14 @@ function parseCommitRefs(rawRefs: string): GitCommitRef[] {
 }
 
 async function getStatusSummary(repoPath: string): Promise<GitStatusSummary> {
-  const git = await resolveRepository(repoPath);
-  const status = await git.status();
+  const repository = await resolveRepository(repoPath);
+
+  if (repository.mode === 'wsl') {
+    const rawStatus = await runWslGit(repository, ['status', '--porcelain', '-b', '-u', '--null']);
+    return parseWslStatusSummary(rawStatus);
+  }
+
+  const status = await repository.git.status();
 
   const staged: GitChange[] = [];
   const unstaged: GitChange[] = [];
@@ -220,26 +615,468 @@ async function getStatusSummary(repoPath: string): Promise<GitStatusSummary> {
 }
 
 async function getBranches(repoPath: string): Promise<BranchSummary> {
-  const git = await resolveRepository(repoPath);
-  const branches = await git.branchLocal();
+  const repository = await resolveRepository(repoPath);
+  const branchArgs = ['branch', '--list', '--no-color'];
 
-  return {
-    current: branches.current,
-    all: branches.all.map((name) => ({
-      name,
-      current: name === branches.current,
-    })),
-  };
-}
-
-async function getDiff(repoPath: string, filePath?: string): Promise<string> {
-  const git = await resolveRepository(repoPath);
-
-  if (filePath) {
-    return git.diff(['--no-ext-diff', '--no-color', '--', filePath]);
+  if (repository.mode === 'wsl') {
+    return parseBranchSummary(await runWslGit(repository, branchArgs));
   }
 
-  return git.diff(['--no-ext-diff', '--no-color']);
+  return parseBranchSummary(await repository.git.raw(branchArgs));
+}
+
+function normalizeRepoRelativePath(pathValue: string | null | undefined): string {
+  const trimmed = pathValue?.trim() ?? '';
+  if (!trimmed) {
+    return '';
+  }
+
+  return trimmed
+    .replace(/\\/g, '/')
+    .replace(/^\/+/, '')
+    .replace(/\/+$/, '');
+}
+
+function resolveRepoChildPath(repoRoot: string, relativePath: string): string {
+  const normalizedRelativePath = normalizeRepoRelativePath(relativePath);
+
+  if (!normalizedRelativePath) {
+    return repoRoot;
+  }
+
+  const absolutePath = resolve(repoRoot, normalizedRelativePath);
+  const relativeToRoot = relative(repoRoot, absolutePath);
+
+  if (
+    relativeToRoot.startsWith('..')
+    || relativeToRoot.includes(`..${process.platform === 'win32' ? '\\' : '/'}`)
+  ) {
+    throw new Error(`Path '${relativePath}' is outside of the repository root.`);
+  }
+
+  return absolutePath;
+}
+
+function compareDirectoryEntries(left: RepoDirectoryEntry, right: RepoDirectoryEntry) {
+  if (left.kind !== right.kind) {
+    return left.kind === 'directory' ? -1 : 1;
+  }
+
+  return left.name.localeCompare(right.name, undefined, { numeric: true, sensitivity: 'base' });
+}
+
+async function listDirectory(repoPath: string, relativePath = ''): Promise<RepoDirectoryEntry[]> {
+  const repoRoot = resolveRepoPath(repoPath);
+  const targetPath = resolveRepoChildPath(repoRoot, relativePath);
+  const entries = await readdir(targetPath, { withFileTypes: true });
+
+  return entries
+    .filter((entry) => {
+      if (FILE_TREE_IGNORED_DIRECTORIES.has(entry.name)) {
+        return false;
+      }
+
+      return entry.isDirectory() || entry.isFile();
+    })
+    .map<RepoDirectoryEntry>((entry) => {
+      const normalizedRelativePath = normalizeRepoRelativePath(relativePath);
+      const entryPath = normalizedRelativePath ? `${normalizedRelativePath}/${entry.name}` : entry.name;
+
+      return {
+        name: entry.name,
+        path: entryPath,
+        kind: entry.isDirectory() ? 'directory' : 'file',
+      };
+    })
+    .sort(compareDirectoryEntries);
+}
+
+function getSearchRank(pathValue: string, query: string): number {
+  const normalizedPath = pathValue.toLowerCase();
+  const fileName = normalizedPath.split('/').at(-1) ?? normalizedPath;
+
+  if (fileName === query) {
+    return 0;
+  }
+
+  if (fileName.startsWith(query)) {
+    return 1;
+  }
+
+  if (fileName.includes(query)) {
+    return 2;
+  }
+
+  if (normalizedPath.startsWith(query)) {
+    return 3;
+  }
+
+  return 4;
+}
+
+async function searchFiles(
+  repoPath: string,
+  query: string,
+  limit = FILE_SEARCH_RESULT_LIMIT,
+): Promise<string[]> {
+  const repoRoot = resolveRepoPath(repoPath);
+  const normalizedQuery = query.trim().toLowerCase();
+  const normalizedLimit = Number.isFinite(limit) ? Math.max(1, Math.min(Math.floor(limit), 500)) : FILE_SEARCH_RESULT_LIMIT;
+
+  if (!normalizedQuery) {
+    return [];
+  }
+
+  async function searchWithRipgrep(): Promise<string[]> {
+    const { stdout } = await execFileAsync(
+      'rg',
+      ['--files', '--hidden', '-g', '!.git'],
+      {
+        cwd: repoRoot,
+        encoding: 'utf8',
+        windowsHide: true,
+        maxBuffer: GIT_OUTPUT_BUFFER_BYTES,
+      },
+    );
+
+    return stdout
+      .split(/\r?\n/)
+      .map((entry) => entry.trim())
+      .filter(Boolean);
+  }
+
+  async function searchWithFilesystemWalk(): Promise<string[]> {
+    const matches: string[] = [];
+
+    async function visit(currentPath: string, relativePath = ''): Promise<boolean> {
+      const entries = await readdir(currentPath, { withFileTypes: true });
+      const sortedEntries = [...entries].sort((left, right) => (
+        left.name.localeCompare(right.name, undefined, { numeric: true, sensitivity: 'base' })
+      ));
+
+      for (const entry of sortedEntries) {
+        if (FILE_TREE_IGNORED_DIRECTORIES.has(entry.name)) {
+          continue;
+        }
+
+        const nextRelativePath = relativePath ? `${relativePath}/${entry.name}` : entry.name;
+        const nextAbsolutePath = join(currentPath, entry.name);
+
+        if (entry.isDirectory()) {
+          if (await visit(nextAbsolutePath, nextRelativePath)) {
+            return true;
+          }
+          continue;
+        }
+
+        if (!entry.isFile()) {
+          continue;
+        }
+
+        matches.push(nextRelativePath);
+      }
+
+      return false;
+    }
+
+    await visit(repoRoot);
+    return matches;
+  }
+
+  let candidates: string[];
+
+  try {
+    candidates = await searchWithRipgrep();
+  } catch {
+    candidates = await searchWithFilesystemWalk();
+  }
+
+  return candidates
+    .filter((pathValue) => pathValue.toLowerCase().includes(normalizedQuery))
+    .sort((left, right) => {
+      const rankDiff = getSearchRank(left, normalizedQuery) - getSearchRank(right, normalizedQuery);
+
+      if (rankDiff !== 0) {
+        return rankDiff;
+      }
+
+      return left.localeCompare(right, undefined, { numeric: true, sensitivity: 'base' });
+    })
+    .slice(0, normalizedLimit);
+}
+
+function isNoMatchRipgrepError(error: unknown) {
+  return (
+    error
+    && typeof error === 'object'
+    && 'code' in error
+    && (error as { code?: unknown }).code === 1
+  );
+}
+
+function normalizeSearchPath(pathValue: string) {
+  return normalizeDiffPath(pathValue).replace(/^\.\//, '');
+}
+
+function isWholeWordTextMatch(lineText: string, column: number, query: string) {
+  const start = Math.max(0, column - 1);
+
+  if (lineText.slice(start, start + query.length) !== query) {
+    return false;
+  }
+
+  const previousCharacter = lineText[start - 1] ?? '';
+  const nextCharacter = lineText[start + query.length] ?? '';
+
+  return !IDENTIFIER_PART_PATTERN.test(previousCharacter) && !IDENTIFIER_PART_PATTERN.test(nextCharacter);
+}
+
+async function searchText(
+  repoPath: string,
+  query: string,
+  limit = FILE_SEARCH_RESULT_LIMIT,
+  wholeWord = false,
+): Promise<GitTextSearchMatch[]> {
+  const repoRoot = resolveRepoPath(repoPath);
+  const normalizedQuery = query.trim();
+  const normalizedLimit = Number.isFinite(limit) ? Math.max(1, Math.min(Math.floor(limit), 500)) : FILE_SEARCH_RESULT_LIMIT;
+
+  if (!normalizedQuery) {
+    return [];
+  }
+
+  async function searchWithRipgrep(): Promise<GitTextSearchMatch[]> {
+    try {
+      const { stdout } = await execFileAsync(
+        'rg',
+        [
+          '--vimgrep',
+          '--hidden',
+          '-g',
+          '!.git',
+          '-g',
+          '!node_modules',
+          '-g',
+          '!dist',
+          '-g',
+          '!build',
+          '-g',
+          '!coverage',
+          '-g',
+          '!release',
+          '-g',
+          '!vendor',
+          '--fixed-strings',
+          '--',
+          normalizedQuery,
+          '.',
+        ],
+        {
+          cwd: repoRoot,
+          encoding: 'utf8',
+          windowsHide: true,
+          maxBuffer: GIT_OUTPUT_BUFFER_BYTES,
+        },
+      );
+
+      return stdout
+        .split(/\r?\n/)
+        .map((line) => line.trimEnd())
+        .filter(Boolean)
+        .map((line) => {
+          const match = line.match(/^(.+?):(\d+):(\d+):(.*)$/);
+
+          if (!match) {
+            return null;
+          }
+
+          const relativePath = normalizeSearchPath(match[1] ?? '');
+          const lineNumber = Number.parseInt(match[2] ?? '0', 10);
+          const column = Number.parseInt(match[3] ?? '0', 10);
+          const text = match[4] ?? '';
+
+          if (!relativePath || !Number.isFinite(lineNumber) || !Number.isFinite(column) || lineNumber < 1 || column < 1) {
+            return null;
+          }
+
+          if (wholeWord && !isWholeWordTextMatch(text, column, normalizedQuery)) {
+            return null;
+          }
+
+          return {
+            path: relativePath,
+            filePath: normalizeDiffPath(join(repoRoot, relativePath)),
+            line: lineNumber,
+            column,
+            text,
+          } satisfies GitTextSearchMatch;
+        })
+        .filter((entry): entry is GitTextSearchMatch => Boolean(entry))
+        .slice(0, normalizedLimit);
+    } catch (error) {
+      if (isNoMatchRipgrepError(error)) {
+        return [];
+      }
+
+      throw error;
+    }
+  }
+
+  async function searchWithFilesystemWalk(): Promise<GitTextSearchMatch[]> {
+    const matches: GitTextSearchMatch[] = [];
+
+    async function visit(currentPath: string, relativePath = ''): Promise<boolean> {
+      const entries = await readdir(currentPath, { withFileTypes: true });
+      const sortedEntries = [...entries].sort((left, right) => (
+        left.name.localeCompare(right.name, undefined, { numeric: true, sensitivity: 'base' })
+      ));
+
+      for (const entry of sortedEntries) {
+        if (TEXT_SEARCH_IGNORED_DIRECTORIES.has(entry.name)) {
+          continue;
+        }
+
+        const nextRelativePath = relativePath ? `${relativePath}/${entry.name}` : entry.name;
+        const nextAbsolutePath = join(currentPath, entry.name);
+
+        if (entry.isDirectory()) {
+          if (await visit(nextAbsolutePath, nextRelativePath)) {
+            return true;
+          }
+          continue;
+        }
+
+        if (!entry.isFile()) {
+          continue;
+        }
+
+        let fileContent: string;
+
+        try {
+          fileContent = await readFile(nextAbsolutePath, 'utf8');
+        } catch {
+          continue;
+        }
+
+        if (fileContent.includes('\0')) {
+          continue;
+        }
+
+        const normalizedContent = fileContent.replace(/\r\n/g, '\n');
+        const lines = normalizedContent.split('\n');
+
+        for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+          const lineText = lines[lineIndex] ?? '';
+          let fromIndex = 0;
+
+          while (fromIndex <= lineText.length) {
+            const matchIndex = lineText.indexOf(normalizedQuery, fromIndex);
+
+            if (matchIndex < 0) {
+              break;
+            }
+
+            const column = matchIndex + 1;
+
+            if (!wholeWord || isWholeWordTextMatch(lineText, column, normalizedQuery)) {
+              matches.push({
+                path: normalizeSearchPath(nextRelativePath),
+                filePath: normalizeDiffPath(nextAbsolutePath),
+                line: lineIndex + 1,
+                column,
+                text: lineText,
+              });
+
+              if (matches.length >= normalizedLimit) {
+                return true;
+              }
+            }
+
+            fromIndex = matchIndex + Math.max(1, normalizedQuery.length);
+          }
+        }
+      }
+
+      return false;
+    }
+
+    await visit(repoRoot);
+    return matches;
+  }
+
+  try {
+    return await searchWithRipgrep();
+  } catch (error) {
+    if (
+      error
+      && typeof error === 'object'
+      && 'code' in error
+      && ((error as { code?: unknown }).code === 'ENOENT' || (error as { code?: unknown }).code === 127)
+    ) {
+      return searchWithFilesystemWalk();
+    }
+
+    throw createRepositoryError(error);
+  }
+}
+
+async function getWorktrees(repoPath: string): Promise<GitWorktreeSummary[]> {
+  const repository = await resolveRepository(repoPath);
+  const currentRepoPath = resolveRepoPath(repoPath);
+  const worktreeArgs = ['worktree', 'list', '--porcelain'];
+  const rawWorktrees = repository.mode === 'wsl'
+    ? await runWslGit(repository, worktreeArgs)
+    : await repository.git.raw(worktreeArgs);
+
+  return parseWorktreeSummary(rawWorktrees, currentRepoPath);
+}
+
+async function getDiff(
+  repoPath: string,
+  filePath?: string,
+  mode: GitDiffMode = 'working-tree',
+): Promise<string> {
+  const repository = await resolveRepository(repoPath);
+  const diffArgs = mode === 'staged'
+    ? ['diff', '--cached', '--no-ext-diff', '--no-color']
+    : ['diff', '--no-ext-diff', '--no-color'];
+
+  if (repository.mode === 'wsl') {
+    const args = filePath
+      ? [...diffArgs, '--', filePath]
+      : diffArgs;
+    const diff = await runWslGit(repository, args);
+
+    if (diff.trim() || !filePath) {
+      return diff;
+    }
+
+    if (mode === 'staged') {
+      return '';
+    }
+
+    return createWslUntrackedDiff(repository, filePath);
+  }
+
+  if (filePath) {
+    const diff = mode === 'staged'
+      ? await repository.git.raw([...diffArgs, '--', filePath])
+      : await repository.git.diff(['--no-ext-diff', '--no-color', '--', filePath]);
+
+    if (diff.trim()) {
+      return diff;
+    }
+
+    if (mode === 'staged') {
+      return '';
+    }
+
+    return createNativeUntrackedDiff(repository, filePath);
+  }
+
+  return mode === 'staged'
+    ? repository.git.raw(diffArgs)
+    : repository.git.diff(['--no-ext-diff', '--no-color']);
 }
 
 async function getCommitDiff(
@@ -247,14 +1084,37 @@ async function getCommitDiff(
   commitHash: string,
   parentHash?: string | null,
 ): Promise<string> {
-  const git = await resolveRepository(repoPath);
+  const repository = await resolveRepository(repoPath);
 
   if (!commitHash.trim()) {
     throw new Error('No commit selected.');
   }
 
+  if (repository.mode === 'wsl') {
+    if (parentHash) {
+      return runWslGit(repository, [
+        'diff',
+        '--no-ext-diff',
+        '--no-color',
+        '--find-renames',
+        parentHash,
+        commitHash,
+      ]);
+    }
+
+    return runWslGit(repository, [
+      'show',
+      '--format=',
+      '--root',
+      '--no-ext-diff',
+      '--no-color',
+      '--find-renames',
+      commitHash,
+    ]);
+  }
+
   if (parentHash) {
-    return git.raw([
+    return repository.git.raw([
       'diff',
       '--no-ext-diff',
       '--no-color',
@@ -264,7 +1124,7 @@ async function getCommitDiff(
     ]);
   }
 
-  return git.raw([
+  return repository.git.raw([
     'show',
     '--format=',
     '--root',
@@ -275,12 +1135,148 @@ async function getCommitDiff(
   ]);
 }
 
+function isMissingHeadError(error: unknown) {
+  return /does not have any commits yet|unknown revision or path not in the working tree|ambiguous argument 'HEAD'|could not resolve HEAD/i
+    .test(createRepositoryError(error).message);
+}
+
+function toWslMountPath(pathValue: string): string {
+  const driveMatch = /^([A-Za-z]):\\(.*)$/.exec(pathValue);
+
+  if (!driveMatch) {
+    throw new Error(`Cannot convert path to WSL mount path: ${pathValue}`);
+  }
+
+  const [, driveLetter, suffix] = driveMatch;
+  const normalizedSuffix = suffix.replace(/\\/g, '/');
+  return `/mnt/${driveLetter.toLowerCase()}/${normalizedSuffix}`;
+}
+
+async function withTempPatchFile<T>(
+  patch: string,
+  callback: (patchFilePath: string) => Promise<T>,
+): Promise<T> {
+  const patchDir = await mkdtemp(join(tmpdir(), 'bridgegit-patch-'));
+  const patchFilePath = join(patchDir, 'discard.patch');
+
+  try {
+    await writeFile(patchFilePath, patch, 'utf8');
+    return await callback(patchFilePath);
+  } finally {
+    await rm(patchDir, { recursive: true, force: true });
+  }
+}
+
+async function applyPatchFile(
+  repository: RepositoryContext,
+  args: string[],
+  patch: string,
+): Promise<void> {
+  await withTempPatchFile(patch, async (patchFilePath) => {
+    if (repository.mode === 'wsl') {
+      await runWslGit(repository, [...args, toWslMountPath(patchFilePath)]);
+      return;
+    }
+
+    await repository.git.raw([...args, patchFilePath]);
+  });
+}
+
+async function discardUntrackedFile(
+  repository: RepositoryContext,
+  filePath: string,
+): Promise<void> {
+  if (repository.mode === 'wsl') {
+    await runWslGit(repository, ['clean', '-f', '--', filePath]);
+    await runWslCommand(repository, ['rm', '-f', '--', filePath]);
+    return;
+  }
+
+  await repository.git.raw(['clean', '-f', '--', filePath]);
+  await rm(join(repository.repoPath, filePath), { force: true });
+}
+
+async function discardWithoutHead(
+  repository: RepositoryContext,
+  filePaths: string[],
+): Promise<void> {
+  if (repository.mode === 'wsl') {
+    await runWslGit(repository, ['rm', '--cached', '-f', '--ignore-unmatch', '--', ...filePaths]);
+    await runWslGit(repository, ['clean', '-f', '--', ...filePaths]);
+    await Promise.all(filePaths.map((filePath) => (
+      runWslCommand(repository, ['rm', '-f', '--', filePath])
+    )));
+    return;
+  }
+
+  await repository.git.raw(['rm', '--cached', '-f', '--ignore-unmatch', '--', ...filePaths]);
+  await repository.git.raw(['clean', '-f', '--', ...filePaths]);
+  await Promise.all(filePaths.map((filePath) => (
+    rm(join(repository.repoPath, filePath), { force: true })
+  )));
+}
+
+async function discardFile(repoPath: string, change: GitChange): Promise<GitStatusSummary> {
+  const repository = await resolveRepository(repoPath);
+  const filePaths = change.type === 'renamed' && change.originalPath
+    ? [change.originalPath, change.path]
+    : [change.path];
+
+  if (change.type === 'untracked') {
+    await discardUntrackedFile(repository, change.path);
+    return getStatusSummary(repoPath);
+  }
+
+  try {
+    if (repository.mode === 'wsl') {
+      await runWslGit(repository, ['restore', '--source=HEAD', '--staged', '--worktree', '--', ...filePaths]);
+    } else {
+      await repository.git.raw(['restore', '--source=HEAD', '--staged', '--worktree', '--', ...filePaths]);
+    }
+  } catch (error) {
+    if (!isMissingHeadError(error)) {
+      throw error;
+    }
+
+    await discardWithoutHead(repository, filePaths);
+  }
+
+  return getStatusSummary(repoPath);
+}
+
+async function discardHunk(
+  repoPath: string,
+  patch: string,
+  mode: GitDiffMode,
+): Promise<GitStatusSummary> {
+  const repository = await resolveRepository(repoPath);
+
+  if (mode === 'staged') {
+    await applyPatchFile(repository, ['apply', '-R', '--cached', '--recount', '--whitespace=nowarn'], patch);
+    await applyPatchFile(repository, ['apply', '-R', '--recount', '--whitespace=nowarn'], patch);
+    return getStatusSummary(repoPath);
+  }
+
+  await applyPatchFile(repository, ['apply', '-R', '--recount', '--whitespace=nowarn'], patch);
+  return getStatusSummary(repoPath);
+}
+
 async function getLog(repoPath: string, limit = 20): Promise<GitLogResult> {
-  const git = await resolveRepository(repoPath);
+  const repository = await resolveRepository(repoPath);
   const maxCount = Math.max(20, Math.min(limit, 300));
 
   try {
-    const rawLog = await git.raw([
+    const rawLog = repository.mode === 'wsl'
+      ? await runWslGit(repository, [
+        'log',
+        '--all',
+        '--topo-order',
+        '--decorate=full',
+        '--date=iso-strict',
+        `--max-count=${maxCount}`,
+        '--pretty=format:%H%x1f%h%x1f%P%x1f%an%x1f%aI%x1f%s%x1f%D%x1e',
+      ])
+      : await repository.git.raw([
       'log',
       '--all',
       '--topo-order',
@@ -288,7 +1284,7 @@ async function getLog(repoPath: string, limit = 20): Promise<GitLogResult> {
       '--date=iso-strict',
       `--max-count=${maxCount}`,
       '--pretty=format:%H%x1f%h%x1f%P%x1f%an%x1f%aI%x1f%s%x1f%D%x1e',
-    ]);
+      ]);
 
     const items = rawLog
       .split('\x1e')
@@ -337,44 +1333,79 @@ async function getLog(repoPath: string, limit = 20): Promise<GitLogResult> {
 }
 
 async function stageFiles(repoPath: string, files: string[]): Promise<GitStatusSummary> {
-  const git = await resolveRepository(repoPath);
-  await git.add(files.length > 0 ? files : ['.']);
+  const repository = await resolveRepository(repoPath);
+
+  if (repository.mode === 'wsl') {
+    await runWslGit(
+      repository,
+      files.length > 0 ? ['add', '--', ...files] : ['add', '.'],
+    );
+  } else {
+    await repository.git.add(files.length > 0 ? files : ['.']);
+  }
+
   return getStatusSummary(repoPath);
 }
 
 async function unstageFiles(repoPath: string, files: string[]): Promise<GitStatusSummary> {
-  const git = await resolveRepository(repoPath);
+  const repository = await resolveRepository(repoPath);
 
   if (files.length > 0) {
-    await git.raw(['restore', '--staged', '--', ...files]);
+    if (repository.mode === 'wsl') {
+      await runWslGit(repository, ['restore', '--staged', '--', ...files]);
+    } else {
+      await repository.git.raw(['restore', '--staged', '--', ...files]);
+    }
   }
 
   return getStatusSummary(repoPath);
 }
 
 async function commitChanges(repoPath: string, message: string): Promise<GitStatusSummary> {
-  const git = await resolveRepository(repoPath);
+  const repository = await resolveRepository(repoPath);
   const trimmedMessage = message.trim();
 
   if (!trimmedMessage) {
     throw new Error('Commit message cannot be empty.');
   }
 
-  await git.commit(trimmedMessage);
+  if (repository.mode === 'wsl') {
+    await runWslGit(repository, ['commit', '-m', trimmedMessage]);
+  } else {
+    await repository.git.commit(trimmedMessage);
+  }
+
   return getStatusSummary(repoPath);
 }
 
 async function checkoutBranch(repoPath: string, branchName: string): Promise<BranchSummary> {
-  const git = await resolveRepository(repoPath);
-  await git.checkout(branchName);
+  const repository = await resolveRepository(repoPath);
+
+  if (repository.mode === 'wsl') {
+    await runWslGit(repository, ['checkout', branchName]);
+  } else {
+    await repository.git.checkout(branchName);
+  }
+
   return getBranches(repoPath);
 }
 
 export function registerGitIpcHandlers() {
+  ipcMain.handle('git:isRepository', (_event, repoPath: string) => isRepository(repoPath));
   ipcMain.handle('git:status', (_event, repoPath: string) => getStatusSummary(repoPath));
   ipcMain.handle('git:branches', (_event, repoPath: string) => getBranches(repoPath));
-  ipcMain.handle('git:diff', (_event, repoPath: string, filePath?: string) =>
-    getDiff(repoPath, filePath),
+  ipcMain.handle('git:listDirectory', (_event, repoPath: string, relativePath?: string) =>
+    listDirectory(repoPath, relativePath),
+  );
+  ipcMain.handle('git:searchFiles', (_event, repoPath: string, query: string, limit?: number) =>
+    searchFiles(repoPath, query, limit),
+  );
+  ipcMain.handle('git:searchText', (_event, repoPath: string, query: string, limit?: number, wholeWord?: boolean) =>
+    searchText(repoPath, query, limit, wholeWord),
+  );
+  ipcMain.handle('git:worktrees', (_event, repoPath: string) => getWorktrees(repoPath));
+  ipcMain.handle('git:diff', (_event, repoPath: string, filePath?: string, mode?: GitDiffMode) =>
+    getDiff(repoPath, filePath, mode),
   );
   ipcMain.handle(
     'git:commitDiff',
@@ -389,6 +1420,12 @@ export function registerGitIpcHandlers() {
   );
   ipcMain.handle('git:unstage', (_event, repoPath: string, files: string[]) =>
     unstageFiles(repoPath, files),
+  );
+  ipcMain.handle('git:discard', (_event, repoPath: string, change: GitChange) =>
+    discardFile(repoPath, change),
+  );
+  ipcMain.handle('git:discardHunk', (_event, repoPath: string, patch: string, mode: GitDiffMode) =>
+    discardHunk(repoPath, patch, mode),
   );
   ipcMain.handle('git:commit', (_event, repoPath: string, message: string) =>
     commitChanges(repoPath, message),
