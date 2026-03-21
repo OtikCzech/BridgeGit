@@ -2,7 +2,7 @@
 
 This note is the default place for release updates and small product messages inside BridgeGit.
 
-## New in 0.2.0
+## New in 0.2.1
 
 - dedicated code tabs powered by CodeMirror
 - syntax highlighting, search, and editor themes
@@ -10,6 +10,7 @@ This note is the default place for release updates and small product messages in
 - richer notes preview with shared highlighting and Mermaid
 - external file change warnings for file-backed notes and code tabs
 - app appearance themes and cleaner settings
+- updated in-app release note and clearer font zoom hint in Settings
 
 ## Quick Start
 

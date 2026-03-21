@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.2.1 - 2026-03-22
+
+Small patch release after the 0.2.0 launch.
+
+- Updated the in-app welcome/update note for the 0.2.x release line
+- Added a clearer `Ctrl + wheel` font-size hint in Settings
+
 ## v0.2.0 - 2026-03-21
 
 Public release focused on the new editor workflow, richer notes preview, and appearance customization.

@@ -11,7 +11,7 @@ import {
 import welcomeNoteContent from './assets/welcome-note.md?raw';
 
 export const WELCOME_NOTE_TAB_ID = 'note-welcome';
-export const CURRENT_INFO_NOTE_REVISION = 'welcome-0.2.0';
+export const CURRENT_INFO_NOTE_REVISION = 'welcome-0.2.1';
 const WELCOME_SHELL_TAB_ID = 'shell-main';
 
 export function hasWorkspaceTabs(workspaceSessions: WorkspaceSessionsById): boolean {
