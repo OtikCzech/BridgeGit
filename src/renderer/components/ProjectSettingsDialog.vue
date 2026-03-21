@@ -622,6 +622,13 @@ function formatPresetTarget(target: TerminalCommandPreset['target']): string {
                 </p>
               </header>
 
+              <div class="settings-dialog__hint-card settings-dialog__hint-card--inline">
+                <span class="settings-dialog__hint-label">Mouse zoom</span>
+                <p class="settings-dialog__hint-copy">
+                  Hold <code>Ctrl</code> and use the mouse wheel over shell, note, code, or the workspace sidebar to change font size.
+                </p>
+              </div>
+
               <div class="settings-dialog__shortcut-groups">
                 <section
                   v-for="group in SETTINGS_SHORTCUT_GROUPS"
