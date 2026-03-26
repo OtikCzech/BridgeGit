@@ -2,18 +2,25 @@
 
 import type {
   BranchSummary,
+  CreateBranchOptions,
+  CreateBranchResult,
+  DeleteBranchResult,
   GitChange,
   GitDiffMode,
   GitLogResult,
+  GitStatusRequestOptions,
   GitStatusSummary,
   GitTextSearchMatch,
   GitWorktreeSummary,
+  MergeWorktreeIntoPrimaryBranchResult,
   NoteFileHandle,
   NoteFileStat,
   PtyCreateOptions,
   PtyDataEvent,
   PtyExitEvent,
   PtySessionInfo,
+  RemoveWorktreeResult,
+  RemoveWorktreeAndDeleteBranchResult,
   RepoDirectoryEntry,
   SessionData,
 } from '../shared/bridgegit';
@@ -54,7 +61,8 @@ declare global {
       };
       git: {
         isRepository: (repoPath: string) => Promise<boolean>;
-        status: (repoPath: string) => Promise<GitStatusSummary>;
+        initRepository: (repoPath: string) => Promise<void>;
+        status: (repoPath: string, options?: GitStatusRequestOptions) => Promise<GitStatusSummary>;
         branches: (repoPath: string) => Promise<BranchSummary>;
         listDirectory: (repoPath: string, relativePath?: string) => Promise<RepoDirectoryEntry[]>;
         searchFiles: (repoPath: string, query: string, limit?: number) => Promise<string[]>;
@@ -78,6 +86,16 @@ declare global {
         discardHunk: (repoPath: string, patch: string, mode: GitDiffMode) => Promise<GitStatusSummary>;
         commit: (repoPath: string, message: string) => Promise<GitStatusSummary>;
         checkout: (repoPath: string, branchName: string) => Promise<BranchSummary>;
+        createBranch: (
+          repoPath: string,
+          branchName: string,
+          options?: CreateBranchOptions,
+        ) => Promise<CreateBranchResult>;
+        deleteBranch: (repoPath: string, branchName: string) => Promise<DeleteBranchResult>;
+        mergeWorktreeIntoPrimaryBranch: (repoPath: string) => Promise<MergeWorktreeIntoPrimaryBranchResult>;
+        removeWorktree: (repoPath: string) => Promise<RemoveWorktreeResult>;
+        removeWorktreeAndDeleteBranch: (repoPath: string) => Promise<RemoveWorktreeAndDeleteBranchResult>;
+        push: (repoPath: string) => Promise<GitStatusSummary>;
       };
       terminal: {
         create: (options: PtyCreateOptions) => Promise<PtySessionInfo>;

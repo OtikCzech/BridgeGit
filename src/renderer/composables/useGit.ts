@@ -1,20 +1,27 @@
 import { ref } from 'vue';
 import type {
   BranchSummary,
+  CreateBranchOptions,
+  CreateBranchResult,
+  DeleteBranchResult,
   GitChange,
   GitDiffMode,
   GitLogEntry,
   GitLogResult,
   GitStatusSummary,
+  MergeWorktreeIntoPrimaryBranchResult,
+  RemoveWorktreeResult,
+  RemoveWorktreeAndDeleteBranchResult,
 } from '../../shared/bridgegit';
 
 interface RefreshOptions {
   reloadDiff?: boolean;
   silent?: boolean;
+  fetchOrigin?: boolean;
 }
 
 interface SetRepoPathOptions {
-  loadMode?: 'branches' | 'full';
+  loadMode?: 'branches' | 'full' | 'none';
 }
 
 interface SelectFileOptions {
@@ -28,12 +35,107 @@ interface RepoStateCacheEntry {
 
 const HISTORY_LIMIT = 120;
 
-function toErrorMessage(error: unknown): string {
+function extractRawErrorMessage(error: unknown): string {
   if (error instanceof Error) {
     return error.message;
   }
 
   return 'Git operation failed.';
+}
+
+function normalizeErrorDetail(rawMessage: string): string {
+  return rawMessage
+    .replace(/^Error occurred in handler for '[^']+':\s*/i, '')
+    .replace(/^Error invoking remote method '[^']+':\s*/i, '')
+    .replace(/^GitError:\s*/i, '')
+    .replace(/^fatal:\s*/i, '')
+    .trim();
+}
+
+function normalizeGitError(error: unknown): { message: string; detail: string | null } {
+  const rawMessage = extractRawErrorMessage(error);
+  const detail = normalizeErrorDetail(rawMessage);
+  const checkoutElsewhereMatch = detail.match(/^'([^']+)' is already checked out at '([^']+)'\.?$/i);
+  const openElsewhereMatch = detail.match(/^Branch "([^"]+)" is already open in another repo\.(?:\s*Checked out at (.+))?$/i);
+  const branchNotMergedMatch = detail.match(/^The branch '([^']+)' is not fully merged\./i);
+  const branchNotSafelyMergedMatch = detail.match(/^Branch "([^"]+)" is not safely merged into ([^.\s]+)\.?$/i);
+  const switchPrimaryRepoMatch = detail.match(/^Switch the primary repo to ([^.\s]+) before removing and deleting this branch\.?$/i);
+  const primaryBranchDeleteMatch = detail.match(/^Branch "([^"]+)" is the primary branch and cannot be deleted\.?$/i);
+  const noPrimaryBranchMatch = detail.match(/^Could not determine the primary branch from origin\/HEAD, main, or master\.?$/i);
+  const linkedWorktreeMergeMatch = detail.match(/^Only linked worktree repos can be merged into the primary branch\.?$/i);
+
+  if (checkoutElsewhereMatch) {
+    const [, branchName, checkoutPath] = checkoutElsewhereMatch;
+
+    return {
+      message: `Branch "${branchName}" je už otevřená v jiném repo.`,
+      detail: `Checked out at ${checkoutPath}`,
+    };
+  }
+
+  if (openElsewhereMatch) {
+    const [, branchName, checkoutPath = ''] = openElsewhereMatch;
+
+    return {
+      message: `Branch "${branchName}" je už otevřená v jiném repo.`,
+      detail: checkoutPath.trim() || detail,
+    };
+  }
+
+  if (branchNotMergedMatch) {
+    const [, branchName] = branchNotMergedMatch;
+
+    return {
+      message: `Branch "${branchName}" ještě není bezpečně mergnutá.`,
+      detail,
+    };
+  }
+
+  if (branchNotSafelyMergedMatch) {
+    const [, branchName, targetBranch] = branchNotSafelyMergedMatch;
+
+    return {
+      message: `Branch "${branchName}" ještě není bezpečně mergnutá do ${targetBranch}.`,
+      detail,
+    };
+  }
+
+  if (switchPrimaryRepoMatch) {
+    const [, targetBranch] = switchPrimaryRepoMatch;
+
+    return {
+      message: `Primární repo musí být přepnuté na ${targetBranch}.`,
+      detail,
+    };
+  }
+
+  if (primaryBranchDeleteMatch) {
+    const [, branchName] = primaryBranchDeleteMatch;
+
+    return {
+      message: `Primární branch "${branchName}" nejde smazat.`,
+      detail,
+    };
+  }
+
+  if (noPrimaryBranchMatch) {
+    return {
+      message: 'Nepodařilo se určit primární branch.',
+      detail,
+    };
+  }
+
+  if (linkedWorktreeMergeMatch) {
+    return {
+      message: 'Mergovat do primární branche jde jen z linked worktree repo.',
+      detail,
+    };
+  }
+
+  return {
+    message: detail || 'Git operation failed.',
+    detail: detail && detail !== rawMessage ? detail : rawMessage,
+  };
 }
 
 export function useGit() {
@@ -49,6 +151,7 @@ export function useGit() {
   const isLoading = ref(false);
   const isLoadingLog = ref(false);
   const error = ref<string | null>(null);
+  const errorDetail = ref<string | null>(null);
   const commitDiffError = ref<string | null>(null);
   const isLoadingCommitDiff = ref(false);
   const isRefreshing = ref(false);
@@ -100,6 +203,18 @@ export function useGit() {
     selectedDiffMode.value = 'working-tree';
     diff.value = '';
     clearCommitDiffState();
+    errorDetail.value = null;
+  }
+
+  function clearErrorState() {
+    error.value = null;
+    errorDetail.value = null;
+  }
+
+  function assignGitError(nextError: unknown) {
+    const normalizedError = normalizeGitError(nextError);
+    error.value = normalizedError.message;
+    errorDetail.value = normalizedError.detail;
   }
 
   function resolveDiffMode(
@@ -166,7 +281,10 @@ export function useGit() {
 
     try {
       const [nextStatus, nextBranches] = await Promise.all([
-        window.bridgegit.git.status(request.repoPath),
+        window.bridgegit.git.status(
+          request.repoPath,
+          options.fetchOrigin ? { fetchOrigin: true } : undefined,
+        ),
         window.bridgegit.git.branches(request.repoPath),
       ]);
 
@@ -180,7 +298,7 @@ export function useGit() {
         status: cloneStatusSummary(nextStatus),
         branches: cloneBranchSummary(nextBranches),
       });
-      error.value = null;
+      clearErrorState();
 
       const shouldReloadDiff = options.reloadDiff ?? true;
 
@@ -211,7 +329,7 @@ export function useGit() {
       }
 
       clearState();
-      error.value = toErrorMessage(nextError);
+      assignGitError(nextError);
     } finally {
       if (isRepoRequestCurrent(request)) {
         refreshInFlight = false;
@@ -239,14 +357,14 @@ export function useGit() {
       }
 
       branches.value = nextBranches;
-      error.value = null;
+      clearErrorState();
     } catch (nextError) {
       if (!isRepoRequestCurrent(request)) {
         return;
       }
 
       branches.value = null;
-      error.value = toErrorMessage(nextError);
+      assignGitError(nextError);
     } finally {
       if (isRepoRequestCurrent(request)) {
         isLoading.value = false;
@@ -264,7 +382,7 @@ export function useGit() {
     isRefreshing.value = false;
     isLoadingLog.value = false;
     isLoadingCommitDiff.value = false;
-    error.value = null;
+    clearErrorState();
 
     if (!nextRepoPath) {
       return;
@@ -272,6 +390,10 @@ export function useGit() {
 
     const loadMode = options.loadMode ?? 'full';
     const cachedRepoState = repoStateCache.get(nextRepoPath);
+
+    if (loadMode === 'none') {
+      return;
+    }
 
     if (loadMode === 'branches') {
       if (cachedRepoState) {
@@ -333,14 +455,14 @@ export function useGit() {
       }
 
       diff.value = nextDiff;
-      error.value = null;
+      clearErrorState();
     } catch (nextError) {
       if (!isRepoRequestCurrent(request)) {
         return;
       }
 
       diff.value = '';
-      error.value = toErrorMessage(nextError);
+      assignGitError(nextError);
     } finally {
       if (isRepoRequestCurrent(request)) {
         isLoading.value = false;
@@ -357,10 +479,10 @@ export function useGit() {
 
     try {
       await window.bridgegit.git.stage(repoPath.value, files);
-      error.value = null;
+      clearErrorState();
       await refresh();
     } catch (nextError) {
-      error.value = toErrorMessage(nextError);
+      assignGitError(nextError);
     } finally {
       isLoading.value = false;
     }
@@ -375,10 +497,10 @@ export function useGit() {
 
     try {
       await window.bridgegit.git.unstage(repoPath.value, files);
-      error.value = null;
+      clearErrorState();
       await refresh();
     } catch (nextError) {
-      error.value = toErrorMessage(nextError);
+      assignGitError(nextError);
     } finally {
       isLoading.value = false;
     }
@@ -393,10 +515,10 @@ export function useGit() {
 
     try {
       await window.bridgegit.git.discard(repoPath.value, change);
-      error.value = null;
+      clearErrorState();
       await refresh();
     } catch (nextError) {
-      error.value = toErrorMessage(nextError);
+      assignGitError(nextError);
     } finally {
       isLoading.value = false;
     }
@@ -411,10 +533,10 @@ export function useGit() {
 
     try {
       await window.bridgegit.git.discardHunk(repoPath.value, patch, mode);
-      error.value = null;
+      clearErrorState();
       await refresh();
     } catch (nextError) {
-      error.value = toErrorMessage(nextError);
+      assignGitError(nextError);
     } finally {
       isLoading.value = false;
     }
@@ -431,10 +553,10 @@ export function useGit() {
       await window.bridgegit.git.commit(repoPath.value, message);
       selectedPath.value = null;
       diff.value = '';
-      error.value = null;
+      clearErrorState();
       await refresh({ reloadDiff: false });
     } catch (nextError) {
-      error.value = toErrorMessage(nextError);
+      assignGitError(nextError);
     } finally {
       isLoading.value = false;
     }
@@ -451,10 +573,166 @@ export function useGit() {
       await window.bridgegit.git.checkout(repoPath.value, branchName);
       selectedPath.value = null;
       diff.value = '';
-      error.value = null;
+      clearErrorState();
       await refresh({ reloadDiff: false });
     } catch (nextError) {
-      error.value = toErrorMessage(nextError);
+      assignGitError(nextError);
+    } finally {
+      isLoading.value = false;
+    }
+  }
+
+  async function createBranch(
+    branchName: string,
+    options?: CreateBranchOptions,
+  ): Promise<CreateBranchResult | null> {
+    if (!repoPath.value || !window.bridgegit?.git) {
+      return null;
+    }
+
+    isLoading.value = true;
+
+    try {
+      const result = await window.bridgegit.git.createBranch(repoPath.value, branchName, {
+        checkout: true,
+        ...options,
+      });
+      if (result.repoPath === repoPath.value) {
+        selectedPath.value = null;
+        diff.value = '';
+        await refresh({ reloadDiff: false });
+      }
+      clearErrorState();
+      return result;
+    } catch (nextError) {
+      assignGitError(nextError);
+      return null;
+    } finally {
+      isLoading.value = false;
+    }
+  }
+
+  async function initRepository(): Promise<boolean> {
+    if (!repoPath.value || !window.bridgegit?.git) {
+      return false;
+    }
+
+    isLoading.value = true;
+
+    try {
+      await window.bridgegit.git.initRepository(repoPath.value);
+      selectedPath.value = null;
+      diff.value = '';
+      clearErrorState();
+      await refresh({ reloadDiff: false });
+      return true;
+    } catch (nextError) {
+      assignGitError(nextError);
+      return false;
+    } finally {
+      isLoading.value = false;
+    }
+  }
+
+  async function deleteBranch(branchName: string): Promise<DeleteBranchResult | null> {
+    if (!repoPath.value || !window.bridgegit?.git) {
+      return null;
+    }
+
+    isLoading.value = true;
+
+    try {
+      const result = await window.bridgegit.git.deleteBranch(repoPath.value, branchName);
+      selectedPath.value = null;
+      diff.value = '';
+      await refresh({ reloadDiff: false });
+      clearErrorState();
+      return result;
+    } catch (nextError) {
+      assignGitError(nextError);
+      return null;
+    } finally {
+      isLoading.value = false;
+    }
+  }
+
+  async function pushBranch() {
+    if (!repoPath.value || !window.bridgegit?.git) {
+      return;
+    }
+
+    isLoading.value = true;
+
+    try {
+      await window.bridgegit.git.push(repoPath.value);
+      clearErrorState();
+      await refresh({ reloadDiff: false });
+    } catch (nextError) {
+      assignGitError(nextError);
+    } finally {
+      isLoading.value = false;
+    }
+  }
+
+  async function mergeWorktreeIntoPrimaryBranch(targetRepoPath: string): Promise<MergeWorktreeIntoPrimaryBranchResult | null> {
+    if (!targetRepoPath || !window.bridgegit?.git) {
+      return null;
+    }
+
+    isLoading.value = true;
+
+    try {
+      const result = await window.bridgegit.git.mergeWorktreeIntoPrimaryBranch(targetRepoPath);
+
+      if (repoPath.value && targetRepoPath === repoPath.value) {
+        selectedPath.value = null;
+        diff.value = '';
+        await refresh({ reloadDiff: false });
+      }
+
+      clearErrorState();
+      return result;
+    } catch (nextError) {
+      assignGitError(nextError);
+      return null;
+    } finally {
+      isLoading.value = false;
+    }
+  }
+
+  async function removeWorktree(targetRepoPath: string): Promise<RemoveWorktreeResult | null> {
+    if (!targetRepoPath || !window.bridgegit?.git) {
+      return null;
+    }
+
+    isLoading.value = true;
+
+    try {
+      const result = await window.bridgegit.git.removeWorktree(targetRepoPath);
+      clearErrorState();
+      return result;
+    } catch (nextError) {
+      assignGitError(nextError);
+      return null;
+    } finally {
+      isLoading.value = false;
+    }
+  }
+
+  async function removeWorktreeAndDeleteBranch(targetRepoPath: string): Promise<RemoveWorktreeAndDeleteBranchResult | null> {
+    if (!targetRepoPath || !window.bridgegit?.git) {
+      return null;
+    }
+
+    isLoading.value = true;
+
+    try {
+      const result = await window.bridgegit.git.removeWorktreeAndDeleteBranch(targetRepoPath);
+      clearErrorState();
+      return result;
+    } catch (nextError) {
+      assignGitError(nextError);
+      return null;
     } finally {
       isLoading.value = false;
     }
@@ -489,7 +767,7 @@ export function useGit() {
       }
 
       commitDiff.value = '';
-      commitDiffError.value = toErrorMessage(nextError);
+      commitDiffError.value = extractRawErrorMessage(nextError);
     } finally {
       if (isRepoRequestCurrent(request)) {
         isLoadingCommitDiff.value = false;
@@ -545,14 +823,14 @@ export function useGit() {
       }
 
       log.value = nextLog;
-      error.value = null;
+      clearErrorState();
       return nextLog;
     } catch (nextError) {
       if (!isRepoRequestCurrent(request)) {
         return null;
       }
 
-      error.value = toErrorMessage(nextError);
+      assignGitError(nextError);
       return null;
     } finally {
       if (isRepoRequestCurrent(request)) {
@@ -575,6 +853,7 @@ export function useGit() {
     isLoadingLog,
     isRefreshing,
     error,
+    errorDetail,
     commitDiffError,
     isLoadingCommitDiff,
     refresh,
@@ -590,6 +869,13 @@ export function useGit() {
     discardHunk,
     commitChanges,
     checkoutBranch,
+    createBranch,
+    initRepository,
+    deleteBranch,
+    mergeWorktreeIntoPrimaryBranch,
+    removeWorktree,
+    removeWorktreeAndDeleteBranch,
+    pushBranch,
     dispose,
   };
 }

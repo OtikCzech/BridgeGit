@@ -29,14 +29,55 @@ export interface GitStatusSummary {
   conflicted: GitChange[];
 }
 
+export interface GitStatusRequestOptions {
+  fetchOrigin?: boolean;
+}
+
 export interface BranchInfo {
   name: string;
   current: boolean;
+  checkedOutElsewhere: boolean;
+  worktreePath: string | null;
 }
 
 export interface BranchSummary {
   current: string | null;
   all: BranchInfo[];
+}
+
+export interface CreateBranchOptions {
+  checkout?: boolean;
+  placement?: 'current-repo' | 'new-repo';
+}
+
+export interface CreateBranchResult {
+  branches: BranchSummary;
+  repoPath: string;
+}
+
+export interface DeleteBranchResult {
+  branches: BranchSummary;
+  deletedBranch: string;
+}
+
+export interface MergeWorktreeIntoPrimaryBranchResult {
+  repoPath: string;
+  primaryRepoPath: string;
+  sourceBranch: string;
+  targetBranch: string;
+}
+
+export interface RemoveWorktreeResult {
+  repoPath: string;
+  primaryRepoPath: string;
+  removedBranch: string | null;
+}
+
+export interface RemoveWorktreeAndDeleteBranchResult {
+  repoPath: string;
+  primaryRepoPath: string;
+  removedBranch: string | null;
+  deletedBranch: string | null;
 }
 
 export interface RepoDirectoryEntry {
@@ -76,11 +117,109 @@ export interface GitWorktreeSummary {
   current: boolean;
 }
 
+const COMPARABLE_WSL_UNC_PATH_PATTERN = /^\/\/(?:wsl\.localhost|wsl\$)\/([^/]+)(\/.*)?$/i;
+const COMPARABLE_WINDOWS_DRIVE_PATH_PATTERN = /^([A-Za-z]):(?:\/(.*))?$/;
+const COMPARABLE_WSL_MOUNT_PATH_PATTERN = /^\/mnt\/([a-zA-Z])(?:\/(.*))?$/;
+
+function trimComparablePathSuffix(pathValue: string): string {
+  if (pathValue === '/') {
+    return pathValue;
+  }
+
+  return pathValue.replace(/\/+$/, '');
+}
+
+function normalizeComparablePosixPath(pathValue: string): string {
+  return trimComparablePathSuffix(pathValue.replace(/\/+/g, '/')) || '/';
+}
+
+function extractComparableLinuxPath(comparablePath: string): string | null {
+  if (comparablePath.startsWith('posix:')) {
+    return comparablePath.slice('posix:'.length);
+  }
+
+  if (comparablePath.startsWith('wsl:')) {
+    const firstSlashIndex = comparablePath.indexOf('/', 'wsl:'.length);
+
+    return firstSlashIndex >= 0 ? comparablePath.slice(firstSlashIndex) : '/';
+  }
+
+  return null;
+}
+
+export function normalizeRepoPathForComparison(pathValue: string | null | undefined): string {
+  const trimmedPath = pathValue?.trim();
+
+  if (!trimmedPath) {
+    return '';
+  }
+
+  const normalizedPath = trimComparablePathSuffix(trimmedPath.replace(/\\/g, '/'));
+  const comparableWslPath = COMPARABLE_WSL_UNC_PATH_PATTERN.exec(normalizedPath);
+
+  if (comparableWslPath) {
+    const [, distro, suffix = ''] = comparableWslPath;
+    const linuxPath = normalizeComparablePosixPath(suffix || '/');
+
+    return `wsl:${distro.toLowerCase()}${linuxPath}`;
+  }
+
+  const comparableWslMount = COMPARABLE_WSL_MOUNT_PATH_PATTERN.exec(normalizedPath);
+
+  if (comparableWslMount) {
+    const [, driveLetter, suffix = ''] = comparableWslMount;
+    const normalizedSuffix = suffix.replace(/\/+/g, '/');
+
+    return normalizedSuffix
+      ? `drive:${driveLetter.toLowerCase()}/${normalizedSuffix}`
+      : `drive:${driveLetter.toLowerCase()}`;
+  }
+
+  const comparableWindowsDrivePath = COMPARABLE_WINDOWS_DRIVE_PATH_PATTERN.exec(normalizedPath);
+
+  if (comparableWindowsDrivePath) {
+    const [, driveLetter, suffix = ''] = comparableWindowsDrivePath;
+    const normalizedSuffix = suffix.replace(/\/+/g, '/');
+
+    return normalizedSuffix
+      ? `drive:${driveLetter.toLowerCase()}/${normalizedSuffix}`
+      : `drive:${driveLetter.toLowerCase()}`;
+  }
+
+  if (normalizedPath.startsWith('/')) {
+    return `posix:${normalizeComparablePosixPath(normalizedPath)}`;
+  }
+
+  return `path:${normalizedPath.toLowerCase()}`;
+}
+
+export function areRepoPathsEquivalent(
+  leftPath: string | null | undefined,
+  rightPath: string | null | undefined,
+): boolean {
+  const normalizedLeftPath = normalizeRepoPathForComparison(leftPath);
+  const normalizedRightPath = normalizeRepoPathForComparison(rightPath);
+
+  if (!normalizedLeftPath || !normalizedRightPath) {
+    return false;
+  }
+
+  if (normalizedLeftPath === normalizedRightPath) {
+    return true;
+  }
+
+  const leftLinuxPath = extractComparableLinuxPath(normalizedLeftPath);
+  const rightLinuxPath = extractComparableLinuxPath(normalizedRightPath);
+
+  return Boolean(leftLinuxPath && rightLinuxPath && leftLinuxPath === rightLinuxPath);
+}
+
 export interface PanelLayout {
   sidebarWidth: number;
   terminalHeight: number;
   terminalWidth: number;
-  contentLayout: 'stacked' | 'side-by-side';
+  sidebarSide: 'left' | 'right';
+  diffPlacement: 'left' | 'right' | 'top' | 'bottom';
   sidebarCollapsed: boolean;
   diffCollapsed: boolean;
   terminalCollapsed: boolean;
@@ -102,6 +241,7 @@ export interface WorkspaceRepoPanelState {
   fontSize: number;
   historyOpen: boolean;
   workspaceDetailExpanded: boolean;
+  workspaceFamilyFocus: boolean;
   files: WorkspaceRepoPanelFilesState;
 }
 
@@ -214,6 +354,7 @@ export interface WorkspaceOverviewItem {
   changedCount: number | null;
   untrackedCount: number | null;
   conflictedCount: number | null;
+  worktreeRole: 'primary' | 'linked' | null;
   hasPanelActivity: boolean;
   hasPanelAttention: boolean;
   isCurrent: boolean;
@@ -373,6 +514,7 @@ export interface SessionData {
   panelLayout: PanelLayout;
   panelLayoutsByWorkspace: PanelLayoutsByWorkspace;
   workspaceRepoPanelStates: WorkspaceRepoPanelStatesById;
+  repoPanelFontSize: number;
   terminalCwd: string | null;
   projectTitle: string;
   projectTitleMode: ProjectTitleMode;
@@ -384,14 +526,15 @@ export interface SessionData {
   worktreeDetectionIntervalMs: WorktreeDetectionInterval;
   dismissedWorktreePaths: string[];
   soundNotificationsEnabled: boolean;
-  infoNoteLastSeenRevision: string | null;
+  seenInfoNoteRevisions: string[];
   terminalCommandPresets: TerminalCommandPreset[];
   workspaceSessions: WorkspaceSessionsById;
 }
 
 export interface ProjectSettingsFormData {
   projectTitle: string;
-  contentLayout: PanelLayout['contentLayout'];
+  sidebarSide: PanelLayout['sidebarSide'];
+  diffPlacement: PanelLayout['diffPlacement'];
   appAppearance: AppAppearance;
   editorTheme: EditorTheme;
   workspacePanelFontSize: number;
@@ -414,6 +557,10 @@ export function cloneWorkspaceTabDefaults(workspaceTabDefaults: WorkspaceTabDefa
 
 export function cloneDismissedWorktreePaths(dismissedWorktreePaths: string[]): string[] {
   return [...dismissedWorktreePaths];
+}
+
+export function cloneSeenInfoNoteRevisions(seenInfoNoteRevisions: string[]): string[] {
+  return [...seenInfoNoteRevisions];
 }
 
 export function cloneTerminalCommandPresets(presets: TerminalCommandPreset[]): TerminalCommandPreset[] {
@@ -467,6 +614,7 @@ export function cloneWorkspaceRepoPanelState(workspaceRepoPanelState: WorkspaceR
     fontSize: workspaceRepoPanelState.fontSize,
     historyOpen: workspaceRepoPanelState.historyOpen,
     workspaceDetailExpanded: workspaceRepoPanelState.workspaceDetailExpanded,
+    workspaceFamilyFocus: workspaceRepoPanelState.workspaceFamilyFocus,
     files: {
       expanded: workspaceRepoPanelState.files.expanded,
       viewMode: workspaceRepoPanelState.files.viewMode,
@@ -629,7 +777,8 @@ export const DEFAULT_PANEL_LAYOUT: PanelLayout = {
   sidebarWidth: 310,
   terminalHeight: 520,
   terminalWidth: 420,
-  contentLayout: 'stacked',
+  sidebarSide: 'left',
+  diffPlacement: 'top',
   sidebarCollapsed: false,
   diffCollapsed: false,
   terminalCollapsed: false,
@@ -652,6 +801,7 @@ export const DEFAULT_SESSION_DATA: SessionData = {
     [GLOBAL_WORKSPACE_ID]: { ...DEFAULT_PANEL_LAYOUT },
   },
   workspaceRepoPanelStates: {},
+  repoPanelFontSize: DEFAULT_NOTE_FONT_SIZE,
   terminalCwd: null,
   projectTitle: 'BridgeGit',
   projectTitleMode: 'auto',
@@ -670,7 +820,7 @@ export const DEFAULT_SESSION_DATA: SessionData = {
   worktreeDetectionIntervalMs: 180_000,
   dismissedWorktreePaths: [],
   soundNotificationsEnabled: true,
-  infoNoteLastSeenRevision: null,
+  seenInfoNoteRevisions: [],
   terminalCommandPresets: getDefaultTerminalCommandPresets(),
   workspaceSessions: {},
 };

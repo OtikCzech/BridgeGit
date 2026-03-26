@@ -23,7 +23,7 @@ interface Props {
   repoName: string;
   changedCount: number;
   infoMessage: string;
-  contentLayout: 'stacked' | 'side-by-side';
+  diffPlacement: 'left' | 'right' | 'top' | 'bottom';
   collapsedPanels: CollapsedPanel[];
   terminalTabIndicators: TerminalTabIndicator[];
   repoDockSummary: RepoDockSummary;
@@ -32,7 +32,7 @@ interface Props {
 defineProps<Props>();
 
 defineEmits<{
-  'toggle-layout': [];
+  'cycle-diff-placement': [];
   'toggle-panel': [panelId: CollapsedPanel['id']];
 }>();
 </script>
@@ -112,12 +112,12 @@ defineEmits<{
       <button
         class="status-bar__layout-toggle"
         type="button"
-        :title="contentLayout === 'stacked' ? 'Switch right pane to side by side' : 'Switch right pane to stacked'"
-        @click="$emit('toggle-layout')"
+        :title="`Cycle diff placement (current: ${diffPlacement})`"
+        @click="$emit('cycle-diff-placement')"
       >
         <span
           class="status-bar__layout-icon"
-          :class="`status-bar__layout-icon--${contentLayout}`"
+          :class="`status-bar__layout-icon--${diffPlacement}`"
         >
           <span />
           <span />
@@ -277,17 +277,26 @@ defineEmits<{
 
 .status-bar__layout-icon span {
   border-radius: 2px;
-  background: rgba(123, 208, 255, 0.75);
+  background: rgba(108, 124, 148, 0.45);
 }
 
-.status-bar__layout-icon--stacked {
+.status-bar__layout-icon--top,
+.status-bar__layout-icon--bottom {
   grid-template-columns: 1fr;
   grid-template-rows: repeat(2, 1fr);
 }
 
-.status-bar__layout-icon--side-by-side {
+.status-bar__layout-icon--left,
+.status-bar__layout-icon--right {
   grid-template-columns: repeat(2, 1fr);
   grid-template-rows: 1fr;
+}
+
+.status-bar__layout-icon--top span:first-child,
+.status-bar__layout-icon--left span:first-child,
+.status-bar__layout-icon--right span:last-child,
+.status-bar__layout-icon--bottom span:last-child {
+  background: rgba(123, 208, 255, 0.82);
 }
 
 @keyframes status-bar-dock-pulse {

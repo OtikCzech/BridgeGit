@@ -125,8 +125,8 @@ const sortedPresets = computed(() => (
 ));
 const collapseButtonTitle = computed(() => (
   props.canCollapse
-    ? `Collapse workspace panel ${props.collapseShortcutDisplay}`
-    : 'Workspace panel cannot be collapsed while it is the last visible panel'
+    ? `Collapse tabs panel ${props.collapseShortcutDisplay}`
+    : 'Tabs panel cannot be collapsed while it is the last visible panel'
 ));
 const creationMenuActions = computed(() => ([
   {
@@ -2066,7 +2066,7 @@ defineExpose({
 <template>
   <section class="terminal-panel" :data-appearance-theme="props.appearanceTheme">
     <header class="terminal-panel__tabs-header">
-      <div class="terminal-panel__tabs" role="tablist" aria-label="Workspace tabs">
+      <div class="terminal-panel__tabs" role="tablist" aria-label="Tabs panel">
         <div
           v-for="tab in tabs"
           :key="tab.id"
@@ -2199,7 +2199,7 @@ defineExpose({
           type="button"
           :disabled="!canCollapse"
           :title="collapseButtonTitle"
-          aria-label="Collapse workspace panel"
+          aria-label="Collapse tabs panel"
           @click="emit('toggle-collapse')"
         >
           <svg viewBox="0 0 24 24" aria-hidden="true">

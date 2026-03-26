@@ -5,7 +5,9 @@ import {
   DEFAULT_PANEL_LAYOUT,
   GLOBAL_WORKSPACE_ID,
   GLOBAL_WORKSPACE_SESSION_KEY,
+  areRepoPathsEquivalent,
   cloneDismissedWorktreePaths,
+  cloneSeenInfoNoteRevisions,
   clonePanelLayoutsByWorkspace,
   cloneProjectTitlesByContext,
   cloneWorkspaceIndicatorVisibilitySettings,
@@ -15,6 +17,8 @@ import {
   cloneWorkspaceDescriptors,
   cloneWorkspaceSessionState,
   cloneWorkspaceSessions,
+  normalizeNoteFontSize,
+  normalizeRepoPathForComparison,
   normalizeAppAppearance,
   normalizeEditorTheme,
   resolveThemeVariant,
@@ -49,10 +53,12 @@ import RepoPanel from './components/RepoPanel.vue';
 import StatusBar from './components/StatusBar.vue';
 import TerminalPanel from './components/TerminalPanel.vue';
 import {
+  CURRENT_APP_VERSION,
   CURRENT_INFO_NOTE_REVISION,
   WELCOME_NOTE_TAB_ID,
   buildOnboardingWorkspaceSessions,
   hasWorkspaceTabs,
+  refreshWelcomeNoteTabs,
   upsertWelcomeNoteTab,
 } from './onboarding';
 import { SHORTCUTS, matchesCommandSlotShortcut, matchesShortcut } from './shortcuts';
@@ -78,12 +84,14 @@ const terminalPanelRef = ref<{
 const sidebarWidth = ref(DEFAULT_PANEL_LAYOUT.sidebarWidth);
 const terminalHeight = ref(DEFAULT_PANEL_LAYOUT.terminalHeight);
 const terminalWidth = ref(DEFAULT_PANEL_LAYOUT.terminalWidth);
-const contentLayout = ref(DEFAULT_PANEL_LAYOUT.contentLayout);
+const sidebarSide = ref(DEFAULT_PANEL_LAYOUT.sidebarSide);
+const diffPlacement = ref(DEFAULT_PANEL_LAYOUT.diffPlacement);
 const sidebarCollapsed = ref(DEFAULT_PANEL_LAYOUT.sidebarCollapsed);
 const diffCollapsed = ref(DEFAULT_PANEL_LAYOUT.diffCollapsed);
 const terminalCollapsed = ref(DEFAULT_PANEL_LAYOUT.terminalCollapsed);
 const panelLayoutsByWorkspace = ref<Record<string, PanelLayout>>({});
 const workspaceRepoPanelStates = ref<Record<string, WorkspaceRepoPanelState>>({});
+const repoPanelFontSize = ref(DEFAULT_SESSION_DATA.repoPanelFontSize);
 const projectTitlesByContext = ref<Record<string, string>>({});
 const appAppearance = ref<AppAppearance>(DEFAULT_SESSION_DATA.appAppearance);
 const editorTheme = ref<EditorTheme>(DEFAULT_SESSION_DATA.editorTheme);
@@ -116,18 +124,23 @@ const workspaceRecentActivityByWorkspaceId = ref<Record<string, Record<string, b
 const workspaceAttentionByWorkspaceId = ref<Record<string, Record<string, boolean>>>({});
 const activeWorkspaceId = ref<string | null>(GLOBAL_WORKSPACE_ID);
 const activeWorkspaceTabId = ref<string | null>(null);
-const workspaceGitSummaryById = ref<Record<string, {
+type WorkspaceGitSummary = {
   branch: string | null;
   changedCount: number | null;
   untrackedCount: number | null;
   conflictedCount: number | null;
-}>>({});
+  worktreeRole: 'primary' | 'linked' | null;
+};
+
+const workspaceGitSummaryById = ref<Record<string, WorkspaceGitSummary>>({});
 const gitRepositoryValidityByPath = ref<Record<string, boolean>>({});
-const infoNoteLastSeenRevision = ref<string | null>(null);
+const seenInfoNoteRevisions = ref<string[]>([]);
 const detectedWorktrees = ref<GitWorktreeSummary[]>([]);
 const sessionReady = ref(false);
 const isSwitchingWorkspaceContext = ref(false);
 const isCheckingWorktrees = ref(false);
+const repoToolbarBusyAction = ref<'fetch' | 'push' | 'refresh' | null>(null);
+const repoOperationStatus = ref<string | null>(null);
 
 const runtimeInfo = window.bridgegit ?? {
   platform: 'unknown',
@@ -153,6 +166,7 @@ const {
   isLoadingLog,
   isLoadingCommitDiff,
   error,
+  errorDetail,
   commitDiffError,
   refresh: refreshRepoStatus,
   loadLog,
@@ -166,6 +180,13 @@ const {
   discardHunk,
   commitChanges,
   checkoutBranch,
+  createBranch,
+  initRepository: initCurrentRepository,
+  deleteBranch,
+  mergeWorktreeIntoPrimaryBranch,
+  removeWorktree,
+  removeWorktreeAndDeleteBranch,
+  pushBranch,
   dispose,
 } = useGit();
 
@@ -217,7 +238,7 @@ const collapsedPanels = computed(() => {
   if (terminalCollapsed.value) {
     panels.push({
       id: 'terminal',
-      label: repoPath.value ? getRepoName(repoPath.value) : 'Workspace',
+      label: 'Tabs',
       shortcut: SHORTCUTS.panelTerminalToggle.display,
     });
   }
@@ -232,6 +253,13 @@ const terminalTabIndicators = computed(() => (
     hasRecentActivity: Boolean(workspaceRecentActivityByTabId.value[tab.id]),
   }))
 ));
+const currentRepoIsGitRepository = computed(() => {
+  if (!repoPath.value) {
+    return false;
+  }
+
+  return gitRepositoryValidityByPath.value[repoPath.value] ?? false;
+});
 
 function getWorkspaceTabsSnapshot(nextWorkspaceId: string) {
   if (nextWorkspaceId === getCurrentWorkspaceId()) {
@@ -258,17 +286,34 @@ function buildWorkspaceGitSummary(nextStatus: GitStatusSummary, nextBranch: stri
     changedCount: nextStatus.staged.length + nextStatus.unstaged.length + nextStatus.conflicted.length,
     untrackedCount: nextStatus.untracked.length,
     conflictedCount: nextStatus.conflicted.length,
+    worktreeRole: null,
   };
 }
 
-async function isGitRepositoryPath(nextRepoPath: string | null): Promise<boolean> {
+function resolveWorkspaceWorktreeRole(
+  nextRepoPath: string,
+  worktrees: GitWorktreeSummary[],
+): 'primary' | 'linked' | null {
+  const primaryWorktree = worktrees.find((worktree) => !worktree.bare) ?? null;
+
+  if (!primaryWorktree) {
+    return null;
+  }
+
+  return areRepoPathsEquivalent(primaryWorktree.path, nextRepoPath) ? 'primary' : 'linked';
+}
+
+async function isGitRepositoryPath(
+  nextRepoPath: string | null,
+  options: { force?: boolean } = {},
+): Promise<boolean> {
   if (!nextRepoPath || !window.bridgegit?.git) {
     return false;
   }
 
   const cachedValidity = gitRepositoryValidityByPath.value[nextRepoPath];
 
-  if (cachedValidity !== undefined) {
+  if (!options.force && cachedValidity !== undefined) {
     return cachedValidity;
   }
 
@@ -290,20 +335,26 @@ async function loadWorkspaceGitSummary(nextWorkspaceId: string, nextRepoPath: st
         changedCount: null,
         untrackedCount: null,
         conflictedCount: null,
+        worktreeRole: null,
       },
     };
     return;
   }
 
   try {
-    const [nextStatus, nextBranches] = await Promise.all([
+    const [nextStatus, nextBranches, nextWorktrees] = await Promise.all([
       window.bridgegit.git.status(nextRepoPath),
       window.bridgegit.git.branches(nextRepoPath),
+      window.bridgegit.git.worktrees(nextRepoPath),
     ]);
+    const nextSummary = buildWorkspaceGitSummary(nextStatus, nextBranches.current);
 
     workspaceGitSummaryById.value = {
       ...workspaceGitSummaryById.value,
-      [nextWorkspaceId]: buildWorkspaceGitSummary(nextStatus, nextBranches.current),
+      [nextWorkspaceId]: {
+        ...nextSummary,
+        worktreeRole: resolveWorkspaceWorktreeRole(nextRepoPath, nextWorktrees),
+      },
     };
   } catch {
     // Keep the last known summary if refresh fails.
@@ -422,6 +473,7 @@ const workspaceOverviewItems = computed<WorkspaceOverviewItem[]>(() => {
       changedCount: cachedSummary?.changedCount ?? null,
       untrackedCount: cachedSummary?.untrackedCount ?? null,
       conflictedCount: cachedSummary?.conflictedCount ?? null,
+      worktreeRole: cachedSummary?.worktreeRole ?? null,
       hasPanelActivity: panelIndicators.hasPanelActivity,
       hasPanelAttention: panelIndicators.hasPanelAttention,
       isCurrent: workspaceId === getCurrentWorkspaceId(),
@@ -429,10 +481,18 @@ const workspaceOverviewItems = computed<WorkspaceOverviewItem[]>(() => {
   });
 });
 const activeDetectedWorktree = computed(() => detectedWorktrees.value[0] ?? null);
-const hasUnreadInfoNote = computed(() => infoNoteLastSeenRevision.value !== CURRENT_INFO_NOTE_REVISION);
+const hasUnreadInfoNote = computed(() => !seenInfoNoteRevisions.value.includes(CURRENT_INFO_NOTE_REVISION));
+const isDiffSplitHorizontal = computed(() => diffPlacement.value === 'left' || diffPlacement.value === 'right');
+const isDiffFirst = computed(() => diffPlacement.value === 'left' || diffPlacement.value === 'top');
 const shellColumns = computed(() => {
   if (sidebarCollapsed.value) {
     return 'minmax(0, 1fr)';
+  }
+
+  if (sidebarSide.value === 'right') {
+    return showShellDivider.value
+      ? 'minmax(0, 1fr) 8px minmax(280px, var(--sidebar-width))'
+      : 'minmax(0, 1fr) minmax(280px, var(--sidebar-width))';
   }
 
   return showShellDivider.value
@@ -448,12 +508,36 @@ const shellRowsMobile = computed(() => {
     ? 'minmax(220px, auto) 8px minmax(0, 1fr)'
     : 'minmax(220px, auto) minmax(0, 1fr)';
 });
+const shellAreas = computed(() => {
+  if (sidebarCollapsed.value) {
+    return '"content"';
+  }
+
+  if (sidebarSide.value === 'right') {
+    return showShellDivider.value
+      ? '"content shell-divider sidebar"'
+      : '"content sidebar"';
+  }
+
+  return showShellDivider.value
+    ? '"sidebar shell-divider content"'
+    : '"sidebar content"';
+});
+const shellAreasMobile = computed(() => {
+  if (sidebarCollapsed.value) {
+    return '"content"';
+  }
+
+  return showShellDivider.value
+    ? '"sidebar" "shell-divider" "content"'
+    : '"sidebar" "content"';
+});
 const contentColumns = computed(() => {
   if (!showContentDivider.value) {
     return 'minmax(0, 1fr)';
   }
 
-  return contentLayout.value === 'side-by-side'
+  return isDiffSplitHorizontal.value
     ? 'minmax(0, 1fr) 8px minmax(280px, var(--terminal-width))'
     : 'minmax(0, 1fr)';
 });
@@ -462,9 +546,32 @@ const contentRows = computed(() => {
     return 'minmax(0, 1fr)';
   }
 
-  return contentLayout.value === 'stacked'
+  return !isDiffSplitHorizontal.value
     ? 'minmax(0, 1fr) 8px minmax(180px, var(--terminal-height))'
     : 'minmax(0, 1fr)';
+});
+const contentAreas = computed(() => {
+  if (!showContentDivider.value) {
+    if (!diffCollapsed.value) {
+      return '"diff"';
+    }
+
+    if (!terminalCollapsed.value) {
+      return '"terminal"';
+    }
+
+    return '"empty"';
+  }
+
+  if (isDiffSplitHorizontal.value) {
+    return isDiffFirst.value
+      ? '"diff content-divider terminal"'
+      : '"terminal content-divider diff"';
+  }
+
+  return isDiffFirst.value
+    ? '"diff" "content-divider" "terminal"'
+    : '"terminal" "content-divider" "diff"';
 });
 const appStyle = computed(() => ({
   '--sidebar-width': `${sidebarWidth.value}px`,
@@ -472,10 +579,13 @@ const appStyle = computed(() => ({
   '--terminal-width': `${terminalWidth.value}px`,
   '--shell-columns': shellColumns.value,
   '--shell-rows': 'minmax(0, 1fr)',
+  '--shell-areas': shellAreas.value,
   '--shell-columns-mobile': '1fr',
   '--shell-rows-mobile': shellRowsMobile.value,
+  '--shell-areas-mobile': shellAreasMobile.value,
   '--content-columns': contentColumns.value,
   '--content-rows': contentRows.value,
+  '--content-areas': contentAreas.value,
 }));
 
 const changedCount = computed(() => {
@@ -725,9 +835,10 @@ function buildDefaultRepoPanelSectionState(): RepoPanelSectionState {
 
 function buildDefaultWorkspaceRepoPanelState(): WorkspaceRepoPanelState {
   return {
-    fontSize: DEFAULT_SESSION_DATA.workspaceTabDefaults.noteFontSize,
+    fontSize: repoPanelFontSize.value,
     historyOpen: false,
     workspaceDetailExpanded: true,
+    workspaceFamilyFocus: false,
     files: {
       expanded: true,
       viewMode: 'list',
@@ -738,19 +849,25 @@ function buildDefaultWorkspaceRepoPanelState(): WorkspaceRepoPanelState {
 }
 
 function currentWorkspaceRepoPanelStateValue(): WorkspaceRepoPanelState {
-  return cloneWorkspaceRepoPanelState(
+  const nextState = cloneWorkspaceRepoPanelState(
     workspaceRepoPanelStates.value[getCurrentWorkspaceId()]
     ?? buildDefaultWorkspaceRepoPanelState(),
   );
+
+  nextState.fontSize = repoPanelFontSize.value;
+  return nextState;
 }
 
 const currentWorkspaceRepoPanelState = computed(() => currentWorkspaceRepoPanelStateValue());
 
 function getWorkspaceRepoPanelStateValue(nextWorkspaceId: string | null | undefined): WorkspaceRepoPanelState {
-  return cloneWorkspaceRepoPanelState(
+  const nextState = cloneWorkspaceRepoPanelState(
     workspaceRepoPanelStates.value[nextWorkspaceId ?? GLOBAL_WORKSPACE_ID]
     ?? buildDefaultWorkspaceRepoPanelState(),
   );
+
+  nextState.fontSize = repoPanelFontSize.value;
+  return nextState;
 }
 
 function buildCurrentPanelLayout(): PanelLayout {
@@ -758,7 +875,8 @@ function buildCurrentPanelLayout(): PanelLayout {
     sidebarWidth: sidebarWidth.value,
     terminalHeight: terminalHeight.value,
     terminalWidth: terminalWidth.value,
-    contentLayout: contentLayout.value,
+    sidebarSide: sidebarSide.value,
+    diffPlacement: diffPlacement.value,
     sidebarCollapsed: sidebarCollapsed.value,
     diffCollapsed: diffCollapsed.value,
     terminalCollapsed: terminalCollapsed.value,
@@ -769,7 +887,8 @@ function applyPanelLayout(nextPanelLayout: PanelLayout) {
   sidebarWidth.value = nextPanelLayout.sidebarWidth;
   terminalHeight.value = nextPanelLayout.terminalHeight;
   terminalWidth.value = nextPanelLayout.terminalWidth;
-  contentLayout.value = nextPanelLayout.contentLayout;
+  sidebarSide.value = nextPanelLayout.sidebarSide;
+  diffPlacement.value = nextPanelLayout.diffPlacement;
   sidebarCollapsed.value = nextPanelLayout.sidebarCollapsed;
   diffCollapsed.value = nextPanelLayout.diffCollapsed;
   terminalCollapsed.value = nextPanelLayout.terminalCollapsed;
@@ -793,12 +912,20 @@ function buildKnownProjectRepoPaths(): Set<string> {
   const knownProjectRepoPaths = new Set<string>();
 
   recentRepos.value.forEach((recentRepo) => {
-    knownProjectRepoPaths.add(recentRepo.path);
+    const comparableRepoPath = normalizeRepoPathForComparison(recentRepo.path);
+
+    if (comparableRepoPath) {
+      knownProjectRepoPaths.add(comparableRepoPath);
+    }
   });
 
   Object.values(workspaceDescriptors.value).forEach((workspaceDescriptor) => {
     if (workspaceDescriptor.kind === 'project' && workspaceDescriptor.repoPath) {
-      knownProjectRepoPaths.add(workspaceDescriptor.repoPath);
+      const comparableRepoPath = normalizeRepoPathForComparison(workspaceDescriptor.repoPath);
+
+      if (comparableRepoPath) {
+        knownProjectRepoPaths.add(comparableRepoPath);
+      }
     }
   });
 
@@ -811,20 +938,43 @@ function buildVisibleWorktreeSuggestions(
 ): GitWorktreeSummary[] {
   const knownProjectRepoPaths = buildKnownProjectRepoPaths();
   const includeDismissed = options.includeDismissed ?? false;
+  const currentRepoComparisonPath = normalizeRepoPathForComparison(repoPath.value);
+  const dismissedWorktreeComparisonPaths = dismissedWorktreePaths.value
+    .map((path) => normalizeRepoPathForComparison(path))
+    .filter(Boolean);
+  const seenWorktreePaths = new Set<string>();
 
   return worktrees.filter((worktree) => {
-    if (!worktree.path || worktree.current || worktree.path === repoPath.value) {
+    const comparableWorktreePath = normalizeRepoPathForComparison(worktree.path);
+
+    if (
+      !worktree.path
+      || !comparableWorktreePath
+      || worktree.current
+      || comparableWorktreePath === currentRepoComparisonPath
+    ) {
       return false;
     }
 
-    if (knownProjectRepoPaths.has(worktree.path)) {
+    if (seenWorktreePaths.has(comparableWorktreePath)) {
       return false;
     }
 
-    if (!includeDismissed && dismissedWorktreePaths.value.includes(worktree.path)) {
+    if (knownProjectRepoPaths.has(comparableWorktreePath)) {
       return false;
     }
 
+    if (
+      !includeDismissed
+      && (
+        dismissedWorktreeComparisonPaths.includes(comparableWorktreePath)
+        || dismissedWorktreePaths.value.some((dismissedPath) => areRepoPathsEquivalent(dismissedPath, worktree.path))
+      )
+    ) {
+      return false;
+    }
+
+    seenWorktreePaths.add(comparableWorktreePath);
     return true;
   });
 }
@@ -859,6 +1009,7 @@ function buildSessionSavePayload(
     recentRepos: recentRepos.value,
     workspaceDescriptors: workspaceDescriptors.value,
     workspaceOrder: workspaceOrder.value,
+    repoPanelFontSize: repoPanelFontSize.value,
     terminalCwd: terminalCwd.value,
     projectTitle: '',
     projectTitleMode: 'auto' as const,
@@ -870,7 +1021,7 @@ function buildSessionSavePayload(
     worktreeDetectionIntervalMs: worktreeDetectionIntervalMs.value,
     dismissedWorktreePaths: dismissedWorktreePaths.value,
     soundNotificationsEnabled: soundNotificationsEnabled.value,
-    infoNoteLastSeenRevision: infoNoteLastSeenRevision.value,
+    seenInfoNoteRevisions: seenInfoNoteRevisions.value,
     terminalCommandPresets: terminalCommandPresets.value,
     workspaceSessions: buildPersistedWorkspaceSessions(),
     panelLayout: buildCurrentPanelLayout(),
@@ -893,6 +1044,22 @@ function captureWorkspacePanelLayout(nextWorkspaceId: string | null) {
     ...panelLayoutsByWorkspace.value,
     [nextWorkspaceId ?? GLOBAL_WORKSPACE_ID]: buildCurrentPanelLayout(),
   };
+}
+
+function syncGlobalLayoutPreferences(
+  nextSidebarSide: PanelLayout['sidebarSide'],
+  nextDiffPlacement: PanelLayout['diffPlacement'],
+) {
+  panelLayoutsByWorkspace.value = Object.fromEntries(
+    Object.entries(buildPersistedPanelLayoutsByWorkspace()).map(([workspaceId, panelLayout]) => [
+      workspaceId,
+      {
+        ...panelLayout,
+        sidebarSide: nextSidebarSide,
+        diffPlacement: nextDiffPlacement,
+      },
+    ]),
+  );
 }
 
 function applyWorkspaceRepoPanelState(nextWorkspaceId: string | null) {
@@ -924,10 +1091,34 @@ function shouldLoadDetailedGitStatus(repoPanelState: WorkspaceRepoPanelState): b
 }
 
 async function updateCurrentWorkspaceRepoPanelState(nextRepoPanelState: WorkspaceRepoPanelState) {
-  workspaceRepoPanelStates.value = {
-    ...workspaceRepoPanelStates.value,
-    [getCurrentWorkspaceId()]: cloneWorkspaceRepoPanelState(nextRepoPanelState),
-  };
+  repoPanelFontSize.value = normalizeNoteFontSize(nextRepoPanelState.fontSize);
+  const currentWorkspaceId = getCurrentWorkspaceId();
+  const nextWorkspaceRepoPanelState = cloneWorkspaceRepoPanelState({
+    ...nextRepoPanelState,
+    fontSize: repoPanelFontSize.value,
+  });
+  const currentWorkspaceRepoPanelState = workspaceRepoPanelStates.value[currentWorkspaceId]
+    ?? buildDefaultWorkspaceRepoPanelState();
+  const focusModeChanged = currentWorkspaceRepoPanelState.workspaceFamilyFocus !== nextWorkspaceRepoPanelState.workspaceFamilyFocus;
+
+  if (focusModeChanged) {
+    const nextWorkspaceRepoPanelStates = cloneWorkspaceRepoPanelStates(workspaceRepoPanelStates.value);
+
+    Object.keys(nextWorkspaceRepoPanelStates).forEach((workspaceId) => {
+      nextWorkspaceRepoPanelStates[workspaceId] = cloneWorkspaceRepoPanelState({
+        ...nextWorkspaceRepoPanelStates[workspaceId],
+        workspaceFamilyFocus: nextWorkspaceRepoPanelState.workspaceFamilyFocus,
+      });
+    });
+
+    nextWorkspaceRepoPanelStates[currentWorkspaceId] = nextWorkspaceRepoPanelState;
+    workspaceRepoPanelStates.value = nextWorkspaceRepoPanelStates;
+  } else {
+    workspaceRepoPanelStates.value = {
+      ...workspaceRepoPanelStates.value,
+      [currentWorkspaceId]: nextWorkspaceRepoPanelState,
+    };
+  }
 
   if (repoPath.value && shouldLoadDetailedGitStatus(nextRepoPanelState) && !status.value && !isLoading.value) {
     void ensureFullStatus();
@@ -1184,36 +1375,85 @@ async function handleGlobalEditableContextMenu(event: MouseEvent) {
   }
 }
 
-function handlePointerMove(event: PointerEvent) {
-  if (activeResize.value === 'sidebar') {
-    const shellElement = shellRef.value;
+function getSidebarResizeBounds() {
+  const shellElement = shellRef.value;
 
-    if (!shellElement) {
-      return;
-    }
-
-    const bounds = shellElement.getBoundingClientRect();
-    const maxSidebarWidth = Math.max(250, bounds.width * 0.46);
-    sidebarWidth.value = Math.round(clamp(event.clientX - bounds.left, 250, maxSidebarWidth));
-    return;
+  if (!shellElement) {
+    return null;
   }
 
+  const bounds = shellElement.getBoundingClientRect();
+  return {
+    bounds,
+    maxSidebarWidth: Math.max(250, bounds.width * 0.46),
+  };
+}
+
+function clampSidebarWidthValue(nextWidth: number): number {
+  const resizeBounds = getSidebarResizeBounds();
+
+  if (!resizeBounds) {
+    return Math.round(Math.max(250, nextWidth));
+  }
+
+  return Math.round(clamp(nextWidth, 250, resizeBounds.maxSidebarWidth));
+}
+
+function getContentResizeBounds() {
   const contentElement = contentRef.value;
 
   if (!contentElement) {
-    return;
+    return null;
   }
 
   const bounds = contentElement.getBoundingClientRect();
+  return {
+    bounds,
+    maxSecondaryWidth: Math.max(280, bounds.width * 0.62),
+  };
+}
 
-  if (contentLayout.value === 'stacked') {
+function clampSecondaryPaneWidthValue(nextWidth: number): number {
+  const resizeBounds = getContentResizeBounds();
+
+  if (!resizeBounds) {
+    return Math.round(Math.max(280, nextWidth));
+  }
+
+  return Math.round(clamp(nextWidth, 280, resizeBounds.maxSecondaryWidth));
+}
+
+function handlePointerMove(event: PointerEvent) {
+  if (activeResize.value === 'sidebar') {
+    const resizeBounds = getSidebarResizeBounds();
+
+    if (!resizeBounds) {
+      return;
+    }
+
+    const { bounds } = resizeBounds;
+    const rawSidebarWidth = sidebarSide.value === 'right'
+      ? bounds.right - event.clientX
+      : event.clientX - bounds.left;
+    sidebarWidth.value = clampSidebarWidthValue(rawSidebarWidth);
+    return;
+  }
+
+  const resizeBounds = getContentResizeBounds();
+
+  if (!resizeBounds) {
+    return;
+  }
+
+  const { bounds, maxSecondaryWidth } = resizeBounds;
+
+  if (!isDiffSplitHorizontal.value) {
     const maxTerminalHeight = Math.max(180, bounds.height - 220);
     terminalHeight.value = Math.round(clamp(bounds.bottom - event.clientY, 180, maxTerminalHeight));
     return;
   }
 
-  const maxTerminalWidth = Math.max(280, bounds.width * 0.62);
-  terminalWidth.value = Math.round(clamp(bounds.right - event.clientX, 280, maxTerminalWidth));
+  terminalWidth.value = Math.round(clamp(bounds.right - event.clientX, 280, maxSecondaryWidth));
 }
 
 function stopResize() {
@@ -1293,8 +1533,60 @@ function startWorktreeDetectionPolling() {
 }
 
 async function handleRefreshRepo() {
-  await refreshRepoStatus();
-  await detectWorktrees({ includeDismissed: true });
+  repoToolbarBusyAction.value = 'refresh';
+  repoOperationStatus.value = 'Refreshing repository state…';
+
+  try {
+    const currentRepoPath = repoPath.value;
+    let currentRepoIsGit = currentRepoIsGitRepository.value;
+
+    if (currentRepoPath) {
+      currentRepoIsGit = await isGitRepositoryPath(currentRepoPath, { force: true });
+
+      const currentWorkspaceId = getCurrentWorkspaceId();
+      if (currentWorkspaceId) {
+        void loadWorkspaceGitSummary(currentWorkspaceId, currentRepoPath);
+      }
+
+      if (!currentRepoIsGit) {
+        detectedWorktrees.value = [];
+        await setRepoPath(currentRepoPath, { loadMode: 'none' });
+        return;
+      }
+    }
+
+    await refreshRepoStatus();
+    await detectWorktrees({ includeDismissed: true });
+  } finally {
+    repoOperationStatus.value = null;
+    repoToolbarBusyAction.value = null;
+  }
+}
+
+async function handleFetchRepo() {
+  repoToolbarBusyAction.value = 'fetch';
+  repoOperationStatus.value = 'Fetching from origin…';
+
+  try {
+    await refreshRepoStatus({ fetchOrigin: true });
+    await detectWorktrees({ includeDismissed: true });
+  } finally {
+    repoOperationStatus.value = null;
+    repoToolbarBusyAction.value = null;
+  }
+}
+
+async function handlePushRepo() {
+  repoToolbarBusyAction.value = 'push';
+  repoOperationStatus.value = 'Pushing current branch…';
+
+  try {
+    await pushBranch();
+    await detectWorktrees({ includeDismissed: true });
+  } finally {
+    repoOperationStatus.value = null;
+    repoToolbarBusyAction.value = null;
+  }
 }
 
 async function handleDismissDetectedWorktree(path: string) {
@@ -1339,18 +1631,18 @@ function showProjectTitleSavedToast(message: string) {
   }, 1800);
 }
 
-function toggleContentLayout() {
-  contentLayout.value = contentLayout.value === 'stacked' ? 'side-by-side' : 'stacked';
+function cycleDiffPlacement() {
+  const order: PanelLayout['diffPlacement'][] = ['top', 'right', 'bottom', 'left'];
+  const currentIndex = order.indexOf(diffPlacement.value);
+  diffPlacement.value = order[(currentIndex + 1) % order.length] ?? 'top';
+  syncGlobalLayoutPreferences(sidebarSide.value, diffPlacement.value);
   scheduleSessionSave();
 }
 
 function handleOpenWelcomeNote() {
+  isSettingsOpen.value = false;
   workspaceTabs.value = upsertWelcomeNoteTab(workspaceTabs.value, workspaceTabDefaults.value);
   activeWorkspaceTabId.value = WELCOME_NOTE_TAB_ID;
-  infoNoteLastSeenRevision.value = CURRENT_INFO_NOTE_REVISION;
-  void saveSession({
-    infoNoteLastSeenRevision: CURRENT_INFO_NOTE_REVISION,
-  });
 
   if (terminalCollapsed.value) {
     terminalCollapsed.value = false;
@@ -1366,35 +1658,39 @@ function markInfoNoteAsSeenWhenActive() {
     return;
   }
 
-  if (infoNoteLastSeenRevision.value === CURRENT_INFO_NOTE_REVISION) {
+  if (seenInfoNoteRevisions.value.includes(CURRENT_INFO_NOTE_REVISION)) {
     return;
   }
 
-  infoNoteLastSeenRevision.value = CURRENT_INFO_NOTE_REVISION;
+  seenInfoNoteRevisions.value = [...seenInfoNoteRevisions.value, CURRENT_INFO_NOTE_REVISION];
 }
 
 async function handleSaveSettings(nextSettings: ProjectSettingsFormData) {
   const trimmedTitle = nextSettings.projectTitle.trim();
-  const nextWorkspaceRepoPanelState = {
-    ...currentWorkspaceRepoPanelStateValue(),
-    fontSize: nextSettings.workspacePanelFontSize,
-  };
   const nextProjectTitlesByContext = repoPath.value
     ? {
         ...projectTitlesByContext.value,
         [getWorkspaceContextKey(getCurrentWorkspaceId(), repoPath.value)]: trimmedTitle || getRepoName(repoPath.value),
       }
     : projectTitlesByContext.value;
+  const shouldSwapSideWidths = (
+    nextSettings.sidebarSide !== sidebarSide.value
+    && (nextSettings.diffPlacement === 'left' || nextSettings.diffPlacement === 'right')
+  );
 
   projectTitlesByContext.value = nextProjectTitlesByContext;
-  contentLayout.value = nextSettings.contentLayout;
+  if (shouldSwapSideWidths) {
+    const currentSidebarWidth = sidebarWidth.value;
+    sidebarWidth.value = clampSidebarWidthValue(terminalWidth.value);
+    terminalWidth.value = clampSecondaryPaneWidthValue(currentSidebarWidth);
+  }
+  sidebarSide.value = nextSettings.sidebarSide;
+  diffPlacement.value = nextSettings.diffPlacement;
+  syncGlobalLayoutPreferences(nextSettings.sidebarSide, nextSettings.diffPlacement);
   appAppearance.value = normalizeAppAppearance(nextSettings.appAppearance);
   editorTheme.value = normalizeEditorTheme(nextSettings.editorTheme);
   applyAppTheme(appAppearance.value);
-  workspaceRepoPanelStates.value = {
-    ...workspaceRepoPanelStates.value,
-    [getCurrentWorkspaceId()]: cloneWorkspaceRepoPanelState(nextWorkspaceRepoPanelState),
-  };
+  repoPanelFontSize.value = normalizeNoteFontSize(nextSettings.workspacePanelFontSize);
   workspaceIndicatorVisibility.value = cloneWorkspaceIndicatorVisibilitySettings(nextSettings.workspaceIndicatorVisibility);
   workspaceTabDefaults.value = cloneWorkspaceTabDefaults(nextSettings.workspaceTabDefaults);
   worktreeDetectionIntervalMs.value = nextSettings.worktreeDetectionIntervalMs;
@@ -1412,17 +1708,14 @@ async function handleSaveSettings(nextSettings: ProjectSettingsFormData) {
     workspaceTabDefaults: nextSettings.workspaceTabDefaults,
     worktreeDetectionIntervalMs: nextSettings.worktreeDetectionIntervalMs,
     soundNotificationsEnabled: nextSettings.soundNotificationsEnabled,
-    infoNoteLastSeenRevision: infoNoteLastSeenRevision.value,
+    seenInfoNoteRevisions: seenInfoNoteRevisions.value,
     terminalCommandPresets: nextSettings.terminalCommandPresets,
     workspaceSessions: buildPersistedWorkspaceSessions(),
     workspaceDescriptors: workspaceDescriptors.value,
     workspaceOrder: workspaceOrder.value,
     panelLayout: buildCurrentPanelLayout(),
     panelLayoutsByWorkspace: buildPersistedPanelLayoutsByWorkspace(),
-    workspaceRepoPanelStates: {
-      ...buildPersistedWorkspaceRepoPanelStates(),
-      [getCurrentWorkspaceId()]: cloneWorkspaceRepoPanelState(nextWorkspaceRepoPanelState),
-    },
+    workspaceRepoPanelStates: buildPersistedWorkspaceRepoPanelStates(),
   });
 
   projectTitlesByContext.value = cloneProjectTitlesByContext(savedSession.projectTitlesByContext);
@@ -1434,6 +1727,7 @@ async function handleSaveSettings(nextSettings: ProjectSettingsFormData) {
   worktreeDetectionIntervalMs.value = savedSession.worktreeDetectionIntervalMs;
   dismissedWorktreePaths.value = cloneDismissedWorktreePaths(savedSession.dismissedWorktreePaths);
   soundNotificationsEnabled.value = savedSession.soundNotificationsEnabled;
+  repoPanelFontSize.value = normalizeNoteFontSize(savedSession.repoPanelFontSize);
   panelLayoutsByWorkspace.value = clonePanelLayoutsByWorkspace(savedSession.panelLayoutsByWorkspace);
   workspaceRepoPanelStates.value = cloneWorkspaceRepoPanelStates(savedSession.workspaceRepoPanelStates);
   applyWorkspacePanelLayout(savedSession.activeWorkspaceId);
@@ -1461,7 +1755,8 @@ async function activateWorkspace(nextWorkspaceId: string | null) {
   const previousWorkspaceId = getCurrentWorkspaceId();
   const nextWorkspaceDescriptor = getWorkspaceDescriptorById(nextWorkspaceId ?? GLOBAL_WORKSPACE_ID);
   const requestedRepoPath = nextWorkspaceDescriptor?.kind === 'project' ? nextWorkspaceDescriptor.repoPath : null;
-  const nextRepoPath = await isGitRepositoryPath(requestedRepoPath) ? requestedRepoPath : null;
+  const nextRepoPath = requestedRepoPath;
+  const nextRepoIsGitRepository = await isGitRepositoryPath(requestedRepoPath);
   const nextWorkspaceOrder = appendWorkspaceToOrder(nextWorkspaceId);
   const nextRepoPanelState = getWorkspaceRepoPanelStateValue(nextWorkspaceId ?? GLOBAL_WORKSPACE_ID);
   const shouldForceOpenWorkspaceDetail = previousWorkspaceId !== (nextWorkspaceDescriptor?.id ?? GLOBAL_WORKSPACE_ID)
@@ -1511,15 +1806,19 @@ async function activateWorkspace(nextWorkspaceId: string | null) {
       lastRepoPath: nextRepoPath,
     }));
     await setRepoPath(nextRepoPath, {
-      loadMode: 'branches',
+      loadMode: nextRepoIsGitRepository ? 'branches' : 'none',
     });
-    await detectWorktrees();
+    if (nextRepoIsGitRepository) {
+      await detectWorktrees();
+    } else {
+      detectedWorktrees.value = [];
+    }
 
     if (nextWorkspaceDescriptor?.id && requestedRepoPath) {
       void loadWorkspaceGitSummary(nextWorkspaceDescriptor.id, requestedRepoPath);
     }
 
-    if (nextRepoPath && shouldLoadDetailedGitStatus(nextRepoPanelStateForActivation)) {
+    if (nextRepoPath && nextRepoIsGitRepository && shouldLoadDetailedGitStatus(nextRepoPanelStateForActivation)) {
       void ensureFullStatus();
     }
   } finally {
@@ -1648,7 +1947,7 @@ async function handleRemoveWorkspace(workspaceId: string) {
     workspaceRepoPanelStates.value = cloneWorkspaceRepoPanelStates(savedSession.workspaceRepoPanelStates);
     projectTitlesByContext.value = cloneProjectTitlesByContext(savedSession.projectTitlesByContext);
     await setRepoPath(nextRepoPath, {
-      loadMode: 'branches',
+      loadMode: (nextRepoPath && await isGitRepositoryPath(nextRepoPath)) ? 'branches' : 'none',
     });
 
     if (nextActiveWorkspaceId !== GLOBAL_WORKSPACE_ID && nextRepoPath) {
@@ -1672,6 +1971,7 @@ function buildWorkspaceSummaryPlaceholder() {
     changedCount: null,
     untrackedCount: null,
     conflictedCount: null,
+    worktreeRole: null,
   };
 }
 
@@ -1744,6 +2044,122 @@ async function handleChangeWorkspaceRepo(workspaceId: string) {
 
   void loadWorkspaceGitSummary(workspaceId, nextRepoPath);
   showProjectTitleSavedToast('Workspace repository updated');
+}
+
+async function handleMergeWorkspaceWorktree(workspaceId: string) {
+  const workspaceDescriptor = getWorkspaceDescriptorById(workspaceId);
+  const targetRepoPath = workspaceDescriptor?.kind === 'project' ? workspaceDescriptor.repoPath : null;
+
+  if (!targetRepoPath) {
+    return;
+  }
+
+  repoOperationStatus.value = 'Merging into primary branch…';
+
+  try {
+    const result = await mergeWorktreeIntoPrimaryBranch(targetRepoPath);
+
+    if (!result) {
+      return;
+    }
+
+    const primaryWorkspace = ensureProjectWorkspace(result.primaryRepoPath);
+    gitRepositoryValidityByPath.value = {
+      ...gitRepositoryValidityByPath.value,
+      [result.primaryRepoPath]: true,
+    };
+    void loadWorkspaceGitSummary(workspaceId, targetRepoPath);
+    void loadWorkspaceGitSummary(primaryWorkspace.id, result.primaryRepoPath);
+    await detectWorktrees({ includeDismissed: true });
+  } finally {
+    repoOperationStatus.value = null;
+  }
+}
+
+async function handleRemoveWorkspaceWorktree(workspaceId: string) {
+  const workspaceDescriptor = getWorkspaceDescriptorById(workspaceId);
+  const targetRepoPath = workspaceDescriptor?.kind === 'project' ? workspaceDescriptor.repoPath : null;
+
+  if (!targetRepoPath || !window.bridgegit?.git) {
+    return;
+  }
+
+  const removingCurrentWorkspace = workspaceId === getCurrentWorkspaceId();
+
+  if (removingCurrentWorkspace) {
+    const worktrees = await window.bridgegit.git.worktrees(targetRepoPath);
+    const primaryRepoPath = worktrees.find((worktree) => !worktree.bare)?.path ?? null;
+
+    if (primaryRepoPath && !areRepoPathsEquivalent(primaryRepoPath, targetRepoPath)) {
+      const primaryWorkspace = ensureProjectWorkspace(primaryRepoPath);
+      await activateWorkspace(primaryWorkspace.id);
+    }
+  }
+
+  repoOperationStatus.value = 'Removing worktree…';
+
+  try {
+    const result = await removeWorktree(targetRepoPath);
+
+    if (!result) {
+      return;
+    }
+
+    await handleRemoveWorkspace(workspaceId);
+
+    const primaryWorkspace = ensureProjectWorkspace(result.primaryRepoPath);
+    gitRepositoryValidityByPath.value = {
+      ...gitRepositoryValidityByPath.value,
+      [result.primaryRepoPath]: true,
+    };
+    void loadWorkspaceGitSummary(primaryWorkspace.id, result.primaryRepoPath);
+    await detectWorktrees({ includeDismissed: true });
+  } finally {
+    repoOperationStatus.value = null;
+  }
+}
+
+async function handleRemoveWorkspaceWorktreeAndDeleteBranch(workspaceId: string) {
+  const workspaceDescriptor = getWorkspaceDescriptorById(workspaceId);
+  const targetRepoPath = workspaceDescriptor?.kind === 'project' ? workspaceDescriptor.repoPath : null;
+
+  if (!targetRepoPath || !window.bridgegit?.git) {
+    return;
+  }
+
+  const removingCurrentWorkspace = workspaceId === getCurrentWorkspaceId();
+
+  if (removingCurrentWorkspace) {
+    const worktrees = await window.bridgegit.git.worktrees(targetRepoPath);
+    const primaryRepoPath = worktrees.find((worktree) => !worktree.bare)?.path ?? null;
+
+    if (primaryRepoPath && !areRepoPathsEquivalent(primaryRepoPath, targetRepoPath)) {
+      const primaryWorkspace = ensureProjectWorkspace(primaryRepoPath);
+      await activateWorkspace(primaryWorkspace.id);
+    }
+  }
+
+  repoOperationStatus.value = 'Removing worktree and branch…';
+
+  try {
+    const result = await removeWorktreeAndDeleteBranch(targetRepoPath);
+
+    if (!result) {
+      return;
+    }
+
+    await handleRemoveWorkspace(workspaceId);
+
+    const primaryWorkspace = ensureProjectWorkspace(result.primaryRepoPath);
+    gitRepositoryValidityByPath.value = {
+      ...gitRepositoryValidityByPath.value,
+      [result.primaryRepoPath]: true,
+    };
+    void loadWorkspaceGitSummary(primaryWorkspace.id, result.primaryRepoPath);
+    await detectWorktrees({ includeDismissed: true });
+  } finally {
+    repoOperationStatus.value = null;
+  }
 }
 
 function handleReorderWorkspaces(nextWorkspaceIds: string[]) {
@@ -2020,6 +2436,80 @@ async function handleCheckout(branchName: string) {
   await checkoutBranch(branchName);
 }
 
+async function handleCreateBranch(
+  branchName: string,
+  placement: 'current-repo' | 'new-repo' = 'current-repo',
+) {
+  if (!branchName.trim()) {
+    return;
+  }
+
+  const result = await createBranch(branchName, { placement });
+
+  if (!result?.repoPath) {
+    return;
+  }
+
+  if (placement === 'current-repo' || areRepoPathsEquivalent(result.repoPath, repoPath.value)) {
+    return;
+  }
+
+  dismissedWorktreePaths.value = dismissedWorktreePaths.value.filter((path) => (
+    !areRepoPathsEquivalent(path, result.repoPath)
+  ));
+  gitRepositoryValidityByPath.value = {
+    ...gitRepositoryValidityByPath.value,
+    [result.repoPath]: true,
+  };
+  await handleSelectRepo(result.repoPath);
+}
+
+async function handleInitRepository() {
+  if (!repoPath.value) {
+    return;
+  }
+
+  repoOperationStatus.value = 'Initializing Git repository…';
+
+  try {
+    const initialized = await initCurrentRepository();
+
+    if (!initialized) {
+      return;
+    }
+
+    gitRepositoryValidityByPath.value = {
+      ...gitRepositoryValidityByPath.value,
+      [repoPath.value]: true,
+    };
+
+    const currentWorkspaceId = getCurrentWorkspaceId();
+
+    if (currentWorkspaceId) {
+      void loadWorkspaceGitSummary(currentWorkspaceId, repoPath.value);
+    }
+
+    await detectWorktrees({ includeDismissed: true });
+  } finally {
+    repoOperationStatus.value = null;
+  }
+}
+
+async function handleDeleteBranch(branchName: string) {
+  if (!branchName.trim()) {
+    return;
+  }
+
+  repoOperationStatus.value = `Deleting branch "${branchName}"…`;
+
+  try {
+    await deleteBranch(branchName);
+    await detectWorktrees({ includeDismissed: true });
+  } finally {
+    repoOperationStatus.value = null;
+  }
+}
+
 async function handleDiscardFile(change: GitChange) {
   await discardFile(change);
 }
@@ -2063,7 +2553,7 @@ async function handleStageCurrentAndAdvance() {
   }
 }
 
-watch([sidebarWidth, terminalHeight, terminalWidth, contentLayout, sidebarCollapsed, diffCollapsed, terminalCollapsed], () => {
+watch([sidebarWidth, terminalHeight, terminalWidth, sidebarSide, diffPlacement, sidebarCollapsed, diffCollapsed, terminalCollapsed], () => {
   scheduleSessionSave();
 });
 
@@ -2109,12 +2599,13 @@ watch(
         changedCount: status.value ? status.value.staged.length + status.value.unstaged.length + status.value.conflicted.length : null,
         untrackedCount: status.value ? status.value.untracked.length : null,
         conflictedCount: status.value ? status.value.conflicted.length : null,
+        worktreeRole: workspaceGitSummaryById.value[getCurrentWorkspaceId()]?.worktreeRole ?? null,
       },
     };
   },
 );
 
-watch(infoNoteLastSeenRevision, () => {
+watch(seenInfoNoteRevisions, () => {
   scheduleSessionSave();
 });
 
@@ -2147,7 +2638,7 @@ onMounted(async () => {
 
     initialSession = await saveSession({
       terminalCwd: initialSession.terminalCwd ?? onboardingCwd,
-      infoNoteLastSeenRevision: initialSession.infoNoteLastSeenRevision,
+      seenInfoNoteRevisions: initialSession.seenInfoNoteRevisions,
       workspaceSessions: buildOnboardingWorkspaceSessions(
         initialSession.lastRepoPath,
         onboardingCwd,
@@ -2155,6 +2646,14 @@ onMounted(async () => {
       ),
     });
   }
+
+  initialSession = {
+    ...initialSession,
+    workspaceSessions: refreshWelcomeNoteTabs(
+      initialSession.workspaceSessions,
+      initialSession.workspaceTabDefaults,
+    ),
+  };
 
   soundNotificationsEnabled.value = initialSession.soundNotificationsEnabled;
   projectTitlesByContext.value = cloneProjectTitlesByContext(initialSession.projectTitlesByContext);
@@ -2165,6 +2664,7 @@ onMounted(async () => {
   workspaceTabDefaults.value = cloneWorkspaceTabDefaults(initialSession.workspaceTabDefaults);
   worktreeDetectionIntervalMs.value = initialSession.worktreeDetectionIntervalMs;
   dismissedWorktreePaths.value = cloneDismissedWorktreePaths(initialSession.dismissedWorktreePaths);
+  repoPanelFontSize.value = normalizeNoteFontSize(initialSession.repoPanelFontSize);
   recentRepos.value = initialSession.recentRepos;
   activeWorkspaceId.value = initialSession.activeWorkspaceId;
   workspaceDescriptors.value = cloneWorkspaceDescriptors(initialSession.workspaceDescriptors);
@@ -2173,7 +2673,7 @@ onMounted(async () => {
   workspaceRepoPanelStates.value = cloneWorkspaceRepoPanelStates(initialSession.workspaceRepoPanelStates);
   terminalCommandPresets.value = initialSession.terminalCommandPresets;
   workspaceSessions.value = cloneWorkspaceSessions(initialSession.workspaceSessions);
-  infoNoteLastSeenRevision.value = initialSession.infoNoteLastSeenRevision;
+  seenInfoNoteRevisions.value = cloneSeenInfoNoteRevisions(initialSession.seenInfoNoteRevisions);
   sidebarWidth.value = initialSession.panelLayout.sidebarWidth;
   applyWorkspaceSession(initialSession.activeWorkspaceId ?? GLOBAL_WORKSPACE_ID);
   workspaceRecentActivityByTabId.value = {
@@ -2186,7 +2686,8 @@ onMounted(async () => {
   const requestedInitialRepoPath = initialWorkspaceDescriptor?.kind === 'project'
     ? initialWorkspaceDescriptor.repoPath
     : null;
-  const initialRepoPath = await isGitRepositoryPath(requestedInitialRepoPath) ? requestedInitialRepoPath : null;
+  const initialRepoPath = requestedInitialRepoPath;
+  const initialRepoIsGitRepository = await isGitRepositoryPath(requestedInitialRepoPath);
   const initialRepoPanelState = getWorkspaceRepoPanelStateValue(initialSession.activeWorkspaceId ?? GLOBAL_WORKSPACE_ID);
   void loadAllWorkspaceGitSummaries();
 
@@ -2201,11 +2702,15 @@ onMounted(async () => {
 
     if (initialRepoPath) {
       await setRepoPath(initialRepoPath, {
-        loadMode: 'branches',
+        loadMode: initialRepoIsGitRepository ? 'branches' : 'none',
       });
-      await detectWorktrees();
+      if (initialRepoIsGitRepository) {
+        await detectWorktrees();
+      } else {
+        detectedWorktrees.value = [];
+      }
 
-      if (shouldLoadDetailedGitStatus(initialRepoPanelState)) {
+      if (initialRepoIsGitRepository && shouldLoadDetailedGitStatus(initialRepoPanelState)) {
         void ensureFullStatus();
       }
     } else {
@@ -2260,11 +2765,15 @@ onBeforeUnmount(() => {
           :detected-worktree="activeDetectedWorktree"
           :status="status"
           :branches="branches"
+          :is-git-repository="currentRepoIsGitRepository"
           :log="log"
           :is-history-open="isCommitHistoryOpen"
           :selected-path="selectedPath"
           :is-loading="isLoading"
+          :toolbar-busy-action="repoToolbarBusyAction"
           :error="error"
+          :error-detail="errorDetail"
+          :operation-status="repoOperationStatus"
           :commit-message="commitMessage"
           :has-unread-info="hasUnreadInfoNote"
           :can-collapse="canCollapseSidebar"
@@ -2277,8 +2786,13 @@ onBeforeUnmount(() => {
           @rename-workspace="handleRenameWorkspace"
           @remove-workspace="handleRemoveWorkspace"
           @change-workspace-repo="handleChangeWorkspaceRepo"
+          @merge-worktree="handleMergeWorkspaceWorktree"
+          @remove-worktree="handleRemoveWorkspaceWorktree"
+          @remove-worktree-and-delete-branch="handleRemoveWorkspaceWorktreeAndDeleteBranch"
           @reorder-workspaces="handleReorderWorkspaces"
           @update:repo-panel-state="updateCurrentWorkspaceRepoPanelState($event)"
+          @fetch="handleFetchRepo"
+          @push="handlePushRepo"
           @refresh="handleRefreshRepo"
           @toggle-history="handleToggleCommitHistory"
           @toggle-collapse="togglePanel('sidebar')"
@@ -2288,6 +2802,9 @@ onBeforeUnmount(() => {
           @unstage="unstageFiles"
           @discard-file="handleDiscardFile"
           @checkout="handleCheckout"
+          @create-branch="handleCreateBranch"
+          @init-git="handleInitRepository"
+          @delete-branch="handleDeleteBranch"
           @add-detected-worktree="handleAddDetectedWorktree"
           @dismiss-detected-worktree="handleDismissDetectedWorktree"
           @update:commit-message="commitMessage = $event"
@@ -2297,13 +2814,16 @@ onBeforeUnmount(() => {
 
       <button
         v-if="showShellDivider"
-        class="app__divider app__divider--vertical"
+        class="app__divider app__divider--shell app__divider--vertical"
         type="button"
         aria-label="Resize git sidebar"
         @pointerdown="startResize('sidebar', $event)"
       />
 
-      <section ref="contentRef" class="app__content">
+      <section
+        ref="contentRef"
+        class="app__content"
+      >
         <div v-if="!diffCollapsed" class="app__surface app__surface--diff">
           <DiffViewer
             :repo-path="repoPath"
@@ -2337,8 +2857,8 @@ onBeforeUnmount(() => {
 
         <button
           v-if="showContentDivider"
-          class="app__divider"
-          :class="contentLayout === 'stacked' ? 'app__divider--horizontal' : 'app__divider--content-vertical'"
+          class="app__divider app__divider--content"
+          :class="isDiffSplitHorizontal ? 'app__divider--content-vertical' : 'app__divider--horizontal'"
           type="button"
           aria-label="Resize right pane split"
           @pointerdown="startResize('content', $event)"
@@ -2374,7 +2894,7 @@ onBeforeUnmount(() => {
         <div v-if="!hasVisibleRightPanels" class="app__surface app__surface--empty">
           <div class="app__empty-state">
             <span class="app__empty-eyebrow">Panels</span>
-            <h2 class="app__empty-title">Diff and workspace are collapsed</h2>
+            <h2 class="app__empty-title">Diff and tabs are collapsed</h2>
             <p class="app__empty-copy">
               Restore a panel from the footer or use its keyboard shortcut.
             </p>
@@ -2389,26 +2909,31 @@ onBeforeUnmount(() => {
       :repo-name="repoName"
       :changed-count="changedCount"
       :info-message="infoMessage"
-      :content-layout="contentLayout"
+      :diff-placement="diffPlacement"
       :collapsed-panels="collapsedPanels"
       :terminal-tab-indicators="terminalTabIndicators"
       :repo-dock-summary="repoDockSummary"
-      @toggle-layout="toggleContentLayout"
+      @cycle-diff-placement="cycleDiffPlacement"
       @toggle-panel="togglePanel"
     />
 
     <ProjectSettingsDialog
       v-model="isSettingsOpen"
       :project-title="currentProjectTitle"
-      :content-layout="contentLayout"
+      :app-version="CURRENT_APP_VERSION"
+      :info-note-revision="CURRENT_INFO_NOTE_REVISION"
+      :has-unread-info-note="hasUnreadInfoNote"
+      :sidebar-side="sidebarSide"
+      :diff-placement="diffPlacement"
       :app-appearance="appAppearance"
       :editor-theme="editorTheme"
-      :workspace-panel-font-size="currentWorkspaceRepoPanelState.fontSize"
+      :workspace-panel-font-size="repoPanelFontSize"
       :workspace-indicator-visibility="workspaceIndicatorVisibility"
       :workspace-tab-defaults="workspaceTabDefaults"
       :worktree-detection-interval-ms="worktreeDetectionIntervalMs"
       :sound-notifications-enabled="soundNotificationsEnabled"
       :terminal-command-presets="terminalCommandPresets"
+      @open-info="handleOpenWelcomeNote"
       @save="handleSaveSettings"
     />
 
@@ -2444,22 +2969,26 @@ onBeforeUnmount(() => {
   display: grid;
   grid-template-columns: var(--shell-columns);
   grid-template-rows: var(--shell-rows);
+  grid-template-areas: var(--shell-areas);
   min-height: 0;
   gap: 3px;
 }
 
 .app__sidebar {
+  grid-area: sidebar;
   min-width: 0;
   min-height: 0;
   overflow: hidden;
 }
 
 .app__content {
+  grid-area: content;
   min-width: 0;
   min-height: 0;
   display: grid;
   grid-template-columns: var(--content-columns);
   grid-template-rows: var(--content-rows);
+  grid-template-areas: var(--content-areas);
 }
 
 .app__surface {
@@ -2473,8 +3002,17 @@ onBeforeUnmount(() => {
 }
 
 .app__surface--empty {
+  grid-area: empty;
   display: grid;
   place-items: center;
+}
+
+.app__surface--diff {
+  grid-area: diff;
+}
+
+.app__surface--terminal {
+  grid-area: terminal;
 }
 
 .app__divider {
@@ -2493,6 +3031,14 @@ onBeforeUnmount(() => {
   border-radius: 999px;
   background: linear-gradient(180deg, rgba(110, 197, 255, 0.16), rgba(110, 197, 255, 0.36));
   opacity: 0.7;
+}
+
+.app__divider--shell {
+  grid-area: shell-divider;
+}
+
+.app__divider--content {
+  grid-area: content-divider;
 }
 
 .app__divider--vertical::before {
@@ -2572,6 +3118,7 @@ onBeforeUnmount(() => {
   .app__shell {
     grid-template-columns: var(--shell-columns-mobile);
     grid-template-rows: var(--shell-rows-mobile);
+    grid-template-areas: var(--shell-areas-mobile);
   }
 
   .app__divider--vertical {

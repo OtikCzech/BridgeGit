@@ -14,8 +14,9 @@ It combines:
 - Shell tabs with multi-session support and reconnect
 - Notes tabs with Markdown source/split/preview modes plus Mermaid diagrams
 - Code editor tabs powered by CodeMirror 6
-- Ctrl/Cmd+click navigation and reference search in the editor
-- Application appearance themes and editor theme variants
+- Worktree-aware branch switching and guarded branch/worktree actions
+- Flexible layout settings for repository side and diff placement
+- Repo family focus mode for working inside one repo family
 - Custom command presets (including default Codex/Claude presets)
 - Keyboard-driven workflow for common actions
 
@@ -72,7 +73,7 @@ npm run start
 - `npm run start` – run Electron app
 - `npm run dist:win` – build Windows NSIS installer
 - `npm run dist:win:portable` – build Windows portable package
-- `npm run dist:linux` – build Linux AppImage
+
 
 ## Default Keyboard Shortcuts
 

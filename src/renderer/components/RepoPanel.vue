@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import type {
+  BranchInfo,
   BranchSummary,
   GitChange,
   GitChangeKind,
@@ -18,7 +19,7 @@ import type {
   WorkspaceOverviewItem,
   WorkspaceRepoPanelState,
 } from '../../shared/bridgegit';
-import { normalizeNoteFontSize, resolveWorkspaceFileTabType } from '../../shared/bridgegit';
+import { areRepoPathsEquivalent, normalizeNoteFontSize, resolveWorkspaceFileTabType } from '../../shared/bridgegit';
 import { SHORTCUTS } from '../shortcuts';
 
 interface Props {
@@ -34,11 +35,15 @@ interface Props {
   detectedWorktree: GitWorktreeSummary | null;
   status: GitStatusSummary | null;
   branches: BranchSummary | null;
+  isGitRepository: boolean;
   log: GitLogResult | null;
   isHistoryOpen: boolean;
   selectedPath: string | null;
   isLoading: boolean;
+  toolbarBusyAction: 'fetch' | 'push' | 'refresh' | null;
   error: string | null;
+  errorDetail: string | null;
+  operationStatus: string | null;
   commitMessage: string;
   hasUnreadInfo: boolean;
   canCollapse: boolean;
@@ -56,8 +61,13 @@ const emit = defineEmits<{
   (event: 'rename-workspace', workspaceId: string, title: string): void;
   (event: 'remove-workspace', workspaceId: string): void;
   (event: 'change-workspace-repo', workspaceId: string): void;
+  (event: 'merge-worktree', workspaceId: string): void;
+  (event: 'remove-worktree', workspaceId: string): void;
+  (event: 'remove-worktree-and-delete-branch', workspaceId: string): void;
   (event: 'reorder-workspaces', workspaceIds: string[]): void;
   (event: 'update:repo-panel-state', value: WorkspaceRepoPanelState): void;
+  (event: 'fetch'): void;
+  (event: 'push'): void;
   (event: 'refresh'): void;
   (event: 'toggle-history'): void;
   (event: 'toggle-collapse'): void;
@@ -67,6 +77,9 @@ const emit = defineEmits<{
   (event: 'unstage', files: string[]): void;
   (event: 'discard-file', change: GitChange): void;
   (event: 'checkout', branch: string): void;
+  (event: 'create-branch', branch: string, placement?: 'current-repo' | 'new-repo'): void;
+  (event: 'init-git'): void;
+  (event: 'delete-branch', branch: string): void;
   (event: 'add-detected-worktree', path: string): void;
   (event: 'dismiss-detected-worktree', path: string): void;
   (event: 'update:commit-message', value: string): void;
@@ -124,32 +137,55 @@ interface WorkspaceMenuState {
   workspaceId: string;
   title: string;
   path: string | null;
+  branch: string | null;
+  worktreeRole: 'primary' | 'linked' | null;
   x: number;
   y: number;
 }
 
+interface BranchItemMenuState {
+  branch: BranchListItem;
+  x: number;
+  y: number;
+}
+
+interface BranchListItem extends BranchInfo {
+  actionLabel: string;
+  helperText: string | null;
+  isWorktreeBranch: boolean;
+  hasWorktreeChanges: boolean;
+}
+
 type FileMenuMode = 'actions' | 'discard-confirm';
-type WorkspaceMenuMode = 'actions' | 'rename' | 'remove-confirm';
+type WorkspaceMenuMode = 'actions' | 'rename' | 'remove-confirm' | 'worktree-remove-confirm' | 'worktree-remove-delete-confirm';
+type BranchItemMenuMode = 'actions' | 'delete-confirm';
 
 const branchPickerRef = ref<HTMLElement | HTMLElement[] | null>(null);
 const branchListRef = ref<HTMLElement | HTMLElement[] | null>(null);
+const branchSearchInputRef = ref<HTMLInputElement | null>(null);
 const workspaceListRef = ref<HTMLElement | null>(null);
 const workspaceRenameInputRef = ref<HTMLInputElement | null>(null);
 const commitInputRef = ref<HTMLInputElement | null>(null);
+const filesFilterInputRef = ref<HTMLInputElement | null>(null);
 const fileMenu = ref<FileMenuState | null>(null);
 const workspaceMenu = ref<WorkspaceMenuState | null>(null);
+const branchItemMenu = ref<BranchItemMenuState | null>(null);
 const isBranchMenuOpen = ref(false);
+const isBranchCreateMode = ref(false);
 const fileMenuMode = ref<FileMenuMode>('actions');
 const workspaceMenuMode = ref<WorkspaceMenuMode>('actions');
+const branchItemMenuMode = ref<BranchItemMenuMode>('actions');
 const draggedWorkspaceId = ref<string | null>(null);
 const dropTargetWorkspaceId = ref<string | null>(null);
 const branchFilter = ref('');
 const filesFilter = ref('');
+const isFilesFilterVisible = ref(false);
 const workspaceRenameValue = ref('');
 const fileListMode = ref<FileListMode>(props.repoPanelState.files.viewMode);
 const isAllFilesExpanded = ref(props.repoPanelState.files.showAll);
 const isFilesExpanded = ref(props.repoPanelState.files.expanded);
 const isWorkspaceDetailExpanded = ref(props.repoPanelState.workspaceDetailExpanded);
+const isWorkspaceFamilyFocus = ref(props.repoPanelState.workspaceFamilyFocus);
 const collapsedSections = ref<SectionState>({ ...props.repoPanelState.files.collapsedSections });
 const repoPanelFontSize = ref(normalizeNoteFontSize(props.repoPanelState.fontSize));
 const pendingCommitFocus = ref(false);
@@ -171,6 +207,45 @@ const collapseButtonTitle = computed(() => (
     : 'Repository panel cannot be collapsed while it is the last visible panel'
 ));
 const hasWorkspaceItems = computed(() => props.workspaceItems.length > 0);
+const currentWorkspaceItem = computed(() => (
+  props.workspaceItems.find((workspace) => workspace.isCurrent) ?? props.workspaceItems[0] ?? null
+));
+
+function workspaceFamilySourceName(workspace: WorkspaceOverviewItem) {
+  if (workspace.path) {
+    return workspace.path.split(/[\\/]/).filter(Boolean).at(-1) ?? workspace.repoName ?? workspace.title;
+  }
+
+  return workspace.repoName || workspace.title;
+}
+
+function workspaceFamilyKey(workspace: WorkspaceOverviewItem) {
+  return workspaceFamilySourceName(workspace).split('.')[0]?.toLowerCase() ?? workspaceFamilySourceName(workspace).toLowerCase();
+}
+
+function workspaceFamilyLabel(workspace: WorkspaceOverviewItem) {
+  return workspaceFamilySourceName(workspace).split('.')[0] ?? workspaceFamilySourceName(workspace);
+}
+
+const currentWorkspaceFamilyKey = computed(() => (
+  currentWorkspaceItem.value ? workspaceFamilyKey(currentWorkspaceItem.value) : null
+));
+const currentWorkspaceFamilyItems = computed(() => (
+  currentWorkspaceFamilyKey.value
+    ? props.workspaceItems.filter((workspace) => workspaceFamilyKey(workspace) === currentWorkspaceFamilyKey.value)
+    : props.workspaceItems
+));
+const currentWorkspaceFamilyLabel = computed(() => (
+  currentWorkspaceItem.value ? workspaceFamilyLabel(currentWorkspaceItem.value) : 'Current repo'
+));
+const visibleWorkspaceItems = computed(() => (
+  isWorkspaceFamilyFocus.value && currentWorkspaceItem.value
+    ? [currentWorkspaceItem.value]
+    : props.workspaceItems
+));
+const shouldShowWorkspaceFamilySwitcher = computed(() => (
+  isWorkspaceFamilyFocus.value && currentWorkspaceFamilyItems.value.length > 0
+));
 
 const sections = computed<Omit<RepoSectionViewModel, 'filteredItems'>[]>(() => {
   const source = props.status;
@@ -231,15 +306,73 @@ const fileStatusIndicators = computed<FilesStatusIndicator[]>(() => [
 const currentBranchLabel = computed(() => (
   props.status?.currentBranch ?? props.branches?.current ?? 'Detached HEAD'
   ));
-const isNonGitRepository = computed(() => (
-  Boolean(props.error?.toLowerCase().includes('not a git repository'))
+const fetchTitle = computed(() => (
+  props.status?.trackingBranch
+    ? `Fetch ${props.status.trackingBranch}`
+    : 'Fetch origin'
 ));
+const pushTitle = computed(() => {
+  if (!canPush.value) {
+    return 'Push unavailable in detached HEAD';
+  }
+
+  if (!shouldHighlightPush.value) {
+    return 'Nothing to push';
+  }
+
+  if (props.status?.trackingBranch) {
+    return `Push ${props.status.trackingBranch}`;
+  }
+
+  const currentBranch = props.status?.currentBranch ?? props.branches?.current;
+
+  if (currentBranch) {
+    return `Push origin/${currentBranch} and set upstream`;
+  }
+
+  return 'Push current branch';
+});
+const aheadBehindLabel = computed(() => (
+  `+${props.status?.ahead ?? 0} / -${props.status?.behind ?? 0}`
+));
+const aheadBehindTitle = computed(() => (
+  `Ahead / behind: +${props.status?.ahead ?? 0} / -${props.status?.behind ?? 0}`
+));
+const shouldHighlightFetch = computed(() => (
+  (props.status?.behind ?? 0) > 0
+));
+const shouldHighlightPush = computed(() => (
+  (props.status?.ahead ?? 0) > 0
+));
+const canPush = computed(() => (
+  props.isGitRepository && Boolean(props.status?.currentBranch ?? props.branches?.current)
+));
+const isNonGitRepository = computed(() => (
+  !props.isGitRepository
+));
+const gitActionsEnabled = computed(() => props.isGitRepository && !props.isLoading);
 const visibleError = computed(() => (
   shouldDisplayError(props.error) ? props.error : null
+));
+const visibleErrorTitle = computed(() => (
+  shouldDisplayError(props.errorDetail) ? props.errorDetail : visibleError.value
+));
+const visibleOperationStatus = computed(() => (
+  shouldDisplayError(props.operationStatus) ? props.operationStatus : null
 ));
 const filesFilterQuery = computed(() => filesFilter.value.trim());
 const normalizedFilesFilterQuery = computed(() => filesFilterQuery.value.toLowerCase());
 const hasFilesFilter = computed(() => Boolean(filesFilterQuery.value));
+const shouldShowFilesFilterRow = computed(() => (
+  isFilesExpanded.value && (isFilesFilterVisible.value || hasFilesFilter.value)
+));
+const filesFilterToggleTitle = computed(() => {
+  if (hasFilesFilter.value) {
+    return 'Clear file filter';
+  }
+
+  return isFilesFilterVisible.value ? 'Hide file filter' : 'Show file filter';
+});
 const isAllFilesSearchMode = computed(() => hasFilesFilter.value);
 const shouldLoadAllFiles = computed(() => (
   hasRequestedAllFilesLoad.value || Boolean(filesFilterQuery.value)
@@ -247,10 +380,94 @@ const shouldLoadAllFiles = computed(() => (
 const shouldShowAllFilesSearchHint = computed(() => (
   isAllFilesSearchMode.value && filesFilterQuery.value.length < 2
 ));
+const branchFilterQuery = computed(() => branchFilter.value.trim());
+const exactBranchMatch = computed(() => (
+  (props.branches?.all ?? []).find((branch) => branch.name === branchFilterQuery.value) ?? null
+));
+const canCreateBranch = computed(() => (
+  Boolean(branchFilterQuery.value) && !exactBranchMatch.value
+));
+const branchSearchPlaceholder = computed(() => (
+  isBranchCreateMode.value ? 'New branch name' : 'Filter branches'
+));
+const branchCreateButtonTitle = computed(() => {
+  if (!isBranchCreateMode.value) {
+    return 'Create a new branch';
+  }
+
+  if (!branchFilterQuery.value) {
+    return 'Enter a new branch name';
+  }
+
+  if (exactBranchMatch.value) {
+    return 'Branch already exists';
+  }
+
+  return `Choose how to create branch "${branchFilterQuery.value}"`;
+});
+const branchCreateHint = computed(() => {
+  if (!isBranchCreateMode.value) {
+    return '';
+  }
+
+  if (!branchFilterQuery.value) {
+    return 'Type a branch name. Press Enter to create it here, or use New Repo for a separate checkout.';
+  }
+
+  if (exactBranchMatch.value) {
+    return `Branch "${exactBranchMatch.value.name}" already exists.`;
+  }
+
+  return `Press Enter to create branch "${branchFilterQuery.value}" here, or choose New Repo below.`;
+});
 
 const filteredBranches = computed(() => {
-  const searchTerm = branchFilter.value.trim().toLowerCase();
-  const branchItems = props.branches?.all ?? [];
+  const searchTerm = branchFilterQuery.value.toLowerCase();
+  const branchItems = (props.branches?.all ?? []).map<BranchListItem>((branch) => {
+    const matchingWorkspace = branch.worktreePath
+      ? props.workspaceItems.find((workspaceItem) => (
+        workspaceItem.path && areRepoPathsEquivalent(workspaceItem.path, branch.worktreePath)
+      )) ?? null
+      : null;
+    const hasWorktreeChanges = Boolean(
+      (matchingWorkspace?.changedCount ?? 0)
+      || (matchingWorkspace?.untrackedCount ?? 0)
+      || (matchingWorkspace?.conflictedCount ?? 0),
+    );
+    const worktreeRepoName = branch.worktreePath
+      ? branch.worktreePath.split(/[\\/]/).filter(Boolean).at(-1) ?? branch.worktreePath
+      : null;
+
+    if (branch.current) {
+      return {
+        ...branch,
+        actionLabel: 'Current',
+        helperText: null,
+        isWorktreeBranch: false,
+        hasWorktreeChanges: false,
+      };
+    }
+
+    if (branch.checkedOutElsewhere) {
+      return {
+        ...branch,
+        actionLabel: matchingWorkspace ? 'Switch to repo' : 'Open repo',
+        helperText: matchingWorkspace
+          ? `Checked out in ${matchingWorkspace.title}`
+          : `Checked out in ${worktreeRepoName}`,
+        isWorktreeBranch: true,
+        hasWorktreeChanges,
+      };
+    }
+
+    return {
+      ...branch,
+      actionLabel: 'Checkout',
+      helperText: null,
+      isWorktreeBranch: false,
+      hasWorktreeChanges: false,
+    };
+  });
 
   if (!searchTerm) {
     return branchItems;
@@ -583,7 +800,7 @@ function buildAllFilesTreeRows(relativePath = '', depth = 0): AllFilesTreeRow[] 
 }
 
 async function ensureDirectoryLoaded(relativePath = '') {
-  if (!props.repoPath || !window.bridgegit?.git || isNonGitRepository.value) {
+  if (!props.repoPath || !window.bridgegit?.git) {
     return;
   }
 
@@ -647,7 +864,7 @@ function toggleAllFilesDirectory(path: string) {
 }
 
 async function runAllFilesSearch(query: string) {
-  if (!props.repoPath || !window.bridgegit?.git || isNonGitRepository.value) {
+  if (!props.repoPath || !window.bridgegit?.git) {
     allFilesSearchResults.value = null;
     allFilesSearchError.value = null;
     isSearchingAllFiles.value = false;
@@ -718,17 +935,53 @@ function buildAllFilesChangeMap(nextStatus: GitStatusSummary | null): Map<string
   return changeMap;
 }
 
-function statusDotClass(change: GitChange) {
-  switch (change.type) {
-    case 'added':
+function resolveVisualSectionId(path: string): SectionId | null {
+  if (props.status?.conflicted.some((item) => item.path === path)) {
+    return 'conflicts';
+  }
+
+  if (props.status?.untracked.some((item) => item.path === path)) {
+    return 'untracked';
+  }
+
+  if (props.status?.unstaged.some((item) => item.path === path)) {
+    return 'changed';
+  }
+
+  if (props.status?.staged.some((item) => item.path === path)) {
+    return 'staged';
+  }
+
+  return null;
+}
+
+function statusDotClass(change: GitChange, sectionId?: SectionId | null) {
+  const resolvedSectionId = sectionId ?? resolveVisualSectionId(change.path);
+
+  if (change.type === 'added') {
+    return 'repo-panel__status-dot--added';
+  }
+
+  switch (resolvedSectionId) {
+    case 'staged':
+      return 'repo-panel__status-dot--staged';
+    case 'changed':
+      return 'repo-panel__status-dot--changed';
     case 'untracked':
-      return 'repo-panel__status-dot--new';
-    case 'deleted':
-      return 'repo-panel__status-dot--deleted';
-    case 'conflicted':
+      return 'repo-panel__status-dot--untracked';
+    case 'conflicts':
       return 'repo-panel__status-dot--conflict';
     default:
-      return 'repo-panel__status-dot--changed';
+      switch (change.type) {
+        case 'untracked':
+          return 'repo-panel__status-dot--untracked';
+        case 'deleted':
+          return 'repo-panel__status-dot--deleted';
+        case 'conflicted':
+          return 'repo-panel__status-dot--conflict';
+        default:
+          return 'repo-panel__status-dot--changed';
+      }
   }
 }
 
@@ -872,6 +1125,7 @@ function areRepoPanelStatesEqual(left: WorkspaceRepoPanelState, right: Workspace
   return left.fontSize === right.fontSize
     && left.historyOpen === right.historyOpen
     && left.workspaceDetailExpanded === right.workspaceDetailExpanded
+    && left.workspaceFamilyFocus === right.workspaceFamilyFocus
     && left.files.expanded === right.files.expanded
     && left.files.viewMode === right.files.viewMode
     && left.files.showAll === right.files.showAll
@@ -883,6 +1137,7 @@ function buildRepoPanelState(): WorkspaceRepoPanelState {
     fontSize: repoPanelFontSize.value,
     historyOpen: props.isHistoryOpen,
     workspaceDetailExpanded: isWorkspaceDetailExpanded.value,
+    workspaceFamilyFocus: isWorkspaceFamilyFocus.value,
     files: {
       expanded: isFilesExpanded.value,
       viewMode: fileListMode.value,
@@ -899,6 +1154,7 @@ function applyRepoPanelState(nextRepoPanelState: WorkspaceRepoPanelState) {
   isAllFilesExpanded.value = nextRepoPanelState.files.showAll;
   isFilesExpanded.value = nextRepoPanelState.files.expanded;
   isWorkspaceDetailExpanded.value = nextRepoPanelState.workspaceDetailExpanded;
+  isWorkspaceFamilyFocus.value = nextRepoPanelState.workspaceFamilyFocus;
   collapsedSections.value = cloneSectionState(nextRepoPanelState.files.collapsedSections);
   isApplyingRepoPanelState = false;
 }
@@ -1085,7 +1341,23 @@ function toggleBranchMenu() {
 
   if (!isBranchMenuOpen.value) {
     branchFilter.value = '';
+    isBranchCreateMode.value = false;
   }
+}
+
+async function toggleFilesFilter() {
+  if (isFilesFilterVisible.value) {
+    if (hasFilesFilter.value) {
+      filesFilter.value = '';
+    }
+
+    isFilesFilterVisible.value = false;
+    return;
+  }
+
+  isFilesFilterVisible.value = true;
+  await nextTick();
+  filesFilterInputRef.value?.focus({ preventScroll: true });
 }
 
 async function scrollCurrentBranchIntoView() {
@@ -1099,9 +1371,15 @@ async function scrollCurrentBranchIntoView() {
   });
 }
 
+async function focusBranchSearchInput() {
+  await nextTick();
+  branchSearchInputRef.value?.focus({ preventScroll: true });
+}
+
 function closeBranchMenu() {
   isBranchMenuOpen.value = false;
   branchFilter.value = '';
+  isBranchCreateMode.value = false;
 }
 
 function openFileMenu(event: MouseEvent, change: GitChange) {
@@ -1186,23 +1464,92 @@ function fileDiscardCopy() {
 
 function openWorkspaceMenu(event: MouseEvent, workspace: WorkspaceOverviewItem) {
   event.preventDefault();
+  openWorkspaceMenuAtPosition(event.clientX, event.clientY, workspace);
+}
+
+function openWorkspaceMenuAtPosition(x: number, y: number, workspace: WorkspaceOverviewItem) {
   closeBranchMenu();
   closeFileMenu();
+  closeBranchItemMenu();
   workspaceMenuMode.value = 'actions';
   workspaceRenameValue.value = workspace.title;
   workspaceMenu.value = {
     workspaceId: workspace.workspaceId,
     title: workspace.title,
     path: workspace.path,
-    x: event.clientX,
-    y: event.clientY,
+    branch: workspace.branch,
+    worktreeRole: workspace.worktreeRole,
+    x,
+    y,
   };
+}
+
+function handleCurrentWorkspaceMenuButtonClick(event: MouseEvent) {
+  if (!currentWorkspaceItem.value) {
+    return;
+  }
+
+  const target = event.currentTarget as HTMLElement | null;
+  const bounds = target?.getBoundingClientRect();
+  openWorkspaceMenuAtPosition(bounds?.left ?? event.clientX, bounds?.bottom ?? event.clientY, currentWorkspaceItem.value);
+}
+
+function handleWorkspaceFamilyFocusToggle() {
+  isWorkspaceFamilyFocus.value = !isWorkspaceFamilyFocus.value;
+}
+
+function compactWorkspaceLabel(workspace: WorkspaceOverviewItem) {
+  const branchLabel = workspace.branch ?? 'branch unknown';
+  const normalizedTitle = workspace.title.trim();
+  const familyTitle = currentWorkspaceItem.value ? workspaceFamilyLabel(currentWorkspaceItem.value) : '';
+
+  if (!normalizedTitle || normalizedTitle === workspace.repoName || normalizedTitle === familyTitle) {
+    return branchLabel;
+  }
+
+  return `${branchLabel} - ${normalizedTitle}`;
+}
+
+function handleWorkspaceFamilySelect(event: Event) {
+  const target = event.target as HTMLSelectElement | null;
+  const workspaceId = target?.value ?? '';
+
+  if (!workspaceId) {
+    return;
+  }
+
+  handleWorkspaceSelect(workspaceId);
 }
 
 function closeWorkspaceMenu() {
   workspaceMenu.value = null;
   workspaceMenuMode.value = 'actions';
   workspaceRenameValue.value = '';
+}
+
+function canDeleteBranch(branch: BranchListItem): boolean {
+  return !branch.current && !branch.checkedOutElsewhere;
+}
+
+function openBranchItemMenu(event: MouseEvent, branch: BranchListItem) {
+  if (!canDeleteBranch(branch)) {
+    return;
+  }
+
+  event.preventDefault();
+  closeFileMenu();
+  closeWorkspaceMenu();
+  branchItemMenuMode.value = 'actions';
+  branchItemMenu.value = {
+    branch,
+    x: event.clientX,
+    y: event.clientY,
+  };
+}
+
+function closeBranchItemMenu() {
+  branchItemMenu.value = null;
+  branchItemMenuMode.value = 'actions';
 }
 
 async function handleWorkspaceRenameStart() {
@@ -1272,6 +1619,67 @@ function handleWorkspaceRemoveStart() {
   workspaceMenuMode.value = 'remove-confirm';
 }
 
+function handleWorkspaceWorktreeMerge() {
+  if (!workspaceMenu.value) {
+    return;
+  }
+
+  emit('merge-worktree', workspaceMenu.value.workspaceId);
+  closeWorkspaceMenu();
+}
+
+function handleWorkspaceWorktreeRemove() {
+  if (!workspaceMenu.value) {
+    return;
+  }
+
+  emit('remove-worktree', workspaceMenu.value.workspaceId);
+  closeWorkspaceMenu();
+}
+
+function handleWorkspaceWorktreeRemoveStart() {
+  if (!workspaceMenu.value) {
+    return;
+  }
+
+  workspaceMenuMode.value = 'worktree-remove-confirm';
+}
+
+function handleWorkspaceWorktreeRemoveAndDeleteBranch() {
+  if (!workspaceMenu.value) {
+    return;
+  }
+
+  emit('remove-worktree-and-delete-branch', workspaceMenu.value.workspaceId);
+  closeWorkspaceMenu();
+}
+
+function handleWorkspaceWorktreeRemoveAndDeleteBranchStart() {
+  if (!workspaceMenu.value) {
+    return;
+  }
+
+  workspaceMenuMode.value = 'worktree-remove-delete-confirm';
+}
+
+function handleBranchDeleteStart() {
+  if (!branchItemMenu.value) {
+    return;
+  }
+
+  branchItemMenuMode.value = 'delete-confirm';
+}
+
+function handleBranchDelete() {
+  if (!branchItemMenu.value) {
+    return;
+  }
+
+  emit('delete-branch', branchItemMenu.value.branch.name);
+  closeBranchItemMenu();
+  closeBranchMenu();
+}
+
 function handleDocumentPointerDown(event: PointerEvent) {
   const target = event.target as Element | null;
   const branchPickerElement = getSingleElement(branchPickerRef.value);
@@ -1287,6 +1695,10 @@ function handleDocumentPointerDown(event: PointerEvent) {
   if (!target?.closest('.repo-panel__workspace-menu')) {
     closeWorkspaceMenu();
   }
+
+  if (!target?.closest('.repo-panel__branch-item-menu')) {
+    closeBranchItemMenu();
+  }
 }
 
 function handleDocumentKeydown(event: KeyboardEvent) {
@@ -1294,12 +1706,69 @@ function handleDocumentKeydown(event: KeyboardEvent) {
     closeBranchMenu();
     closeFileMenu();
     closeWorkspaceMenu();
+    closeBranchItemMenu();
   }
 }
 
-function handleBranchSelect(branchName: string) {
-  emit('checkout', branchName);
+function handleBranchSelect(branch: BranchInfo) {
+  if (branch.current) {
+    return;
+  }
+
+  if (branch.checkedOutElsewhere && branch.worktreePath) {
+    emit('select-repo', branch.worktreePath);
+    closeBranchMenu();
+    return;
+  }
+
+  emit('checkout', branch.name);
   closeBranchMenu();
+}
+
+function handleCreateBranch(placement: 'current-repo' | 'new-repo' = 'current-repo') {
+  if (!canCreateBranch.value) {
+    return;
+  }
+
+  emit('create-branch', branchFilterQuery.value, placement);
+}
+
+async function handleBranchCreateButtonClick() {
+  if (isBranchCreateMode.value) {
+    await focusBranchSearchInput();
+    return;
+  }
+
+  isBranchCreateMode.value = true;
+  branchFilter.value = '';
+  await focusBranchSearchInput();
+}
+
+function handleBranchFilterKeydown(event: KeyboardEvent) {
+  if (event.key === 'Escape' && isBranchCreateMode.value) {
+    event.preventDefault();
+    isBranchCreateMode.value = false;
+    branchFilter.value = '';
+    return;
+  }
+
+  if (event.key !== 'Enter') {
+    return;
+  }
+
+  event.preventDefault();
+
+  if (isBranchCreateMode.value) {
+    if (canCreateBranch.value) {
+      handleCreateBranch();
+    }
+
+    return;
+  }
+
+  if (exactBranchMatch.value) {
+    handleBranchSelect(exactBranchMatch.value);
+  }
 }
 
 function triggerAction(action: GroupAction, files: string[]) {
@@ -1354,6 +1823,7 @@ watch(
   () => isBranchMenuOpen.value,
   (isOpen) => {
     if (isOpen) {
+      void focusBranchSearchInput();
       void scrollCurrentBranchIntoView();
     }
   },
@@ -1364,6 +1834,15 @@ watch(
   () => {
     if (isBranchMenuOpen.value) {
       void scrollCurrentBranchIntoView();
+    }
+  },
+);
+
+watch(
+  () => props.isLoading,
+  (nextLoading, previousLoading) => {
+    if (!nextLoading && previousLoading && isBranchCreateMode.value && isBranchMenuOpen.value) {
+      closeBranchMenu();
     }
   },
 );
@@ -1408,13 +1887,24 @@ watch(
 
 watch(
   () => isFilesExpanded.value,
-  () => {
+  (isExpanded) => {
+    if (!isExpanded) {
+      isFilesFilterVisible.value = false;
+    }
+
     emitRepoPanelState();
   },
 );
 
 watch(
   () => isWorkspaceDetailExpanded.value,
+  () => {
+    emitRepoPanelState();
+  },
+);
+
+watch(
+  () => isWorkspaceFamilyFocus.value,
   () => {
     emitRepoPanelState();
   },
@@ -1606,24 +2096,74 @@ onBeforeUnmount(() => {
 
     <section v-if="hasWorkspaceItems" class="repo-panel__workspaces">
       <div class="repo-panel__workspaces-header">
-        <span class="repo-panel__label">Workspaces</span>
+        <div class="repo-panel__workspaces-heading">
+          <span class="repo-panel__label">Workspaces</span>
+          <button
+            class="repo-panel__mini-action repo-panel__mini-action--icon"
+            type="button"
+            aria-label="Open repository"
+            title="Open repository"
+            @click="emit('open-repo')"
+          >
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M4.75 6A2.75 2.75 0 0 1 7.5 3.25h3.19c.53 0 1.04.22 1.4.61l1.1 1.14h3.31A2.75 2.75 0 0 1 19.25 7.75v8.75a2.75 2.75 0 0 1-2.75 2.75h-9A2.75 2.75 0 0 1 4.75 16.5V6Zm2.75-1.25c-.69 0-1.25.56-1.25 1.25v10.5c0 .69.56 1.25 1.25 1.25h9c.69 0 1.25-.56 1.25-1.25V7.75c0-.69-.56-1.25-1.25-1.25h-3.63a.75.75 0 0 1-.54-.23L11 5.13a.75.75 0 0 0-.54-.23H7.5Z" />
+              <path d="M12 8.25a.75.75 0 0 1 .75.75v2.25H15a.75.75 0 0 1 0 1.5h-2.25V15a.75.75 0 0 1-1.5 0v-2.25H9a.75.75 0 0 1 0-1.5h2.25V9a.75.75 0 0 1 .75-.75Z" />
+            </svg>
+          </button>
+        </div>
+
         <button
           class="repo-panel__mini-action repo-panel__mini-action--icon"
+          :class="{ 'repo-panel__mini-action--active': isWorkspaceFamilyFocus }"
           type="button"
-          aria-label="Open repository"
-          title="Open repository"
-          @click="emit('open-repo')"
+          :aria-label="isWorkspaceFamilyFocus ? 'Show all workspaces' : 'Show only current repo family'"
+          :title="isWorkspaceFamilyFocus ? 'Show all workspaces' : 'Show only current repo family'"
+          @click="handleWorkspaceFamilyFocusToggle"
         >
           <svg viewBox="0 0 24 24" aria-hidden="true">
-            <path d="M4.75 6A2.75 2.75 0 0 1 7.5 3.25h3.19c.53 0 1.04.22 1.4.61l1.1 1.14h3.31A2.75 2.75 0 0 1 19.25 7.75v8.75a2.75 2.75 0 0 1-2.75 2.75h-9A2.75 2.75 0 0 1 4.75 16.5V6Zm2.75-1.25c-.69 0-1.25.56-1.25 1.25v10.5c0 .69.56 1.25 1.25 1.25h9c.69 0 1.25-.56 1.25-1.25V7.75c0-.69-.56-1.25-1.25-1.25h-3.63a.75.75 0 0 1-.54-.23L11 5.13a.75.75 0 0 0-.54-.23H7.5Z" />
-            <path d="M12 8.25a.75.75 0 0 1 .75.75v2.25H15a.75.75 0 0 1 0 1.5h-2.25V15a.75.75 0 0 1-1.5 0v-2.25H9a.75.75 0 0 1 0-1.5h2.25V9a.75.75 0 0 1 .75-.75Z" />
+            <path d="M4.75 6.75A2.75 2.75 0 0 1 7.5 4h9A2.75 2.75 0 0 1 19.25 6.75v1.14c0 .53-.19 1.03-.53 1.42l-3.97 4.47v3.08a.75.75 0 0 1-.27.58l-2.5 2.03A.75.75 0 0 1 10.75 18.9v-5.12L6.78 9.31a2.13 2.13 0 0 1-.53-1.42V6.75ZM7.5 5.5c-.69 0-1.25.56-1.25 1.25v1.14c0 .15.05.29.15.4l4.16 4.69a.75.75 0 0 1 .19.5v3.85l1-.81v-3.04a.75.75 0 0 1 .19-.5l4.16-4.69c.1-.11.15-.25.15-.4V6.75c0-.69-.56-1.25-1.25-1.25h-9Z" />
           </svg>
         </button>
       </div>
 
+      <div v-if="shouldShowWorkspaceFamilySwitcher" class="repo-panel__workspace-family-switcher">
+        <div class="repo-panel__workspace-family-summary">
+          <span class="repo-panel__workspace-family-name">{{ currentWorkspaceFamilyLabel }}</span>
+          <span class="repo-panel__workspace-family-count">{{ currentWorkspaceFamilyItems.length }} repos</span>
+        </div>
+
+        <div class="repo-panel__workspace-family-controls">
+          <select
+            class="repo-panel__workspace-family-select"
+            :value="currentWorkspaceItem?.workspaceId ?? ''"
+            @change="handleWorkspaceFamilySelect"
+          >
+            <option
+              v-for="workspace in currentWorkspaceFamilyItems"
+              :key="workspace.workspaceId"
+              :value="workspace.workspaceId"
+            >
+              {{ compactWorkspaceLabel(workspace) }}
+            </option>
+          </select>
+
+          <button
+            class="repo-panel__mini-action repo-panel__mini-action--icon"
+            type="button"
+            aria-label="Open current workspace menu"
+            title="Workspace actions"
+            @click="handleCurrentWorkspaceMenuButtonClick"
+          >
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M12 6.75a1.25 1.25 0 1 0 0-2.5 1.25 1.25 0 0 0 0 2.5Zm0 6.5a1.25 1.25 0 1 0 0-2.5 1.25 1.25 0 0 0 0 2.5Zm0 6.5a1.25 1.25 0 1 0 0-2.5 1.25 1.25 0 0 0 0 2.5Z" />
+            </svg>
+          </button>
+        </div>
+      </div>
+
       <div ref="workspaceListRef" class="repo-panel__workspace-list">
         <div
-          v-for="workspace in workspaceItems"
+          v-for="workspace in visibleWorkspaceItems"
           :key="workspace.workspaceId"
           class="repo-panel__workspace-entry"
           :class="{
@@ -1631,7 +2171,7 @@ onBeforeUnmount(() => {
             'repo-panel__workspace-entry--drop-target':
               workspace.workspaceId === dropTargetWorkspaceId && workspace.workspaceId !== draggedWorkspaceId,
           }"
-          :draggable="workspaceItems.length > 1"
+          :draggable="visibleWorkspaceItems.length > 1"
           @dragstart="handleWorkspaceDragStart($event, workspace.workspaceId)"
           @dragover="handleWorkspaceDragOver($event, workspace.workspaceId)"
           @drop.prevent="handleWorkspaceDrop(workspace.workspaceId)"
@@ -1708,115 +2248,278 @@ onBeforeUnmount(() => {
                 </div>
               </section>
 
-              <section class="repo-panel__summary">
-                <div class="repo-panel__summary-row repo-panel__summary-row--branch">
-                  <div ref="branchPickerRef" class="repo-panel__summary-branch">
-                    <button
-                      class="repo-panel__branch-button"
-                      type="button"
-                      :title="currentBranchLabel"
-                      :disabled="isLoading"
-                      :aria-expanded="isBranchMenuOpen"
-                      aria-haspopup="dialog"
-                      @click="toggleBranchMenu"
-                    >
-                      <span class="repo-panel__branch-label">
-                        {{ currentBranchLabel }}
-                      </span>
-                      <span class="repo-panel__branch-chevron" aria-hidden="true">▾</span>
-                    </button>
-
-                    <div class="repo-panel__summary-actions">
-                      <button
-                        class="repo-panel__action"
-                        :class="{ 'repo-panel__action--active': isHistoryOpen }"
-                        type="button"
-                        :disabled="isLoading"
-                        :title="historyCount
-                          ? `Commit history (${historyCount.toLocaleString()}) ${SHORTCUTS.historyOpen.display}`
-                          : `Commit history ${SHORTCUTS.historyOpen.display}`"
-                        aria-label="Toggle commit history"
-                        @click="emit('toggle-history')"
-                      >
-                        <svg viewBox="0 0 24 24" aria-hidden="true">
-                          <path
-                            d="M7.25 6.5a2.75 2.75 0 1 1 2.53 2.74v3.03h4.44a2.75 2.75 0 1 1 0 1.5H8.28V9.24A2.75 2.75 0 0 1 7.25 6.5Zm0 0a1.25 1.25 0 1 0 1.25-1.25A1.25 1.25 0 0 0 7.25 6.5Zm9.5 6.5a1.25 1.25 0 1 0 1.25-1.25A1.25 1.25 0 0 0 16.75 13Zm-9.5 4.5a2.75 2.75 0 1 1 2.53 2.74v-3.74h1.5v3.74A2.75 2.75 0 1 1 7.25 17.5Zm1.25 1.25a1.25 1.25 0 1 0 0-2.5 1.25 1.25 0 0 0 0 2.5Z"
-                          />
-                        </svg>
-                      </button>
-
-                      <button
-                        class="repo-panel__action"
-                        type="button"
-                        :disabled="isLoading"
-                        title="Refresh repository status"
-                        aria-label="Refresh repository status"
-                        @click="emit('refresh')"
-                      >
-                        <svg viewBox="0 0 24 24" aria-hidden="true">
-                          <path
-                            d="M12 4.5a7.5 7.5 0 0 1 6.43 3.64V5.25a.75.75 0 0 1 1.5 0v5.25a.75.75 0 0 1-.75.75h-5.25a.75.75 0 0 1 0-1.5h3.5A6 6 0 1 0 18 13.5a.75.75 0 0 1 1.5 0A7.5 7.5 0 1 1 12 4.5Z"
-                          />
-                        </svg>
-                      </button>
-                    </div>
-
-                    <section
-                      v-if="isBranchMenuOpen"
-                      class="repo-panel__branch-menu"
-                      role="dialog"
-                      aria-label="Branches"
-                    >
-                      <input
-                        v-model="branchFilter"
-                        class="repo-panel__branch-search"
-                        type="search"
-                        placeholder="Filter branches"
-                        autocomplete="off"
-                      />
-
-                      <div
-                        v-if="filteredBranches.length"
-                        ref="branchListRef"
-                        class="repo-panel__branch-list"
-                      >
-                        <button
-                          v-for="branch in filteredBranches"
-                          :key="branch.name"
-                          class="repo-panel__branch-item"
-                          :class="{ 'repo-panel__branch-item--active': branch.current }"
-                          type="button"
-                          :title="branch.name"
-                          @click="handleBranchSelect(branch.name)"
-                        >
-                          {{ branch.name }}
-                        </button>
-                      </div>
-
-                      <div v-else class="repo-panel__branch-empty">
-                        No branches match the current filter.
-                      </div>
-                    </section>
-                  </div>
-                </div>
-
-                <div class="repo-panel__summary-row">
-                  <span class="repo-panel__summary-label">Ahead / behind</span>
-                  <span class="repo-panel__summary-value">
-                    +{{ status?.ahead ?? 0 }} / -{{ status?.behind ?? 0 }}
+              <section
+                v-if="!props.isGitRepository"
+                class="repo-panel__commit-box repo-panel__worktree-callout"
+              >
+                <div class="repo-panel__worktree-copy">
+                  <span class="repo-panel__label">Git not initialized</span>
+                  <strong class="repo-panel__worktree-branch">
+                    This folder is not a Git repository
+                  </strong>
+                  <span class="repo-panel__worktree-path">
+                    All files works normally. Initialize Git to enable branches, status and commit flow.
                   </span>
                 </div>
 
-                <div class="repo-panel__summary-row">
-                  <span class="repo-panel__summary-label">Tracking</span>
-                  <span class="repo-panel__summary-value">
-                    {{ status?.trackingBranch ?? 'No upstream' }}
-                  </span>
+                <div class="repo-panel__worktree-actions">
+                  <button
+                    class="repo-panel__commit repo-panel__commit--active repo-panel__worktree-add"
+                    type="button"
+                    :disabled="props.isLoading"
+                    @click="emit('init-git')"
+                  >
+                    Initialize Git repository
+                  </button>
                 </div>
               </section>
 
-              <div v-if="visibleError" class="repo-panel__error">
+              <div ref="branchPickerRef" class="repo-panel__branch-block">
+                <section class="repo-panel__summary">
+                  <div class="repo-panel__summary-row repo-panel__summary-row--branch">
+                    <div class="repo-panel__summary-branch">
+                    <div class="repo-panel__summary-toolbar">
+                      <button
+                        class="repo-panel__action"
+                        :class="{ 'repo-panel__action--active': isBranchMenuOpen }"
+                        type="button"
+                        :disabled="!gitActionsEnabled"
+                        :title="props.isGitRepository
+                          ? `Switch branch (${currentBranchLabel})`
+                          : 'Initialize Git repository to enable branches'"
+                        aria-label="Switch branch"
+                        :aria-expanded="isBranchMenuOpen"
+                        aria-haspopup="dialog"
+                        @click="toggleBranchMenu"
+                      >
+                        <svg viewBox="0 0 24 24" aria-hidden="true">
+                          <path
+                            d="M6 4.25a2.75 2.75 0 1 1 2.57 2.74H10a3 3 0 0 1 3 3v3.18a2.75 2.75 0 1 1-1.5 0V10a1.5 1.5 0 0 0-1.5-1.5H8.57A2.75 2.75 0 1 1 6 4.25Zm1.25 0a1.25 1.25 0 1 0 1.25-1.25 1.25 1.25 0 0 0-1.25 1.25Zm8.25 11a1.25 1.25 0 1 0 1.25 1.25 1.25 1.25 0 0 0-1.25-1.25ZM7.25 19.5a1.25 1.25 0 1 0 1.25-1.25 1.25 1.25 0 0 0-1.25 1.25Z"
+                          />
+                        </svg>
+                      </button>
+
+                      <span
+                        class="repo-panel__summary-value repo-panel__summary-value--ahead-behind repo-panel__summary-value--counts"
+                        :title="aheadBehindTitle"
+                      >
+                        {{ aheadBehindLabel }}
+                      </span>
+
+                      <div class="repo-panel__summary-actions">
+                        <button
+                          class="repo-panel__action"
+                          :class="{ 'repo-panel__action--active': shouldHighlightFetch }"
+                          type="button"
+                          :disabled="!gitActionsEnabled"
+                          :title="props.isGitRepository ? fetchTitle : 'Initialize Git repository to enable fetch'"
+                          :aria-label="props.isGitRepository ? fetchTitle : 'Fetch unavailable until Git is initialized'"
+                          @click="emit('fetch')"
+                        >
+                          <span
+                            v-if="props.toolbarBusyAction === 'fetch'"
+                            class="repo-panel__action-loader"
+                            aria-hidden="true"
+                          />
+                          <svg v-else viewBox="0 0 24 24" aria-hidden="true">
+                            <path
+                              d="M12 4.75a.75.75 0 0 1 .75.75v8.19l2.22-2.22a.75.75 0 1 1 1.06 1.06l-3.5 3.5a.75.75 0 0 1-1.06 0l-3.5-3.5a.75.75 0 1 1 1.06-1.06l2.22 2.22V5.5a.75.75 0 0 1 .75-.75ZM6 18.5a.75.75 0 0 1 .75-.75h10.5a.75.75 0 0 1 0 1.5H6.75A.75.75 0 0 1 6 18.5Z"
+                            />
+                          </svg>
+                        </button>
+
+                        <button
+                          class="repo-panel__action"
+                          :class="{ 'repo-panel__action--dimmed': !shouldHighlightPush }"
+                          type="button"
+                          :disabled="!gitActionsEnabled || !canPush || !shouldHighlightPush"
+                          :title="pushTitle"
+                          :aria-label="pushTitle"
+                          @click="emit('push')"
+                        >
+                          <span
+                            v-if="props.toolbarBusyAction === 'push'"
+                            class="repo-panel__action-loader"
+                            aria-hidden="true"
+                          />
+                          <svg v-else viewBox="0 0 24 24" aria-hidden="true">
+                            <path
+                              d="M6 18.5a.75.75 0 0 1 .75-.75h10.5a.75.75 0 0 1 0 1.5H6.75A.75.75 0 0 1 6 18.5ZM12 4.75a.75.75 0 0 1 .75.75v8.19l2.22-2.22a.75.75 0 1 1 1.06 1.06l-3.5 3.5a.75.75 0 0 1-1.06 0l-3.5-3.5a.75.75 0 1 1 1.06-1.06l2.22 2.22V5.5a.75.75 0 0 1 .75-.75Z"
+                              transform="rotate(180 12 12)"
+                            />
+                          </svg>
+                        </button>
+
+                        <button
+                          class="repo-panel__action"
+                          :class="{ 'repo-panel__action--active': isHistoryOpen }"
+                          type="button"
+                          :disabled="!gitActionsEnabled"
+                          :title="historyCount
+                            ? `Commit history (${historyCount.toLocaleString()}) ${SHORTCUTS.historyOpen.display}`
+                            : (props.isGitRepository
+                              ? `Commit history ${SHORTCUTS.historyOpen.display}`
+                              : 'Initialize Git repository to enable history')"
+                          aria-label="Toggle commit history"
+                          @click="emit('toggle-history')"
+                        >
+                          <svg viewBox="0 0 24 24" aria-hidden="true">
+                            <path
+                              d="M7.25 6.5a2.75 2.75 0 1 1 2.53 2.74v3.03h4.44a2.75 2.75 0 1 1 0 1.5H8.28V9.24A2.75 2.75 0 0 1 7.25 6.5Zm0 0a1.25 1.25 0 1 0 1.25-1.25A1.25 1.25 0 0 0 7.25 6.5Zm9.5 6.5a1.25 1.25 0 1 0 1.25-1.25A1.25 1.25 0 0 0 16.75 13Zm-9.5 4.5a2.75 2.75 0 1 1 2.53 2.74v-3.74h1.5v3.74A2.75 2.75 0 1 1 7.25 17.5Zm1.25 1.25a1.25 1.25 0 1 0 0-2.5 1.25 1.25 0 0 0 0 2.5Z"
+                            />
+                          </svg>
+                        </button>
+
+                        <button
+                          class="repo-panel__action"
+                          type="button"
+                          :disabled="isLoading"
+                          title="Refresh repository status"
+                          aria-label="Refresh repository status"
+                          @click="emit('refresh')"
+                        >
+                          <span
+                            v-if="props.toolbarBusyAction === 'refresh'"
+                            class="repo-panel__action-loader"
+                            aria-hidden="true"
+                          />
+                          <svg v-else viewBox="0 0 24 24" aria-hidden="true">
+                            <path
+                              d="M12 4.5a7.5 7.5 0 0 1 6.43 3.64V5.25a.75.75 0 0 1 1.5 0v5.25a.75.75 0 0 1-.75.75h-5.25a.75.75 0 0 1 0-1.5h3.5A6 6 0 1 0 18 13.5a.75.75 0 0 1 1.5 0A7.5 7.5 0 1 1 12 4.5Z"
+                            />
+                          </svg>
+                        </button>
+                      </div>
+                    </div>
+
+                    </div>
+                  </div>
+                </section>
+
+                <section
+                  v-if="props.isGitRepository && isBranchMenuOpen"
+                  class="repo-panel__branch-menu"
+                  role="dialog"
+                  aria-label="Branches"
+                >
+                  <div class="repo-panel__branch-search-row">
+                    <input
+                      ref="branchSearchInputRef"
+                      v-model="branchFilter"
+                      class="repo-panel__branch-search"
+                      type="search"
+                      :placeholder="branchSearchPlaceholder"
+                      autocomplete="off"
+                      spellcheck="false"
+                      @keydown="handleBranchFilterKeydown"
+                    />
+
+                    <button
+                      class="repo-panel__action"
+                      :class="{ 'repo-panel__action--active': isBranchCreateMode }"
+                      type="button"
+                      :disabled="isLoading"
+                      :title="branchCreateButtonTitle"
+                      :aria-label="branchCreateButtonTitle"
+                      @click="handleBranchCreateButtonClick"
+                    >
+                      <span
+                        v-if="isLoading && isBranchCreateMode"
+                        class="repo-panel__action-loader"
+                        aria-hidden="true"
+                      />
+                      <svg v-else viewBox="0 0 24 24" aria-hidden="true">
+                        <path
+                          d="M11.25 5.25a.75.75 0 0 1 1.5 0v6h6a.75.75 0 0 1 0 1.5h-6v6a.75.75 0 0 1-1.5 0v-6h-6a.75.75 0 0 1 0-1.5h6v-6Z"
+                        />
+                      </svg>
+                    </button>
+                  </div>
+
+                  <div v-if="isBranchCreateMode" class="repo-panel__branch-hint">
+                    {{ branchCreateHint }}
+                  </div>
+
+                  <div
+                    v-if="isBranchCreateMode && canCreateBranch"
+                    class="repo-panel__branch-create-actions"
+                  >
+                    <button
+                      class="repo-panel__branch-create-action"
+                      type="button"
+                      :disabled="isLoading"
+                      @click="handleCreateBranch('current-repo')"
+                    >
+                      Create Here
+                    </button>
+                    <button
+                      class="repo-panel__branch-create-action repo-panel__branch-create-action--primary"
+                      type="button"
+                      :disabled="isLoading"
+                      @click="handleCreateBranch('new-repo')"
+                    >
+                      New Repo
+                    </button>
+                  </div>
+
+                  <div
+                    v-if="!isBranchCreateMode && filteredBranches.length"
+                    ref="branchListRef"
+                    class="repo-panel__branch-list"
+                  >
+                    <button
+                      v-for="branch in filteredBranches"
+                      :key="branch.name"
+                      class="repo-panel__branch-item"
+                      :class="{
+                        'repo-panel__branch-item--active': branch.current,
+                        'repo-panel__branch-item--external': branch.checkedOutElsewhere,
+                      }"
+                      type="button"
+                      :title="branch.helperText ? `${branch.name} — ${branch.helperText}` : branch.name"
+                      :disabled="branch.current"
+                      @click="handleBranchSelect(branch)"
+                      @contextmenu="openBranchItemMenu($event, branch)"
+                    >
+                      <span class="repo-panel__branch-item-main">
+                        <span
+                          v-if="branch.isWorktreeBranch"
+                          class="repo-panel__branch-item-icon"
+                          :class="{ 'repo-panel__branch-item-icon--dirty': branch.hasWorktreeChanges }"
+                          aria-hidden="true"
+                        >
+                          <svg viewBox="0 0 24 24">
+                            <path
+                              d="M7.25 6.5a2.75 2.75 0 1 1 2.53 2.74v3.03h4.44a2.75 2.75 0 1 1 0 1.5H8.28V9.24A2.75 2.75 0 0 1 7.25 6.5Zm0 0a1.25 1.25 0 1 0 1.25-1.25A1.25 1.25 0 0 0 7.25 6.5Zm9.5 6.5a1.25 1.25 0 1 0 1.25-1.25A1.25 1.25 0 0 0 16.75 13Zm-9.5 4.5a2.75 2.75 0 1 1 2.53 2.74v-3.74h1.5v3.74A2.75 2.75 0 1 1 7.25 17.5Zm1.25 1.25a1.25 1.25 0 1 0 0-2.5 1.25 1.25 0 0 0 0 2.5Z"
+                            />
+                          </svg>
+                        </span>
+                        <span class="repo-panel__branch-item-name">{{ branch.name }}</span>
+                      </span>
+                    </button>
+                  </div>
+
+                  <div v-else-if="!isBranchCreateMode" class="repo-panel__branch-empty">
+                    No branches match the current filter.
+                  </div>
+                </section>
+              </div>
+
+              <div
+                v-if="visibleError"
+                class="repo-panel__error"
+                :title="visibleErrorTitle ?? undefined"
+              >
                 {{ visibleError }}
+              </div>
+
+              <div
+                v-if="visibleOperationStatus"
+                class="repo-panel__status-line"
+                :title="visibleOperationStatus"
+              >
+                <span class="repo-panel__action-loader" aria-hidden="true" />
+                <span>{{ visibleOperationStatus }}</span>
               </div>
 
               <div class="repo-panel__files-toolbar-stack">
@@ -1849,28 +2552,45 @@ onBeforeUnmount(() => {
                       </span>
                     </span>
                   </button>
-                  <div v-if="isFilesExpanded" class="repo-panel__view-toggle" role="group" aria-label="File list view mode">
+                  <div v-if="isFilesExpanded" class="repo-panel__files-toolbar-actions">
+                    <div class="repo-panel__view-toggle" role="group" aria-label="File list view mode">
+                      <button
+                        class="repo-panel__view-button"
+                        :class="{ 'repo-panel__view-button--active': fileListMode === 'list' }"
+                        type="button"
+                        @click="fileListMode = 'list'"
+                      >
+                        List
+                      </button>
+                      <button
+                        class="repo-panel__view-button"
+                        :class="{ 'repo-panel__view-button--active': fileListMode === 'tree' }"
+                        type="button"
+                        @click="fileListMode = 'tree'"
+                      >
+                        Tree
+                      </button>
+                    </div>
                     <button
-                      class="repo-panel__view-button"
-                      :class="{ 'repo-panel__view-button--active': fileListMode === 'list' }"
+                      class="repo-panel__mini-action repo-panel__mini-action--icon"
+                      :class="{ 'repo-panel__action--active': isFilesFilterVisible || hasFilesFilter }"
                       type="button"
-                      @click="fileListMode = 'list'"
+                      :title="filesFilterToggleTitle"
+                      :aria-label="filesFilterToggleTitle"
+                      @click="toggleFilesFilter"
                     >
-                      List
-                    </button>
-                    <button
-                      class="repo-panel__view-button"
-                      :class="{ 'repo-panel__view-button--active': fileListMode === 'tree' }"
-                      type="button"
-                      @click="fileListMode = 'tree'"
-                    >
-                      Tree
+                      <svg viewBox="0 0 24 24" aria-hidden="true">
+                        <path
+                          d="M10.5 4a6.5 6.5 0 1 1-4.85 10.83l-2.12 2.12a.75.75 0 1 1-1.06-1.06l2.12-2.12A6.5 6.5 0 0 1 10.5 4Zm0 1.5a5 5 0 1 0 0 10 5 5 0 0 0 0-10Z"
+                        />
+                      </svg>
                     </button>
                   </div>
                 </div>
 
-                <div v-if="isFilesExpanded" class="repo-panel__files-filter-row">
+                <div v-if="shouldShowFilesFilterRow" class="repo-panel__files-filter-row">
                   <input
+                    ref="filesFilterInputRef"
                     v-model="filesFilter"
                     class="repo-panel__files-filter"
                     type="search"
@@ -1901,11 +2621,11 @@ onBeforeUnmount(() => {
 
                     <div class="repo-panel__group-actions">
                       <button
-                        v-if="!isNonGitRepository && !isAllFilesSearchMode && !shouldLoadAllFiles"
+                        v-if="!isAllFilesSearchMode && !shouldLoadAllFiles"
                         class="repo-panel__mini-action repo-panel__mini-action--icon"
                         type="button"
-                        aria-label="Load repository files"
-                        title="Load repository files"
+                        aria-label="Load files"
+                        title="Load files"
                         @click.stop="requestAllFilesLoad"
                       >
                         <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -1926,12 +2646,8 @@ onBeforeUnmount(() => {
 
                   <div v-if="!isAllFilesExpanded" />
 
-                  <div v-else-if="isNonGitRepository" class="repo-panel__clean">
-                    All files is available only for Git repositories.
-                  </div>
-
                   <div v-else-if="shouldShowAllFilesSearchHint" class="repo-panel__clean">
-                    Type at least 2 characters to search all repository files.
+                    Type at least 2 characters to search files.
                   </div>
 
                   <div v-else-if="visibleAllFilesSearchError" class="repo-panel__error">
@@ -1989,7 +2705,7 @@ onBeforeUnmount(() => {
                   </ul>
 
                   <div v-else-if="isAllFilesSearchMode" class="repo-panel__clean">
-                    No repository files match the current filter.
+                    No files match the current filter.
                   </div>
 
                   <div v-else-if="allFilesRootError" class="repo-panel__error">
@@ -2061,13 +2777,13 @@ onBeforeUnmount(() => {
                   </ul>
 
                   <div v-else class="repo-panel__clean">
-                    No repository files found.
+                    No files found.
                   </div>
                 </section>
 
                 <template v-if="!areFileDetailsLoaded">
                   <div v-if="isNonGitRepository" class="repo-panel__clean">
-                    Change tracking is available only for Git repositories.
+                    Change tracking requires a Git repository.
                   </div>
 
                   <div v-else class="repo-panel__clean">
@@ -2180,7 +2896,7 @@ onBeforeUnmount(() => {
                             <span class="repo-panel__file-name">{{ fileName(item.path) }}</span>
                             <span class="repo-panel__file-directory">{{ fileDirectory(item.path) }}</span>
                           </span>
-                          <span class="repo-panel__status-dot" :class="statusDotClass(item)" aria-hidden="true" />
+                          <span class="repo-panel__status-dot" :class="statusDotClass(item, section.id)" aria-hidden="true" />
                         </button>
                       </li>
                     </ul>
@@ -2215,7 +2931,7 @@ onBeforeUnmount(() => {
                           <span
                             v-if="row.item"
                             class="repo-panel__status-dot"
-                            :class="statusDotClass(row.item)"
+                            :class="statusDotClass(row.item, section.id)"
                             aria-hidden="true"
                           />
                         </button>
@@ -2319,18 +3035,51 @@ onBeforeUnmount(() => {
           class="repo-panel__file-menu-item"
           type="button"
           role="menuitem"
-          @click="handleWorkspaceRepoChange"
+          @click="handleWorkspaceRenameStart"
         >
-          Change repository folder…
+          Rename
         </button>
         <button
           class="repo-panel__file-menu-item"
           type="button"
           role="menuitem"
-          @click="handleWorkspaceRenameStart"
+          @click="handleWorkspaceRepoChange"
         >
-          Rename
+          Change repository folder…
         </button>
+        <div
+          v-if="workspaceMenu.worktreeRole === 'linked'"
+          class="repo-panel__menu-divider"
+          aria-hidden="true"
+        />
+        <button
+          v-if="workspaceMenu.worktreeRole === 'linked'"
+          class="repo-panel__file-menu-item"
+          type="button"
+          role="menuitem"
+          @click="handleWorkspaceWorktreeMerge"
+        >
+          Merge into primary branch
+        </button>
+        <button
+          v-if="workspaceMenu.worktreeRole === 'linked'"
+          class="repo-panel__file-menu-item repo-panel__file-menu-item--danger"
+          type="button"
+          role="menuitem"
+          @click="handleWorkspaceWorktreeRemoveStart"
+        >
+          Remove worktree
+        </button>
+        <button
+          v-if="workspaceMenu.worktreeRole === 'linked'"
+          class="repo-panel__file-menu-item repo-panel__file-menu-item--danger"
+          type="button"
+          role="menuitem"
+          @click="handleWorkspaceWorktreeRemoveAndDeleteBranchStart"
+        >
+          Remove worktree and delete branch
+        </button>
+        <div class="repo-panel__menu-divider" aria-hidden="true" />
         <button
           class="repo-panel__file-menu-item repo-panel__file-menu-item--danger"
           type="button"
@@ -2376,6 +3125,55 @@ onBeforeUnmount(() => {
       </form>
 
       <div v-else class="repo-panel__workspace-remove-confirm">
+        <template v-if="workspaceMenuMode === 'worktree-remove-confirm'">
+          <p class="repo-panel__workspace-remove-copy">
+            Remove worktree <strong>{{ workspaceMenu.title }}</strong>?
+          </p>
+          <p class="repo-panel__workspace-remove-note">
+            Removes the linked checkout folder from disk and this repo from the sidebar.
+          </p>
+          <div class="repo-panel__workspace-rename-actions">
+            <button
+              class="repo-panel__file-menu-item repo-panel__file-menu-item--danger"
+              type="button"
+              @click="handleWorkspaceWorktreeRemove"
+            >
+              Remove worktree
+            </button>
+            <button
+              class="repo-panel__file-menu-item"
+              type="button"
+              @click="closeWorkspaceMenu"
+            >
+              Cancel
+            </button>
+          </div>
+        </template>
+        <template v-else-if="workspaceMenuMode === 'worktree-remove-delete-confirm'">
+          <p class="repo-panel__workspace-remove-copy">
+            Remove worktree <strong>{{ workspaceMenu.title }}</strong> and delete branch <strong>{{ workspaceMenu.branch ?? 'unknown' }}</strong>?
+          </p>
+          <p class="repo-panel__workspace-remove-note">
+            Safe only. The primary repo must already be on its primary branch, and this branch must already be merged.
+          </p>
+          <div class="repo-panel__workspace-rename-actions">
+            <button
+              class="repo-panel__file-menu-item repo-panel__file-menu-item--danger"
+              type="button"
+              @click="handleWorkspaceWorktreeRemoveAndDeleteBranch"
+            >
+              Remove and delete branch
+            </button>
+            <button
+              class="repo-panel__file-menu-item"
+              type="button"
+              @click="closeWorkspaceMenu"
+            >
+              Cancel
+            </button>
+          </div>
+        </template>
+        <template v-else>
         <p class="repo-panel__workspace-remove-copy">
           Remove <strong>{{ workspaceMenu.title }}</strong> from the workspace list?
         </p>
@@ -2394,6 +3192,51 @@ onBeforeUnmount(() => {
             class="repo-panel__file-menu-item"
             type="button"
             @click="closeWorkspaceMenu"
+          >
+            Cancel
+          </button>
+        </div>
+        </template>
+      </div>
+    </div>
+
+    <div
+      v-if="branchItemMenu"
+      class="repo-panel__file-menu repo-panel__branch-item-menu"
+      :style="{ left: `${branchItemMenu.x}px`, top: `${branchItemMenu.y}px` }"
+      role="menu"
+      aria-label="Branch actions"
+    >
+      <template v-if="branchItemMenuMode === 'actions'">
+        <button
+          class="repo-panel__file-menu-item repo-panel__file-menu-item--danger"
+          type="button"
+          role="menuitem"
+          @click="handleBranchDeleteStart"
+        >
+          Delete branch
+        </button>
+      </template>
+
+      <div v-else class="repo-panel__workspace-remove-confirm">
+        <p class="repo-panel__workspace-remove-copy">
+          Delete branch <strong>{{ branchItemMenu.branch.name }}</strong>?
+        </p>
+        <p class="repo-panel__workspace-remove-note">
+          Deletes only the local branch. Git will refuse if it is not safely merged yet.
+        </p>
+        <div class="repo-panel__workspace-rename-actions">
+          <button
+            class="repo-panel__file-menu-item repo-panel__file-menu-item--danger"
+            type="button"
+            @click="handleBranchDelete"
+          >
+            Delete branch
+          </button>
+          <button
+            class="repo-panel__file-menu-item"
+            type="button"
+            @click="closeBranchItemMenu"
           >
             Cancel
           </button>
@@ -2530,6 +3373,66 @@ onBeforeUnmount(() => {
   margin-right: 10px;
   padding-inline: var(--repo-panel-content-inset);
   box-sizing: border-box;
+}
+
+.repo-panel__workspaces-heading {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.repo-panel__workspace-family-switcher {
+  display: grid;
+  gap: 8px;
+  margin-right: 10px;
+  padding-inline: var(--repo-panel-content-inset);
+  box-sizing: border-box;
+}
+
+.repo-panel__workspace-family-summary {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+}
+
+.repo-panel__workspace-family-name {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: calc(0.76rem * var(--repo-panel-scale));
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.repo-panel__workspace-family-count {
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: calc(0.72rem * var(--repo-panel-scale));
+  white-space: nowrap;
+}
+
+.repo-panel__workspace-family-controls {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.repo-panel__workspace-family-select {
+  width: 100%;
+  min-width: 0;
+  padding: 0.58rem 0.72rem;
+  border: 1px solid var(--border-subtle);
+  border-radius: 10px;
+  background: var(--repo-panel-input-bg);
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: calc(0.76rem * var(--repo-panel-scale));
 }
 
 .repo-panel__workspace-list {
@@ -2766,7 +3669,7 @@ onBeforeUnmount(() => {
   overflow: hidden;
   margin: 0;
   font-family: var(--font-display);
-  font-size: calc(1.06rem * var(--repo-panel-scale));
+  font-size: calc(0.76rem * var(--repo-panel-scale));
   font-weight: 700;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -2797,6 +3700,9 @@ onBeforeUnmount(() => {
 }
 
 .repo-panel__project-settings--info-unread {
+  border-color: rgba(255, 176, 102, 0.34);
+  background: rgba(255, 176, 102, 0.12);
+  box-shadow: 0 0 0 1px rgba(255, 176, 102, 0.08), 0 0 18px rgba(255, 176, 102, 0.18);
   color: #ffb066;
 }
 
@@ -2835,6 +3741,15 @@ onBeforeUnmount(() => {
   fill: currentColor;
 }
 
+.repo-panel__action-loader {
+  width: 14px;
+  height: 14px;
+  border: 1.5px solid rgba(127, 142, 164, 0.22);
+  border-top-color: currentColor;
+  border-radius: 999px;
+  animation: repo-panel-spin 700ms linear infinite;
+}
+
 .repo-panel__action--active {
   border-color: rgba(110, 197, 255, 0.34);
   background: var(--repo-panel-button-active-bg);
@@ -2842,12 +3757,23 @@ onBeforeUnmount(() => {
   opacity: 1;
 }
 
+.repo-panel__action--dimmed {
+  color: var(--text-dim);
+  opacity: 0.38;
+}
+
+.repo-panel__branch-block {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+}
+
 .repo-panel__summary {
   display: grid;
-  gap: 8px;
+  gap: 6px;
   min-width: 0;
   width: 100%;
-  padding: 0 0 10px;
+  padding: 0 0 8px;
   border-bottom: 1px solid rgba(108, 124, 148, 0.14);
   box-sizing: border-box;
 }
@@ -2910,8 +3836,6 @@ onBeforeUnmount(() => {
 
 .repo-panel__summary-row--branch {
   grid-template-columns: minmax(0, 1fr);
-  position: relative;
-  z-index: 2;
 }
 
 .repo-panel__summary-row:not(:last-child) {
@@ -2920,18 +3844,25 @@ onBeforeUnmount(() => {
 
 .repo-panel__summary-branch {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: center;
   gap: 8px;
   min-width: 0;
   position: relative;
   overflow: visible;
 }
 
+.repo-panel__summary-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  width: 100%;
+}
+
 .repo-panel__summary-actions {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
+  margin-left: auto;
 }
 
 .repo-panel__summary-value {
@@ -2946,54 +3877,37 @@ onBeforeUnmount(() => {
   overflow: hidden;
 }
 
+.repo-panel__summary-value--ahead-behind {
+  color: var(--text-primary);
+  font-size: calc(0.7rem * var(--repo-panel-scale));
+  font-weight: 400;
+}
+
+.repo-panel__summary-value--counts {
+  padding-inline: 2px;
+  text-align: left;
+  flex: 0 0 auto;
+}
+
 .repo-panel__select {
   width: 100%;
   min-width: 0;
 }
 
-.repo-panel__branch-button {
-  display: inline-flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  width: 100%;
-  min-width: 0;
-  padding: var(--repo-panel-item-pad-y) var(--repo-panel-control-pad-x);
-  border: 1px solid var(--border-subtle);
-  border-radius: 12px;
-  background: var(--repo-panel-input-bg);
-  color: var(--text-primary);
-  font-family: var(--font-mono);
-  font-size: calc(0.82rem * var(--repo-panel-scale));
-  line-height: 1.2;
-}
-
-.repo-panel__branch-label {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.repo-panel__branch-chevron {
-  color: var(--text-dim);
-  font-size: calc(0.74rem * var(--repo-panel-scale));
-  flex: 0 0 auto;
-}
-
 .repo-panel__branch-menu {
-  position: absolute;
-  top: calc(100% + 8px);
-  left: 0;
-  right: 0;
-  z-index: 45;
   display: grid;
-  gap: 8px;
-  padding: var(--repo-panel-card-pad);
-  border: 1px solid var(--border-strong);
-  border-radius: 14px;
-  background: var(--repo-panel-menu-bg);
-  box-shadow: 0 18px 38px rgba(0, 0, 0, 0.34);
+  gap: 6px;
+  padding: 0 2px 2px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  font-size: calc(0.76rem * var(--repo-panel-scale));
+}
+
+.repo-panel__branch-menu input,
+.repo-panel__branch-menu button {
+  font: inherit;
 }
 
 .repo-panel__branch-search {
@@ -3003,16 +3917,58 @@ onBeforeUnmount(() => {
   border-radius: 10px;
   background: var(--repo-panel-input-bg);
   color: var(--text-primary);
+  font-size: calc(0.76rem * var(--repo-panel-scale));
+  line-height: 1.2;
+}
+
+.repo-panel__branch-search-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.repo-panel__branch-hint {
+  color: var(--text-dim);
+  font-size: calc(0.74rem * var(--repo-panel-scale));
+  line-height: 1.3;
+}
+
+.repo-panel__branch-create-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.repo-panel__branch-create-action {
+  min-height: 34px;
+  border: 1px solid var(--border-muted);
+  border-radius: 10px;
+  background: var(--repo-panel-input-bg);
+  color: var(--text-secondary);
+  transition:
+    background 140ms ease,
+    border-color 140ms ease,
+    color 140ms ease;
+}
+
+.repo-panel__branch-create-action:hover {
+  border-color: var(--border-strong);
+  color: var(--text-primary);
+}
+
+.repo-panel__branch-create-action--primary {
+  color: var(--text-primary);
 }
 
 .repo-panel__branch-list {
   display: grid;
   gap: 6px;
-  max-height: 220px;
-  overflow: auto;
 }
 
 .repo-panel__branch-item {
+  display: flex;
+  align-items: center;
   padding: var(--repo-panel-item-pad-y) var(--repo-panel-control-pad-x);
   border: 1px solid transparent;
   border-radius: 10px;
@@ -3024,10 +3980,57 @@ onBeforeUnmount(() => {
   text-align: left;
 }
 
+.repo-panel__branch-item:disabled {
+  cursor: default;
+  opacity: 1;
+}
+
 .repo-panel__branch-item--active,
 .repo-panel__branch-item:hover {
   border-color: rgba(110, 197, 255, 0.24);
   background: var(--repo-panel-surface-active-bg);
+}
+
+.repo-panel__branch-item--external {
+  border-color: rgba(242, 165, 65, 0.16);
+}
+
+.repo-panel__branch-item-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.repo-panel__branch-item-main {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.repo-panel__branch-item-icon {
+  display: inline-flex;
+  width: 0.95rem;
+  height: 0.95rem;
+  flex: 0 0 auto;
+  color: rgba(170, 176, 186, 0.88);
+}
+
+.repo-panel__branch-item-icon--dirty {
+  color: rgba(242, 165, 65, 0.92);
+}
+
+.repo-panel__branch-item-icon svg {
+  width: 100%;
+  height: 100%;
+  fill: currentColor;
+}
+
+.repo-panel__branch-item-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .repo-panel__branch-empty {
@@ -3077,6 +4080,12 @@ onBeforeUnmount(() => {
 
 .repo-panel__file-menu-item--danger {
   color: #ffb3ad;
+}
+
+.repo-panel__menu-divider {
+  height: 1px;
+  margin: 4px 6px;
+  background: color-mix(in srgb, var(--border-subtle) 72%, transparent);
 }
 
 .repo-panel__workspace-rename-form {
@@ -3142,6 +4151,13 @@ onBeforeUnmount(() => {
 .repo-panel__files-toolbar-stack {
   display: grid;
   gap: 10px;
+}
+
+.repo-panel__files-toolbar-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
 }
 
 .repo-panel__files-filter-row {
@@ -3319,6 +4335,13 @@ onBeforeUnmount(() => {
   font-size: calc(0.78rem * var(--repo-panel-scale));
 }
 
+.repo-panel__mini-action--active {
+  border-color: rgba(110, 197, 255, 0.34);
+  background: var(--repo-panel-button-active-bg);
+  color: rgba(123, 208, 255, 0.94);
+  opacity: 1;
+}
+
 .repo-panel__mini-action--icon {
   display: inline-flex;
   align-items: center;
@@ -3349,9 +4372,8 @@ onBeforeUnmount(() => {
 }
 
 .repo-panel__file-main {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: start;
+  display: flex;
+  align-items: flex-start;
   gap: 10px;
   width: 100%;
   padding: var(--repo-panel-item-pad-y) var(--repo-panel-control-pad-x);
@@ -3377,6 +4399,7 @@ onBeforeUnmount(() => {
 
 .repo-panel__file-meta {
   min-width: 0;
+  flex: 1 1 auto;
   display: grid;
   gap: 2px;
 }
@@ -3403,17 +4426,28 @@ onBeforeUnmount(() => {
   height: 8px;
   border-radius: 999px;
   flex: 0 0 auto;
+  margin-left: auto;
   margin-top: 0.2rem;
 }
 
-.repo-panel__status-dot--new {
-  background: #6fe0a5;
-  box-shadow: 0 0 0 1px rgba(111, 224, 165, 0.28);
+.repo-panel__status-dot--untracked {
+  background: #7f8ea4;
+  box-shadow: 0 0 0 1px rgba(127, 142, 164, 0.22);
+}
+
+.repo-panel__status-dot--added {
+  background: #6ea7ea;
+  box-shadow: 0 0 0 1px rgba(110, 167, 234, 0.24);
+}
+
+.repo-panel__status-dot--staged {
+  background: #67c98f;
+  box-shadow: 0 0 0 1px rgba(103, 201, 143, 0.24);
 }
 
 .repo-panel__status-dot--changed {
-  background: #6cb0ff;
-  box-shadow: 0 0 0 1px rgba(108, 176, 255, 0.26);
+  background: #d59a56;
+  box-shadow: 0 0 0 1px rgba(213, 154, 86, 0.24);
 }
 
 .repo-panel__status-dot--deleted {
@@ -3468,8 +4502,7 @@ onBeforeUnmount(() => {
 }
 
 .repo-panel__tree-file {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+  display: flex;
   align-items: center;
   gap: 8px;
   background: var(--repo-panel-surface-bg);
@@ -3515,6 +4548,7 @@ onBeforeUnmount(() => {
 
 .repo-panel__tree-label {
   min-width: 0;
+  flex: 1 1 auto;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -3539,6 +4573,28 @@ onBeforeUnmount(() => {
   border-color: var(--border-subtle);
   background: var(--repo-panel-muted-surface-bg);
   color: var(--text-muted);
+}
+
+.repo-panel__status-line {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-width: 0;
+  padding: 9px var(--repo-panel-card-pad);
+  border: 1px solid var(--border-subtle);
+  border-radius: 14px;
+  background: var(--repo-panel-muted-surface-bg);
+  color: var(--text-muted);
+  font-size: calc(0.74rem * var(--repo-panel-scale));
+  line-height: 1.35;
+  box-sizing: border-box;
+}
+
+.repo-panel__status-line .repo-panel__action-loader {
+  flex: 0 0 auto;
+  width: 12px;
+  height: 12px;
 }
 
 .repo-panel__commit-row {

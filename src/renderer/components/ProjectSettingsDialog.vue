@@ -28,7 +28,11 @@ type SettingsSectionId = 'general' | 'shortcuts' | 'commands' | 'layout';
 interface Props {
   modelValue: boolean;
   projectTitle: string;
-  contentLayout: PanelLayout['contentLayout'];
+  appVersion: string;
+  infoNoteRevision: string;
+  hasUnreadInfoNote: boolean;
+  sidebarSide: PanelLayout['sidebarSide'];
+  diffPlacement: PanelLayout['diffPlacement'];
   appAppearance: AppAppearance;
   editorTheme: EditorTheme;
   workspacePanelFontSize: number;
@@ -76,7 +80,7 @@ const SETTINGS_SECTIONS: SettingsSection[] = [
   {
     id: 'layout',
     label: 'Layout',
-    copy: 'Preferred arrangement for diff and shell panels.',
+    copy: 'Preferred arrangement for repository and diff panels.',
   },
 ];
 
@@ -109,12 +113,14 @@ const props = defineProps<Props>();
 
 const emit = defineEmits<{
   'update:modelValue': [value: boolean];
+  'open-info': [];
   save: [value: ProjectSettingsFormData];
 }>();
 
 const activeSection = ref<SettingsSectionId>('general');
 const draftTitle = ref(props.projectTitle);
-const draftContentLayout = ref<PanelLayout['contentLayout']>(props.contentLayout);
+const draftSidebarSide = ref<PanelLayout['sidebarSide']>(props.sidebarSide);
+const draftDiffPlacement = ref<PanelLayout['diffPlacement']>(props.diffPlacement);
 const draftAppAppearance = ref<AppAppearance>(props.appAppearance);
 const draftEditorTheme = ref<EditorTheme>(props.editorTheme);
 const draftWorkspacePanelFontSize = ref(normalizeNoteFontSize(props.workspacePanelFontSize));
@@ -209,7 +215,8 @@ function buildCommandPreset(): TerminalCommandPreset {
 
 function resetDraft() {
   draftTitle.value = props.projectTitle;
-  draftContentLayout.value = props.contentLayout;
+  draftSidebarSide.value = props.sidebarSide;
+  draftDiffPlacement.value = props.diffPlacement;
   draftAppAppearance.value = props.appAppearance;
   draftEditorTheme.value = props.editorTheme;
   draftWorkspacePanelFontSize.value = normalizeNoteFontSize(props.workspacePanelFontSize);
@@ -290,10 +297,19 @@ watch(
 );
 
 watch(
-  () => props.contentLayout,
+  () => props.sidebarSide,
   (value) => {
     if (!props.modelValue) {
-      draftContentLayout.value = value;
+      draftSidebarSide.value = value;
+    }
+  },
+);
+
+watch(
+  () => props.diffPlacement,
+  (value) => {
+    if (!props.modelValue) {
+      draftDiffPlacement.value = value;
     }
   },
 );
@@ -393,7 +409,8 @@ async function previewNotificationSound() {
 function handleSubmit() {
   emit('save', {
     projectTitle: draftTitle.value.trim(),
-    contentLayout: draftContentLayout.value,
+    sidebarSide: draftSidebarSide.value,
+    diffPlacement: draftDiffPlacement.value,
     appAppearance: draftAppAppearance.value,
     editorTheme: draftEditorTheme.value,
     workspacePanelFontSize: normalizeNoteFontSize(draftWorkspacePanelFontSize.value),
@@ -489,9 +506,12 @@ function formatPresetTarget(target: TerminalCommandPreset['target']): string {
         aria-label="Project settings"
       >
         <header class="settings-dialog__header">
-          <div>
+          <div class="settings-dialog__header-copy">
             <p class="settings-dialog__eyebrow">Settings</p>
-            <h2 class="settings-dialog__title">Project settings</h2>
+            <div class="settings-dialog__title-row">
+              <h2 class="settings-dialog__title">Project settings</h2>
+              <code class="settings-dialog__version-badge">v{{ appVersion }}</code>
+            </div>
           </div>
 
           <button
@@ -605,6 +625,42 @@ function formatPresetTarget(target: TerminalCommandPreset['target']): string {
                 <p class="settings-dialog__hint-copy">
                   Leave the title empty to follow the current repository name automatically.
                 </p>
+              </div>
+
+              <div class="settings-dialog__hint-card">
+                <span class="settings-dialog__hint-label">About</span>
+                <div class="settings-dialog__meta-list">
+                  <div class="settings-dialog__meta-row">
+                    <span class="settings-dialog__label">BridgeGit version</span>
+                    <code class="settings-dialog__meta-value">v{{ appVersion }}</code>
+                  </div>
+                  <div class="settings-dialog__meta-row">
+                    <span class="settings-dialog__label">Message center revision</span>
+                    <code class="settings-dialog__meta-value">{{ infoNoteRevision }}</code>
+                  </div>
+                </div>
+                <div class="settings-dialog__message-list">
+                  <button class="settings-dialog__message-item" type="button" @click="emit('open-info')">
+                    <span class="settings-dialog__message-item-copyblock">
+                      <span class="settings-dialog__message-item-title">Welcome update</span>
+                      <span class="settings-dialog__message-item-copy">Bundled release note for BridgeGit v{{ appVersion }}</span>
+                    </span>
+                    <span
+                      class="settings-dialog__info-status"
+                      :class="hasUnreadInfoNote
+                        ? 'settings-dialog__info-status--unread'
+                        : 'settings-dialog__info-status--read'"
+                    >
+                      {{ hasUnreadInfoNote ? 'Unread' : 'Read' }}
+                    </span>
+                  </button>
+                </div>
+                <p class="settings-dialog__hint-copy">
+                  The in-app release note is bundled with the app version and stays highlighted in the envelope button until it is shown once.
+                </p>
+                <button class="settings-dialog__button settings-dialog__button--ghost" type="button" @click="emit('open-info')">
+                  Open message center
+                </button>
               </div>
             </section>
 
@@ -883,31 +939,83 @@ function formatPresetTarget(target: TerminalCommandPreset['target']): string {
               <header class="settings-dialog__section-header">
                 <div>
                   <p class="settings-dialog__section-eyebrow">Layout</p>
-                  <h3 class="settings-dialog__section-title">Diff and shell arrangement</h3>
+                  <h3 class="settings-dialog__section-title">Repository and diff placement</h3>
                 </div>
                 <p class="settings-dialog__section-copy">
-                  Choose the preferred split used by the right side workspace.
+                  Choose where the repository panel sits and where the diff panel should open.
                 </p>
               </header>
 
-              <div class="settings-dialog__layout-options">
-                <label
-                  class="settings-dialog__layout-card"
-                  :class="{ 'settings-dialog__layout-card--active': draftContentLayout === 'stacked' }"
-                >
-                  <input v-model="draftContentLayout" type="radio" value="stacked">
-                  <span class="settings-dialog__layout-title">Stacked</span>
-                  <span class="settings-dialog__layout-copy">Diff above shell, best for narrow windows.</span>
-                </label>
+              <div class="settings-dialog__layout-group">
+                <div class="settings-dialog__layout-group-header">
+                  <span class="settings-dialog__hint-label">Repository panel</span>
+                  <p class="settings-dialog__layout-group-copy">Choose which side the repository panel uses.</p>
+                </div>
 
-                <label
-                  class="settings-dialog__layout-card"
-                  :class="{ 'settings-dialog__layout-card--active': draftContentLayout === 'side-by-side' }"
-                >
-                  <input v-model="draftContentLayout" type="radio" value="side-by-side">
-                  <span class="settings-dialog__layout-title">Side by side</span>
-                  <span class="settings-dialog__layout-copy">Diff next to shell, best for wider screens.</span>
-                </label>
+                <div class="settings-dialog__layout-options settings-dialog__layout-options--two">
+                  <label
+                    class="settings-dialog__layout-card"
+                    :class="{ 'settings-dialog__layout-card--active': draftSidebarSide === 'left' }"
+                  >
+                    <input v-model="draftSidebarSide" type="radio" value="left">
+                    <span class="settings-dialog__layout-title">Left</span>
+                    <span class="settings-dialog__layout-copy">Keep repository navigation on the left side.</span>
+                  </label>
+
+                  <label
+                    class="settings-dialog__layout-card"
+                    :class="{ 'settings-dialog__layout-card--active': draftSidebarSide === 'right' }"
+                  >
+                    <input v-model="draftSidebarSide" type="radio" value="right">
+                    <span class="settings-dialog__layout-title">Right</span>
+                    <span class="settings-dialog__layout-copy">Move repository navigation to the right side.</span>
+                  </label>
+                </div>
+              </div>
+
+              <div class="settings-dialog__layout-group">
+                <div class="settings-dialog__layout-group-header">
+                  <span class="settings-dialog__hint-label">Diff panel</span>
+                  <p class="settings-dialog__layout-group-copy">Choose where the diff sits relative to tabs.</p>
+                </div>
+
+                <div class="settings-dialog__layout-options settings-dialog__layout-options--four">
+                  <label
+                    class="settings-dialog__layout-card"
+                    :class="{ 'settings-dialog__layout-card--active': draftDiffPlacement === 'left' }"
+                  >
+                    <input v-model="draftDiffPlacement" type="radio" value="left">
+                    <span class="settings-dialog__layout-title">Left</span>
+                    <span class="settings-dialog__layout-copy">Diff on the left, tabs on the right.</span>
+                  </label>
+
+                  <label
+                    class="settings-dialog__layout-card"
+                    :class="{ 'settings-dialog__layout-card--active': draftDiffPlacement === 'right' }"
+                  >
+                    <input v-model="draftDiffPlacement" type="radio" value="right">
+                    <span class="settings-dialog__layout-title">Right</span>
+                    <span class="settings-dialog__layout-copy">Diff on the right, tabs on the left.</span>
+                  </label>
+
+                  <label
+                    class="settings-dialog__layout-card"
+                    :class="{ 'settings-dialog__layout-card--active': draftDiffPlacement === 'top' }"
+                  >
+                    <input v-model="draftDiffPlacement" type="radio" value="top">
+                    <span class="settings-dialog__layout-title">Top</span>
+                    <span class="settings-dialog__layout-copy">Diff above tabs for vertically stacked work.</span>
+                  </label>
+
+                  <label
+                    class="settings-dialog__layout-card"
+                    :class="{ 'settings-dialog__layout-card--active': draftDiffPlacement === 'bottom' }"
+                  >
+                    <input v-model="draftDiffPlacement" type="radio" value="bottom">
+                    <span class="settings-dialog__layout-title">Bottom</span>
+                    <span class="settings-dialog__layout-copy">Diff below tabs for top-first browsing.</span>
+                  </label>
+                </div>
               </div>
 
               <div class="settings-dialog__grid">
@@ -1252,6 +1360,18 @@ function formatPresetTarget(target: TerminalCommandPreset['target']): string {
   gap: 12px;
 }
 
+.settings-dialog__header-copy {
+  display: grid;
+  gap: 6px;
+}
+
+.settings-dialog__title-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
 .settings-dialog__eyebrow,
 .settings-dialog__section-eyebrow,
 .settings-dialog__hint-label,
@@ -1269,6 +1389,20 @@ function formatPresetTarget(target: TerminalCommandPreset['target']): string {
   color: var(--text-primary);
   font-size: 1.08rem;
   font-weight: 700;
+}
+
+.settings-dialog__version-badge,
+.settings-dialog__meta-value {
+  display: inline-flex;
+  align-items: center;
+  min-height: 26px;
+  padding: 0 10px;
+  border: 1px solid rgba(108, 124, 148, 0.18);
+  border-radius: 999px;
+  background: var(--settings-key-bg);
+  color: var(--text-primary);
+  font-size: 0.78rem;
+  font-family: inherit;
 }
 
 .settings-dialog__close,
@@ -1474,6 +1608,82 @@ function formatPresetTarget(target: TerminalCommandPreset['target']): string {
 
 .settings-dialog__hint-card {
   padding: 0.8rem 0.9rem;
+}
+
+.settings-dialog__meta-list {
+  display: grid;
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.settings-dialog__meta-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.settings-dialog__message-list {
+  display: grid;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.settings-dialog__message-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  padding: 12px 14px;
+  border: 1px solid rgba(108, 124, 148, 0.14);
+  border-radius: 14px;
+  background: var(--settings-card-active-bg);
+  color: var(--text-primary);
+  text-align: left;
+  cursor: pointer;
+}
+
+.settings-dialog__message-item-copyblock {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.settings-dialog__message-item-title {
+  font-size: 0.9rem;
+  font-weight: 650;
+}
+
+.settings-dialog__message-item-copy {
+  color: var(--text-muted);
+  font-size: 0.8rem;
+  line-height: 1.4;
+}
+
+.settings-dialog__info-status {
+  display: inline-flex;
+  align-items: center;
+  min-height: 28px;
+  padding: 0.28rem 0.62rem;
+  border: 1px solid rgba(108, 124, 148, 0.18);
+  border-radius: 999px;
+  font-size: 0.76rem;
+  font-weight: 600;
+}
+
+.settings-dialog__info-status--read {
+  color: var(--text-muted);
+}
+
+.settings-dialog__info-status--unread {
+  border-color: rgba(255, 176, 102, 0.3);
+  background: rgba(255, 176, 102, 0.12);
+  color: #ffb066;
+}
+
+.settings-dialog__hint-card > .settings-dialog__button {
+  margin-top: 10px;
 }
 
 .settings-dialog__preview-card {
@@ -1697,6 +1907,23 @@ function formatPresetTarget(target: TerminalCommandPreset['target']): string {
 .settings-dialog__layout-options {
   display: grid;
   gap: 12px;
+}
+
+.settings-dialog__layout-group {
+  display: grid;
+  gap: 10px;
+}
+
+.settings-dialog__layout-group-header {
+  display: grid;
+  gap: 4px;
+}
+
+.settings-dialog__layout-group-copy {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 0.82rem;
+  line-height: 1.4;
 }
 
 .settings-dialog__shortcut-groups,
@@ -1925,7 +2152,11 @@ function formatPresetTarget(target: TerminalCommandPreset['target']): string {
   gap: 8px;
 }
 
-.settings-dialog__layout-options {
+.settings-dialog__layout-options--two {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.settings-dialog__layout-options--four {
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
@@ -2006,6 +2237,11 @@ code {
   .settings-dialog__grid,
   .settings-dialog__layout-options {
     grid-template-columns: 1fr;
+  }
+
+  .settings-dialog__meta-row {
+    align-items: start;
+    flex-direction: column;
   }
 
   .settings-dialog__section-header,

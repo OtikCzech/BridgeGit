@@ -8,10 +8,12 @@ import {
   type WorkspaceSessionsById,
   type WorkspaceTabState,
 } from '../shared/bridgegit';
+import packageJson from '../../package.json';
 import welcomeNoteContent from './assets/welcome-note.md?raw';
 
 export const WELCOME_NOTE_TAB_ID = 'note-welcome';
-export const CURRENT_INFO_NOTE_REVISION = 'welcome-0.2.1';
+export const CURRENT_APP_VERSION = packageJson.version;
+export const CURRENT_INFO_NOTE_REVISION = `welcome-${CURRENT_APP_VERSION}`;
 const WELCOME_SHELL_TAB_ID = 'shell-main';
 
 export function hasWorkspaceTabs(workspaceSessions: WorkspaceSessionsById): boolean {
@@ -76,12 +78,41 @@ export function upsertWelcomeNoteTab(
 
   return tabs.map((tab) => (
     tab.id === WELCOME_NOTE_TAB_ID && tab.type === 'note'
-      ? {
-          ...tab,
-          title: welcomeTab.title,
-          content: welcomeTab.content,
-          savedContent: welcomeTab.savedContent,
-        }
+      ? mergeWelcomeNoteTab(tab, welcomeTab)
       : tab
   ));
+}
+
+export function refreshWelcomeNoteTabs(
+  workspaceSessions: WorkspaceSessionsById,
+  workspaceTabDefaults?: WorkspaceTabDefaults,
+): WorkspaceSessionsById {
+  const welcomeTab = buildWelcomeNoteTab(workspaceTabDefaults);
+
+  return Object.fromEntries(
+    Object.entries(workspaceSessions).map(([workspaceId, workspaceSession]) => ([
+      workspaceId,
+      {
+        ...workspaceSession,
+        tabs: workspaceSession.tabs.map((tab) => (
+          tab.id === WELCOME_NOTE_TAB_ID && tab.type === 'note'
+            ? mergeWelcomeNoteTab(tab, welcomeTab)
+            : tab
+        )),
+      },
+    ])),
+  );
+}
+
+function mergeWelcomeNoteTab(
+  tab: WorkspaceNoteTabState,
+  welcomeTab: WorkspaceNoteTabState,
+): WorkspaceNoteTabState {
+  return {
+    ...tab,
+    title: welcomeTab.title,
+    filePath: welcomeTab.filePath,
+    content: welcomeTab.content,
+    savedContent: welcomeTab.savedContent,
+  };
 }

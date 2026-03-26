@@ -1,18 +1,25 @@
 import { contextBridge, ipcRenderer } from 'electron';
 import type {
   BranchSummary,
+  CreateBranchOptions,
+  CreateBranchResult,
+  DeleteBranchResult,
   GitChange,
   GitDiffMode,
   GitLogResult,
+  GitStatusRequestOptions,
   GitStatusSummary,
   GitTextSearchMatch,
   GitWorktreeSummary,
+  MergeWorktreeIntoPrimaryBranchResult,
   NoteFileHandle,
   NoteFileStat,
   PtyCreateOptions,
   PtyDataEvent,
   PtyExitEvent,
   PtySessionInfo,
+  RemoveWorktreeResult,
+  RemoveWorktreeAndDeleteBranchResult,
   RepoDirectoryEntry,
   SessionData,
 } from '../shared/bridgegit';
@@ -57,8 +64,10 @@ const bridgegitApi = {
   git: {
     isRepository: (repoPath: string) =>
       ipcRenderer.invoke('git:isRepository', repoPath) as Promise<boolean>,
-    status: (repoPath: string) =>
-      ipcRenderer.invoke('git:status', repoPath) as Promise<GitStatusSummary>,
+    initRepository: (repoPath: string) =>
+      ipcRenderer.invoke('git:initRepository', repoPath) as Promise<void>,
+    status: (repoPath: string, options?: GitStatusRequestOptions) =>
+      ipcRenderer.invoke('git:status', repoPath, options) as Promise<GitStatusSummary>,
     branches: (repoPath: string) =>
       ipcRenderer.invoke('git:branches', repoPath) as Promise<BranchSummary>,
     listDirectory: (repoPath: string, relativePath?: string) =>
@@ -87,6 +96,18 @@ const bridgegitApi = {
       ipcRenderer.invoke('git:commit', repoPath, message) as Promise<GitStatusSummary>,
     checkout: (repoPath: string, branchName: string) =>
       ipcRenderer.invoke('git:checkout', repoPath, branchName) as Promise<BranchSummary>,
+    createBranch: (repoPath: string, branchName: string, options?: CreateBranchOptions) =>
+      ipcRenderer.invoke('git:createBranch', repoPath, branchName, options) as Promise<CreateBranchResult>,
+    deleteBranch: (repoPath: string, branchName: string) =>
+      ipcRenderer.invoke('git:deleteBranch', repoPath, branchName) as Promise<DeleteBranchResult>,
+    mergeWorktreeIntoPrimaryBranch: (repoPath: string) =>
+      ipcRenderer.invoke('git:mergeWorktreeIntoPrimaryBranch', repoPath) as Promise<MergeWorktreeIntoPrimaryBranchResult>,
+    removeWorktree: (repoPath: string) =>
+      ipcRenderer.invoke('git:removeWorktree', repoPath) as Promise<RemoveWorktreeResult>,
+    removeWorktreeAndDeleteBranch: (repoPath: string) =>
+      ipcRenderer.invoke('git:removeWorktreeAndDeleteBranch', repoPath) as Promise<RemoveWorktreeAndDeleteBranchResult>,
+    push: (repoPath: string) =>
+      ipcRenderer.invoke('git:push', repoPath) as Promise<GitStatusSummary>,
   },
   terminal: {
     create: (options: PtyCreateOptions) =>

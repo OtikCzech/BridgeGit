@@ -108,6 +108,7 @@ interface PartialWorkspaceRepoPanelState {
   fontSize?: number;
   historyOpen?: boolean;
   workspaceDetailExpanded?: boolean;
+  workspaceFamilyFocus?: boolean;
   files?: PartialWorkspaceRepoPanelFilesState;
 }
 
@@ -116,6 +117,7 @@ interface LegacySessionData extends Partial<Omit<SessionData, 'workspaceSessions
   workspaceTabs?: PartialWorkspaceTabState[];
   activeWorkspaceTabId?: string | null;
   activeTerminalTabId?: string | null;
+  infoNoteLastSeenRevision?: string | null;
   workspaceSessions?: Record<string, PartialWorkspaceSessionState>;
   workspaceDescriptors?: Record<string, PartialWorkspaceDescriptor>;
   panelLayoutsByWorkspace?: Record<string, Partial<PanelLayout>>;
@@ -260,6 +262,22 @@ function normalizeRecentRepos(
       return Date.parse(right.lastUsedAt) - Date.parse(left.lastUsedAt);
     })
     .slice(0, 12);
+}
+
+function normalizeSeenInfoNoteRevisions(
+  seenInfoNoteRevisions: string[] | undefined,
+  legacyInfoNoteLastSeenRevision: string | null | undefined,
+): string[] {
+  const normalizedRevisions = (seenInfoNoteRevisions ?? [])
+    .map((revision) => revision.trim())
+    .filter((revision, index, revisions) => revision.length > 0 && revisions.indexOf(revision) === index);
+
+  if (normalizedRevisions.length > 0) {
+    return normalizedRevisions;
+  }
+
+  const legacyRevision = legacyInfoNoteLastSeenRevision?.trim();
+  return legacyRevision ? [legacyRevision] : [];
 }
 
 function normalizeWorkspaceOrder(
@@ -749,6 +767,7 @@ function normalizeWorkspaceRepoPanelState(
     fontSize: normalizeNoteFontSize(workspaceRepoPanelState?.fontSize),
     historyOpen: workspaceRepoPanelState?.historyOpen ?? false,
     workspaceDetailExpanded: workspaceRepoPanelState?.workspaceDetailExpanded ?? true,
+    workspaceFamilyFocus: workspaceRepoPanelState?.workspaceFamilyFocus ?? false,
     files: {
       expanded: workspaceRepoPanelState?.files?.expanded ?? true,
       viewMode: workspaceRepoPanelState?.files?.viewMode === 'tree' ? 'tree' : 'list',
@@ -946,6 +965,7 @@ function normalizeSession(session: LegacySessionData): SessionData {
     panelLayout: panelLayoutsByWorkspace[activeWorkspaceId] ?? fallbackPanelLayout,
     panelLayoutsByWorkspace,
     workspaceRepoPanelStates,
+    repoPanelFontSize: normalizeNoteFontSize(session.repoPanelFontSize),
     terminalCwd: fallbackCwd,
     projectTitle,
     projectTitleMode,
@@ -957,7 +977,10 @@ function normalizeSession(session: LegacySessionData): SessionData {
     worktreeDetectionIntervalMs: normalizeWorktreeDetectionInterval(session.worktreeDetectionIntervalMs),
     dismissedWorktreePaths: normalizeDismissedWorktreePaths(session.dismissedWorktreePaths),
     soundNotificationsEnabled: session.soundNotificationsEnabled ?? DEFAULT_SESSION_DATA.soundNotificationsEnabled,
-    infoNoteLastSeenRevision: session.infoNoteLastSeenRevision?.trim() || null,
+    seenInfoNoteRevisions: normalizeSeenInfoNoteRevisions(
+      session.seenInfoNoteRevisions,
+      session.infoNoteLastSeenRevision,
+    ),
     terminalCommandPresets,
     workspaceSessions,
   };

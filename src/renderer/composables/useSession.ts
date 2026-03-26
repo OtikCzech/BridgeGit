@@ -3,6 +3,7 @@ import {
   DEFAULT_SESSION_DATA,
   cloneDismissedWorktreePaths,
   cloneWorkspaceTabDefaults,
+  cloneSeenInfoNoteRevisions,
   clonePanelLayoutsByWorkspace,
   cloneProjectTitlesByContext,
   cloneWorkspaceIndicatorVisibilitySettings,
@@ -34,6 +35,7 @@ function cloneSession(session: SessionData): SessionData {
     workspaceIndicatorVisibility: cloneWorkspaceIndicatorVisibilitySettings(session.workspaceIndicatorVisibility),
     workspaceTabDefaults: cloneWorkspaceTabDefaults(session.workspaceTabDefaults),
     dismissedWorktreePaths: cloneDismissedWorktreePaths(session.dismissedWorktreePaths),
+    seenInfoNoteRevisions: cloneSeenInfoNoteRevisions(session.seenInfoNoteRevisions),
     terminalCommandPresets: cloneTerminalCommandPresets(session.terminalCommandPresets),
     workspaceSessions: cloneWorkspaceSessions(session.workspaceSessions),
   };
@@ -97,6 +99,9 @@ function mergeSession(base: SessionData, patch: SessionPatch): SessionData {
     dismissedWorktreePaths: patch.dismissedWorktreePaths
       ? cloneDismissedWorktreePaths(patch.dismissedWorktreePaths)
       : cloneDismissedWorktreePaths(base.dismissedWorktreePaths),
+    seenInfoNoteRevisions: patch.seenInfoNoteRevisions
+      ? cloneSeenInfoNoteRevisions(patch.seenInfoNoteRevisions)
+      : cloneSeenInfoNoteRevisions(base.seenInfoNoteRevisions),
     terminalCommandPresets: patch.terminalCommandPresets
       ? cloneTerminalCommandPresets(patch.terminalCommandPresets)
       : cloneTerminalCommandPresets(base.terminalCommandPresets),

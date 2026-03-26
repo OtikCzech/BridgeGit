@@ -4,7 +4,9 @@ import { execFile } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { readdir, readFile, stat, writeFile } from 'node:fs/promises';
 import { basename, dirname, extname, isAbsolute, join, resolve, win32 } from 'node:path';
+import { promisify } from 'node:util';
 import { registerGitIpcHandlers } from './git';
+import { normalizeStoredPath } from './path-utils';
 import { cleanupPtysForWebContents, registerPtyIpcHandlers } from './pty';
 import { loadSession, saveSession } from './store';
 import type { NoteFileHandle, NoteFileStat, SessionData } from '../shared/bridgegit';
@@ -34,6 +36,7 @@ const WORKSPACE_FILE_FILTERS = [
   },
 ];
 const NOTE_LINK_EXTENSIONS = new Set(['.md', '.markdown', '.txt']);
+const execFileAsync = promisify(execFile);
 
 function getPreloadPath() {
   return join(__dirname, '../preload/index.js');
@@ -62,6 +65,32 @@ function formatErrorMessage(error: unknown): string {
   }
 
   return 'Unexpected file system error.';
+}
+
+async function resolveDialogDefaultPath(defaultPath?: string | null): Promise<string | undefined> {
+  const trimmedPath = defaultPath?.trim();
+
+  if (!trimmedPath) {
+    return undefined;
+  }
+
+  if (process.platform === 'win32' && trimmedPath.startsWith('/')) {
+    try {
+      const { stdout } = await execFileAsync('wsl.exe', ['wslpath', '-w', trimmedPath], {
+        encoding: 'utf8',
+        windowsHide: true,
+      });
+      const convertedPath = stdout.trim();
+
+      if (convertedPath) {
+        return convertedPath;
+      }
+    } catch {
+      // Fall back to the generic path normalization below.
+    }
+  }
+
+  return normalizeStoredPath(trimmedPath) ?? undefined;
 }
 
 async function readNoteFileHandle(filePath: string): Promise<NoteFileHandle> {
@@ -257,7 +286,7 @@ function registerCoreIpcHandlers() {
     const options: OpenDialogOptions = {
       title: 'Open Git Repository',
       properties: ['openDirectory'],
-      defaultPath: defaultPath ?? undefined,
+      defaultPath: await resolveDialogDefaultPath(defaultPath),
     };
     const dialogWindow = getDialogWindow();
     const result = dialogWindow

@@ -1,7 +1,7 @@
 import { homedir } from 'node:os';
 
 const WSL_MOUNT_PATH_PATTERN = /^\/mnt\/([a-zA-Z])(?:\/(.*))?$/;
-const WINDOWS_WSL_UNC_PATH_PATTERN = /^\\\\wsl\.localhost\\([^\\]+)(?:\\(.*))?$/i;
+const WINDOWS_WSL_UNC_PATH_PATTERN = /^\\\\(?:wsl\.localhost|wsl\$)\\([^\\]+)(?:\\(.*))?$/i;
 
 export interface WindowsWslPath {
   distro: string;
@@ -28,6 +28,23 @@ export function parseWindowsWslPath(pathValue: string | null | undefined): Windo
     distro,
     linuxPath: normalizedSuffix ? `/${normalizedSuffix}` : '/',
   };
+}
+
+export function formatWindowsWslPath(distro: string, linuxPath: string): string {
+  const trimmedDistro = distro.trim();
+  const trimmedLinuxPath = linuxPath.trim();
+
+  if (!trimmedDistro) {
+    return '';
+  }
+
+  const normalizedLinuxPath = trimmedLinuxPath
+    .replace(/^\/+/, '')
+    .replace(/\//g, '\\');
+
+  return normalizedLinuxPath
+    ? `\\\\wsl.localhost\\${trimmedDistro}\\${normalizedLinuxPath}`
+    : `\\\\wsl.localhost\\${trimmedDistro}`;
 }
 
 export function normalizeStoredPath(pathValue: string | null | undefined): string | null {

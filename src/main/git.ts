@@ -1,23 +1,32 @@
 import { ipcMain } from 'electron';
 import { execFile } from 'node:child_process';
-import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { lstat, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join, relative, resolve } from 'node:path';
+import { join, posix as posixPath, relative, resolve, win32 as win32Path } from 'node:path';
 import { promisify } from 'node:util';
 import { simpleGit, type FileStatusResult, type SimpleGit } from 'simple-git';
-import type {
+import {
+  areRepoPathsEquivalent,
+  BranchInfo,
   BranchSummary,
+  CreateBranchOptions,
+  CreateBranchResult,
+  DeleteBranchResult,
   GitChange,
   GitChangeKind,
   GitCommitRef,
   GitDiffMode,
   GitLogResult,
+  GitStatusRequestOptions,
   GitStatusSummary,
   GitTextSearchMatch,
   GitWorktreeSummary,
+  MergeWorktreeIntoPrimaryBranchResult,
+  RemoveWorktreeResult,
+  RemoveWorktreeAndDeleteBranchResult,
   RepoDirectoryEntry,
 } from '../shared/bridgegit';
-import { normalizeStoredPath, parseWindowsWslPath } from './path-utils';
+import { formatWindowsWslPath, normalizeStoredPath, parseWindowsWslPath } from './path-utils';
 
 const execFileAsync = promisify(execFile);
 const GIT_OUTPUT_BUFFER_BYTES = 64 * 1024 * 1024;
@@ -115,6 +124,14 @@ async function runWslCommand(context: WslRepositoryContext, args: string[]): Pro
 
 async function runWslGit(context: WslRepositoryContext, args: string[]): Promise<string> {
   return runWslCommand(context, ['git', ...args]);
+}
+
+async function runGit(repository: RepositoryContext, args: string[]): Promise<string> {
+  if (repository.mode === 'wsl') {
+    return runWslGit(repository, args);
+  }
+
+  return repository.git.raw(args);
 }
 
 function normalizeDiffPath(filePath: string): string {
@@ -341,6 +358,27 @@ async function isRepository(repoPath: string): Promise<boolean> {
   }
 }
 
+async function initRepository(repoPath: string): Promise<void> {
+  const normalizedRepoPath = resolveRepoPath(repoPath);
+  const wslPath = process.platform === 'win32' ? parseWindowsWslPath(normalizedRepoPath) : null;
+
+  if (wslPath) {
+    await runWslCommand(
+      {
+        mode: 'wsl',
+        repoPath: normalizedRepoPath,
+        distro: wslPath.distro,
+        linuxPath: wslPath.linuxPath,
+      },
+      ['git', 'init'],
+    );
+    return;
+  }
+
+  const git = getGit(normalizedRepoPath);
+  await git.init();
+}
+
 function mapStatusCode(code: string): GitChangeKind {
   switch (code) {
     case 'M':
@@ -388,8 +426,8 @@ function sortAndDedupe(changes: GitChange[]): GitChange[] {
   return [...unique.values()].sort((left, right) => left.path.localeCompare(right.path));
 }
 
-function parseBranchSummary(rawBranches: string): BranchSummary {
-  const all = rawBranches
+function parseBranchList(rawBranches: string): BranchInfo[] {
+  return rawBranches
     .split('\n')
     .map((line) => line.trimEnd())
     .filter(Boolean)
@@ -399,9 +437,31 @@ function parseBranchSummary(rawBranches: string): BranchSummary {
       return {
         name,
         current,
+        checkedOutElsewhere: false,
+        worktreePath: null,
       };
     })
     .filter((branch) => branch.name && !branch.name.startsWith('('));
+}
+
+async function buildBranchSummary(
+  branches: BranchInfo[],
+  worktrees: GitWorktreeSummary[],
+): Promise<BranchSummary> {
+  const all = branches.map((branch) => {
+    const matchingWorktree = worktrees.find((worktree) => (
+      !worktree.current
+      && !worktree.detached
+      && !worktree.bare
+      && worktree.branch === branch.name
+    ));
+
+    return {
+      ...branch,
+      checkedOutElsewhere: Boolean(matchingWorktree),
+      worktreePath: matchingWorktree?.path ?? null,
+    };
+  });
 
   return {
     current: all.find((branch) => branch.current)?.name ?? null,
@@ -409,7 +469,88 @@ function parseBranchSummary(rawBranches: string): BranchSummary {
   };
 }
 
-function parseWorktreeSummary(rawWorktrees: string, currentRepoPath: string): GitWorktreeSummary[] {
+function normalizeWorktreePath(pathValue: string, repository: RepositoryContext): string | null {
+  const trimmedPath = pathValue.trim();
+
+  if (!trimmedPath) {
+    return null;
+  }
+
+  if (repository.mode === 'wsl' && process.platform === 'win32') {
+    return formatWindowsWslPath(repository.distro, trimmedPath);
+  }
+
+  return normalizeStoredPath(trimmedPath);
+}
+
+function getRepositoryPathModule(repository: RepositoryContext) {
+  if (repository.mode === 'wsl') {
+    return posixPath;
+  }
+
+  return process.platform === 'win32' ? win32Path : posixPath;
+}
+
+function branchDirectorySlug(branchName: string): string {
+  const slug = branchName
+    .replace(/\/+/g, '-')
+    .replace(/[^A-Za-z0-9._-]+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-+|-+$/g, '');
+
+  return slug || 'branch';
+}
+
+function resolveProjectWorktreeBaseName(projectName: string): string {
+  const trimmedProjectName = projectName.trim();
+  const firstDotIndex = trimmedProjectName.indexOf('.');
+
+  if (firstDotIndex <= 0) {
+    return trimmedProjectName;
+  }
+
+  return trimmedProjectName.slice(0, firstDotIndex);
+}
+
+async function getPrimaryWorktreePath(repository: RepositoryContext): Promise<string> {
+  const rawWorktrees = repository.mode === 'wsl'
+    ? await runWslGit(repository, ['worktree', 'list', '--porcelain'])
+    : await repository.git.raw(['worktree', 'list', '--porcelain']);
+  const firstWorktreeLine = rawWorktrees
+    .split('\n')
+    .find((line) => line.startsWith('worktree '));
+
+  if (!firstWorktreeLine) {
+    return repository.mode === 'wsl' ? repository.linuxPath : repository.repoPath;
+  }
+
+  const rawPath = firstWorktreeLine.slice('worktree '.length).trim();
+
+  if (repository.mode === 'wsl') {
+    return rawPath || repository.linuxPath;
+  }
+
+  return normalizeStoredPath(rawPath) ?? repository.repoPath;
+}
+
+function buildBranchCheckoutPath(
+  repository: RepositoryContext,
+  primaryWorktreePath: string,
+  branchName: string,
+): string {
+  const pathModule = getRepositoryPathModule(repository);
+  const projectParent = pathModule.dirname(primaryWorktreePath);
+  const primaryProjectName = pathModule.basename(primaryWorktreePath);
+  const projectName = resolveProjectWorktreeBaseName(primaryProjectName) || primaryProjectName;
+
+  return pathModule.join(projectParent, `${projectName}.${branchDirectorySlug(branchName)}`);
+}
+
+function parseWorktreeSummary(
+  rawWorktrees: string,
+  repository: RepositoryContext,
+  currentRepoPath: string,
+): GitWorktreeSummary[] {
   const worktrees: GitWorktreeSummary[] = [];
   const lines = rawWorktrees.split('\n');
   let path: string | null = null;
@@ -429,7 +570,7 @@ function parseWorktreeSummary(rawWorktrees: string, currentRepoPath: string): Gi
       head,
       detached,
       bare,
-      current: path === currentRepoPath,
+      current: areRepoPathsEquivalent(path, currentRepoPath),
     });
   }
 
@@ -445,7 +586,7 @@ function parseWorktreeSummary(rawWorktrees: string, currentRepoPath: string): Gi
     }
 
     if (line.startsWith('worktree ')) {
-      path = normalizeStoredPath(line.slice('worktree '.length).trim());
+      path = normalizeWorktreePath(line.slice('worktree '.length), repository);
       continue;
     }
 
@@ -560,8 +701,28 @@ function parseCommitRefs(rawRefs: string): GitCommitRef[] {
   return [...uniqueRefs.values()];
 }
 
-async function getStatusSummary(repoPath: string): Promise<GitStatusSummary> {
+async function fetchOrigin(repository: RepositoryContext): Promise<void> {
+  if (repository.mode === 'wsl') {
+    await runWslGit(repository, ['fetch', '--prune', 'origin']);
+    return;
+  }
+
+  await repository.git.raw(['fetch', '--prune', 'origin']);
+}
+
+async function getStatusSummary(
+  repoPath: string,
+  options: GitStatusRequestOptions = {},
+): Promise<GitStatusSummary> {
   const repository = await resolveRepository(repoPath);
+
+  if (options.fetchOrigin) {
+    try {
+      await fetchOrigin(repository);
+    } catch {
+      // Keep local status available even when fetching origin fails.
+    }
+  }
 
   if (repository.mode === 'wsl') {
     const rawStatus = await runWslGit(repository, ['status', '--porcelain', '-b', '-u', '--null']);
@@ -617,12 +778,23 @@ async function getStatusSummary(repoPath: string): Promise<GitStatusSummary> {
 async function getBranches(repoPath: string): Promise<BranchSummary> {
   const repository = await resolveRepository(repoPath);
   const branchArgs = ['branch', '--list', '--no-color'];
+  const worktreeArgs = ['worktree', 'list', '--porcelain'];
+  const currentRepoPath = resolveRepoPath(repoPath);
 
-  if (repository.mode === 'wsl') {
-    return parseBranchSummary(await runWslGit(repository, branchArgs));
-  }
+  const [rawBranches, rawWorktrees] = repository.mode === 'wsl'
+    ? await Promise.all([
+      runWslGit(repository, branchArgs),
+      runWslGit(repository, worktreeArgs),
+    ])
+    : await Promise.all([
+      repository.git.raw(branchArgs),
+      repository.git.raw(worktreeArgs),
+    ]);
 
-  return parseBranchSummary(await repository.git.raw(branchArgs));
+  return buildBranchSummary(
+    parseBranchList(rawBranches),
+    parseWorktreeSummary(rawWorktrees, repository, currentRepoPath),
+  );
 }
 
 function normalizeRepoRelativePath(pathValue: string | null | undefined): string {
@@ -1028,7 +1200,7 @@ async function getWorktrees(repoPath: string): Promise<GitWorktreeSummary[]> {
     ? await runWslGit(repository, worktreeArgs)
     : await repository.git.raw(worktreeArgs);
 
-  return parseWorktreeSummary(rawWorktrees, currentRepoPath);
+  return parseWorktreeSummary(rawWorktrees, repository, currentRepoPath);
 }
 
 async function getDiff(
@@ -1380,6 +1552,16 @@ async function commitChanges(repoPath: string, message: string): Promise<GitStat
 
 async function checkoutBranch(repoPath: string, branchName: string): Promise<BranchSummary> {
   const repository = await resolveRepository(repoPath);
+  const branches = await getBranches(repoPath);
+  const targetBranch = branches.all.find((branch) => branch.name === branchName) ?? null;
+
+  if (targetBranch?.checkedOutElsewhere) {
+    const detail = targetBranch.worktreePath
+      ? ` Checked out at ${targetBranch.worktreePath}.`
+      : '';
+
+    throw new Error(`Branch "${branchName}" is already open in another repo.${detail}`);
+  }
 
   if (repository.mode === 'wsl') {
     await runWslGit(repository, ['checkout', branchName]);
@@ -1390,9 +1572,339 @@ async function checkoutBranch(repoPath: string, branchName: string): Promise<Bra
   return getBranches(repoPath);
 }
 
+async function validateBranchName(repository: RepositoryContext, branchName: string): Promise<string> {
+  const trimmedBranchName = branchName.trim();
+
+  if (!trimmedBranchName) {
+    throw new Error('Branch name cannot be empty.');
+  }
+
+  try {
+    if (repository.mode === 'wsl') {
+      await runWslGit(repository, ['check-ref-format', '--branch', trimmedBranchName]);
+    } else {
+      await repository.git.raw(['check-ref-format', '--branch', trimmedBranchName]);
+    }
+  } catch {
+    throw new Error(`Invalid branch name: ${trimmedBranchName}`);
+  }
+
+  return trimmedBranchName;
+}
+
+async function createBranch(
+  repoPath: string,
+  branchName: string,
+  options: CreateBranchOptions = {},
+): Promise<CreateBranchResult> {
+  const repository = await resolveRepository(repoPath);
+  const validatedBranchName = await validateBranchName(repository, branchName.trim());
+  const placement = options.placement ?? 'current-repo';
+
+  if (placement === 'current-repo') {
+    const command = options.checkout === false
+      ? ['branch', validatedBranchName]
+      : ['checkout', '-b', validatedBranchName];
+
+    if (repository.mode === 'wsl') {
+      await runWslGit(repository, command);
+    } else {
+      await repository.git.raw(command);
+    }
+
+    return {
+      branches: await getBranches(repoPath),
+      repoPath: resolveRepoPath(repoPath),
+    };
+  }
+
+  const primaryWorktreePath = await getPrimaryWorktreePath(repository);
+  const nextRepoPath = buildBranchCheckoutPath(repository, primaryWorktreePath, validatedBranchName);
+  const command = ['worktree', 'add', '-b', validatedBranchName, nextRepoPath, 'HEAD'];
+
+  if (repository.mode === 'wsl') {
+    await runWslGit(repository, command);
+  } else {
+    await repository.git.raw(command);
+  }
+
+  return {
+    branches: await getBranches(repoPath),
+    repoPath: normalizeWorktreePath(nextRepoPath, repository) ?? resolveRepoPath(nextRepoPath),
+  };
+}
+
+async function deleteBranch(repoPath: string, branchName: string): Promise<DeleteBranchResult> {
+  const repository = await resolveRepository(repoPath);
+  const validatedBranchName = await validateBranchName(repository, branchName.trim());
+  const branches = await getBranches(repoPath);
+  const targetBranch = branches.all.find((branch) => branch.name === validatedBranchName) ?? null;
+
+  if (!targetBranch) {
+    throw new Error(`Branch "${validatedBranchName}" does not exist.`);
+  }
+
+  if (targetBranch.current) {
+    throw new Error(`Branch "${validatedBranchName}" is currently checked out.`);
+  }
+
+  if (targetBranch.checkedOutElsewhere) {
+    const detail = targetBranch.worktreePath
+      ? ` Checked out at ${targetBranch.worktreePath}.`
+      : '';
+
+    throw new Error(`Branch "${validatedBranchName}" is already open in another repo.${detail}`);
+  }
+
+  await runGit(repository, ['branch', '-d', validatedBranchName]);
+
+  return {
+    branches: await getBranches(repoPath),
+    deletedBranch: validatedBranchName,
+  };
+}
+
+interface WorktreeLifecycleContext {
+  currentRepoPath: string;
+  currentWorktree: GitWorktreeSummary;
+  primaryWorktree: GitWorktreeSummary;
+}
+
+async function resolveWorktreeLifecycleContext(repoPath: string): Promise<WorktreeLifecycleContext> {
+  const currentRepoPath = resolveRepoPath(repoPath);
+  const worktrees = await getWorktrees(currentRepoPath);
+  const currentWorktree = worktrees.find((worktree) => worktree.current) ?? null;
+  const primaryWorktree = worktrees.find((worktree) => !worktree.bare) ?? null;
+
+  if (!currentWorktree) {
+    throw new Error('The selected repository is not an active worktree.');
+  }
+
+  if (!primaryWorktree) {
+    throw new Error('Could not determine the primary repository checkout.');
+  }
+
+  return {
+    currentRepoPath,
+    currentWorktree,
+    primaryWorktree,
+  };
+}
+
+async function resolveMergeTargetBranch(repository: RepositoryContext): Promise<string> {
+  try {
+    const symbolicRef = await runGit(repository, ['symbolic-ref', '--quiet', '--short', 'refs/remotes/origin/HEAD']);
+    const normalizedRef = symbolicRef.trim();
+
+    if (normalizedRef.startsWith('origin/')) {
+      const branchName = normalizedRef.slice('origin/'.length).trim();
+
+      if (branchName) {
+        return branchName;
+      }
+    }
+  } catch {
+    // Fallback to local branch detection below.
+  }
+
+  const rawBranches = await runGit(repository, ['branch', '--list', '--no-color', 'master', 'main']);
+  const branchNames = new Set(parseBranchList(rawBranches).map((branch) => branch.name));
+
+  if (branchNames.has('main')) {
+    return 'main';
+  }
+
+  if (branchNames.has('master')) {
+    return 'master';
+  }
+
+  throw new Error('Could not determine the primary branch from origin/HEAD, main, or master.');
+}
+
+async function ensureWorktreeNodeModulesSymlinkRemoved(worktreePath: string): Promise<void> {
+  const nodeModulesPath = join(worktreePath, 'node_modules');
+
+  try {
+    const stats = await lstat(nodeModulesPath);
+
+    if (stats.isSymbolicLink()) {
+      await rm(nodeModulesPath, { recursive: true, force: true });
+    }
+  } catch (error) {
+    if (
+      error
+      && typeof error === 'object'
+      && 'code' in error
+      && (error as { code?: unknown }).code === 'ENOENT'
+    ) {
+      return;
+    }
+
+    throw error;
+  }
+}
+
+async function mergeWorktreeIntoPrimaryBranch(repoPath: string): Promise<MergeWorktreeIntoPrimaryBranchResult> {
+  const { currentRepoPath, currentWorktree, primaryWorktree } = await resolveWorktreeLifecycleContext(repoPath);
+
+  if (areRepoPathsEquivalent(currentWorktree.path, primaryWorktree.path)) {
+    throw new Error('Only linked worktree repos can be merged into the primary branch.');
+  }
+
+  const sourceStatus = await getStatusSummary(currentRepoPath);
+
+  if (!sourceStatus.isClean) {
+    throw new Error('Commit or discard changes in this worktree before merging.');
+  }
+
+  const sourceBranch = sourceStatus.currentBranch?.trim() ?? '';
+
+  if (!sourceBranch) {
+    throw new Error('Cannot merge a detached worktree.');
+  }
+
+  const primaryRepository = await resolveRepository(primaryWorktree.path);
+  const targetBranch = await resolveMergeTargetBranch(primaryRepository);
+
+  if (sourceBranch === targetBranch) {
+    throw new Error(`Branch "${sourceBranch}" is already the target branch.`);
+  }
+
+  const primaryStatus = await getStatusSummary(primaryWorktree.path);
+
+  if (!primaryStatus.isClean) {
+    throw new Error('Commit or discard changes in the primary repo before merging.');
+  }
+
+  await runGit(primaryRepository, ['checkout', targetBranch]);
+  await runGit(primaryRepository, ['merge', sourceBranch]);
+
+  return {
+    repoPath: currentRepoPath,
+    primaryRepoPath: primaryWorktree.path,
+    sourceBranch,
+    targetBranch,
+  };
+}
+
+async function removeWorktree(repoPath: string): Promise<RemoveWorktreeResult> {
+  const { currentRepoPath, currentWorktree, primaryWorktree } = await resolveWorktreeLifecycleContext(repoPath);
+
+  if (areRepoPathsEquivalent(currentWorktree.path, primaryWorktree.path)) {
+    throw new Error('The primary repo cannot be removed as a worktree.');
+  }
+
+  const currentStatus = await getStatusSummary(currentRepoPath);
+
+  if (!currentStatus.isClean) {
+    throw new Error('Commit or discard changes in this worktree before removing it.');
+  }
+
+  await ensureWorktreeNodeModulesSymlinkRemoved(currentWorktree.path);
+
+  const primaryRepository = await resolveRepository(primaryWorktree.path);
+  await runGit(primaryRepository, ['worktree', 'remove', currentWorktree.path]);
+
+  return {
+    repoPath: currentRepoPath,
+    primaryRepoPath: primaryWorktree.path,
+    removedBranch: currentStatus.currentBranch?.trim() || null,
+  };
+}
+
+async function isBranchMergedIntoTarget(
+  repository: RepositoryContext,
+  branchName: string,
+  targetBranch: string,
+): Promise<boolean> {
+  try {
+    await runGit(repository, ['merge-base', '--is-ancestor', branchName, targetBranch]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function removeWorktreeAndDeleteBranch(repoPath: string): Promise<RemoveWorktreeAndDeleteBranchResult> {
+  const { currentRepoPath, currentWorktree, primaryWorktree } = await resolveWorktreeLifecycleContext(repoPath);
+
+  if (areRepoPathsEquivalent(currentWorktree.path, primaryWorktree.path)) {
+    throw new Error('The primary repo cannot be removed as a worktree.');
+  }
+
+  const currentStatus = await getStatusSummary(currentRepoPath);
+
+  if (!currentStatus.isClean) {
+    throw new Error('Commit or discard changes in this worktree before removing it.');
+  }
+
+  const sourceBranch = currentStatus.currentBranch?.trim() ?? '';
+
+  if (!sourceBranch) {
+    throw new Error('Cannot delete a detached worktree branch.');
+  }
+
+  const primaryRepository = await resolveRepository(primaryWorktree.path);
+  const targetBranch = await resolveMergeTargetBranch(primaryRepository);
+  const primaryStatus = await getStatusSummary(primaryWorktree.path);
+
+  if (sourceBranch === targetBranch) {
+    throw new Error(`Branch "${sourceBranch}" is the primary branch and cannot be deleted.`);
+  }
+
+  if (primaryStatus.currentBranch !== targetBranch) {
+    throw new Error(`Switch the primary repo to ${targetBranch} before removing and deleting this branch.`);
+  }
+
+  const isMerged = await isBranchMergedIntoTarget(primaryRepository, sourceBranch, targetBranch);
+
+  if (!isMerged) {
+    throw new Error(`Branch "${sourceBranch}" is not safely merged into ${targetBranch}.`);
+  }
+
+  await ensureWorktreeNodeModulesSymlinkRemoved(currentWorktree.path);
+  await runGit(primaryRepository, ['worktree', 'remove', currentWorktree.path]);
+  await runGit(primaryRepository, ['branch', '-d', sourceBranch]);
+
+  return {
+    repoPath: currentRepoPath,
+    primaryRepoPath: primaryWorktree.path,
+    removedBranch: sourceBranch,
+    deletedBranch: sourceBranch,
+  };
+}
+
+async function pushCurrentBranch(repoPath: string): Promise<GitStatusSummary> {
+  const repository = await resolveRepository(repoPath);
+  const status = await getStatusSummary(repoPath);
+  const currentBranch = status.currentBranch?.trim() ?? '';
+
+  if (!currentBranch) {
+    throw new Error('Cannot push from detached HEAD.');
+  }
+
+  if (repository.mode === 'wsl') {
+    if (status.trackingBranch) {
+      await runWslGit(repository, ['push']);
+    } else {
+      await runWslGit(repository, ['push', '--set-upstream', 'origin', currentBranch]);
+    }
+  } else if (status.trackingBranch) {
+    await repository.git.push();
+  } else {
+    await repository.git.raw(['push', '--set-upstream', 'origin', currentBranch]);
+  }
+
+  return getStatusSummary(repoPath);
+}
+
 export function registerGitIpcHandlers() {
   ipcMain.handle('git:isRepository', (_event, repoPath: string) => isRepository(repoPath));
-  ipcMain.handle('git:status', (_event, repoPath: string) => getStatusSummary(repoPath));
+  ipcMain.handle('git:initRepository', (_event, repoPath: string) => initRepository(repoPath));
+  ipcMain.handle(
+    'git:status',
+    (_event, repoPath: string, options?: GitStatusRequestOptions) => getStatusSummary(repoPath, options),
+  );
   ipcMain.handle('git:branches', (_event, repoPath: string) => getBranches(repoPath));
   ipcMain.handle('git:listDirectory', (_event, repoPath: string, relativePath?: string) =>
     listDirectory(repoPath, relativePath),
@@ -1432,5 +1944,25 @@ export function registerGitIpcHandlers() {
   );
   ipcMain.handle('git:checkout', (_event, repoPath: string, branchName: string) =>
     checkoutBranch(repoPath, branchName),
+  );
+  ipcMain.handle(
+    'git:createBranch',
+    (_event, repoPath: string, branchName: string, options?: CreateBranchOptions) =>
+      createBranch(repoPath, branchName, options),
+  );
+  ipcMain.handle('git:deleteBranch', (_event, repoPath: string, branchName: string) =>
+    deleteBranch(repoPath, branchName),
+  );
+  ipcMain.handle('git:mergeWorktreeIntoPrimaryBranch', (_event, repoPath: string) =>
+    mergeWorktreeIntoPrimaryBranch(repoPath),
+  );
+  ipcMain.handle('git:removeWorktree', (_event, repoPath: string) =>
+    removeWorktree(repoPath),
+  );
+  ipcMain.handle('git:removeWorktreeAndDeleteBranch', (_event, repoPath: string) =>
+    removeWorktreeAndDeleteBranch(repoPath),
+  );
+  ipcMain.handle('git:push', (_event, repoPath: string) =>
+    pushCurrentBranch(repoPath),
   );
 }
