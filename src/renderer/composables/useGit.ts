@@ -185,6 +185,8 @@ export function useGit() {
     return {
       ...nextBranches,
       all: nextBranches.all.map((item) => ({ ...item })),
+      local: nextBranches.local.map((item) => ({ ...item })),
+      remote: nextBranches.remote.map((item) => ({ ...item })),
     };
   }
 
@@ -674,6 +676,24 @@ export function useGit() {
     }
   }
 
+  async function pullBranch() {
+    if (!repoPath.value || !window.bridgegit?.git) {
+      return;
+    }
+
+    isLoading.value = true;
+
+    try {
+      await window.bridgegit.git.pull(repoPath.value);
+      clearErrorState();
+      await refresh({ reloadDiff: false });
+    } catch (nextError) {
+      assignGitError(nextError);
+    } finally {
+      isLoading.value = false;
+    }
+  }
+
   async function mergeWorktreeIntoPrimaryBranch(targetRepoPath: string): Promise<MergeWorktreeIntoPrimaryBranchResult | null> {
     if (!targetRepoPath || !window.bridgegit?.git) {
       return null;
@@ -875,6 +895,7 @@ export function useGit() {
     mergeWorktreeIntoPrimaryBranch,
     removeWorktree,
     removeWorktreeAndDeleteBranch,
+    pullBranch,
     pushBranch,
     dispose,
   };

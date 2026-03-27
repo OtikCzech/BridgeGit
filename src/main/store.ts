@@ -89,6 +89,15 @@ type PartialWorkspaceTabState =
 interface PartialWorkspaceSessionState {
   tabs?: PartialWorkspaceTabState[];
   activeTabId?: string | null;
+  editorPaneLayout?: {
+    panes?: Array<{
+      id?: string;
+      row?: number;
+      col?: number;
+      tabId?: string | null;
+    }>;
+    activePaneId?: string | null;
+  };
 }
 
 interface PartialWorkspaceDescriptor {
@@ -528,10 +537,50 @@ function normalizeWorkspaceSessionState(
   const activeTabId = tabs.find((tab) => tab.id === (workspaceSession?.activeTabId ?? requestedActiveTabId))?.id
     ?? tabs[0]?.id
     ?? null;
+  const codeTabs = tabs.filter((tab) => tab.type === 'code');
+  const codeTabIds = new Set(codeTabs.map((tab) => tab.id));
+  const fallbackCodeTabId = (
+    (activeTabId && codeTabIds.has(activeTabId) ? activeTabId : null)
+    ?? codeTabs[0]?.id
+    ?? null
+  );
+  const normalizedPanes = (workspaceSession?.editorPaneLayout?.panes ?? [])
+    .map((pane, index) => {
+      const id = pane.id?.trim() || `pane-${index + 1}`;
+
+      return {
+        id,
+        row: pane.row === 1 ? 1 : 0,
+        col: pane.col === 1 ? 1 : 0,
+        tabId: pane.tabId && codeTabIds.has(pane.tabId) ? pane.tabId : fallbackCodeTabId,
+      } as const;
+    })
+    .filter((pane, index, panes) => (
+      pane.tabId
+      && panes.findIndex((candidate) => candidate.row === pane.row && candidate.col === pane.col) === index
+    ));
+  const panes = normalizedPanes.length > 0
+    ? normalizedPanes
+    : (fallbackCodeTabId
+      ? [{
+          id: 'pane-primary',
+          row: 0 as const,
+          col: 0 as const,
+          tabId: fallbackCodeTabId,
+        }]
+      : []);
+  const activePaneId = panes.find((pane) => pane.id === workspaceSession?.editorPaneLayout?.activePaneId)?.id
+    ?? panes.find((pane) => pane.tabId === fallbackCodeTabId)?.id
+    ?? panes[0]?.id
+    ?? null;
 
   return {
     tabs,
     activeTabId,
+    editorPaneLayout: {
+      panes,
+      activePaneId,
+    },
   };
 }
 
@@ -602,6 +651,10 @@ function normalizeWorkspaceSessions(
       normalizedSessions[workspaceId] = {
         tabs: [],
         activeTabId: null,
+        editorPaneLayout: {
+          panes: [],
+          activePaneId: null,
+        },
       };
     }
   });

@@ -15,6 +15,7 @@ import {
   cloneWorkspaceRepoPanelState,
   cloneWorkspaceRepoPanelStates,
   cloneWorkspaceDescriptors,
+  cloneWorkspaceEditorPaneLayout,
   cloneWorkspaceSessionState,
   cloneWorkspaceSessions,
   normalizeNoteFontSize,
@@ -24,6 +25,7 @@ import {
   resolveThemeVariant,
   resolveWorkspaceFileTabType,
   type AppAppearance,
+  type CodeNavigationTarget,
   type EditorTheme,
   type ResolvedEditorTheme,
   type GitDiffMode,
@@ -37,6 +39,7 @@ import {
   type RecentRepoEntry,
   type TerminalCommandPreset,
   type WorktreeDetectionInterval,
+  type WorkspaceEditorPaneLayout,
   type WorkspaceIndicatorVisibilitySettings,
   type WorkspaceTabDefaults,
   type WorkspaceDescriptor,
@@ -49,6 +52,7 @@ import {
 } from '../shared/bridgegit';
 import { useGit } from './composables/useGit';
 import { useSession } from './composables/useSession';
+import { useTerminal } from './composables/useTerminal';
 import RepoPanel from './components/RepoPanel.vue';
 import StatusBar from './components/StatusBar.vue';
 import TerminalPanel from './components/TerminalPanel.vue';
@@ -73,13 +77,17 @@ const terminalPanelRef = ref<{
   addShellTab: () => void;
   addNoteTab: () => void;
   closeActiveTab: () => void;
+  closeEditorPane: (direction: 'left' | 'right' | 'up' | 'down') => boolean;
   focusPreviousTab: () => void;
   focusNextTab: () => void;
   executePresetBySlot: (slot: number) => Promise<boolean>;
+  openAllTabsDialog: () => void;
   openCreationMenu: () => void;
   openFile: () => Promise<unknown>;
   openNoteFilePath: (filePath: string) => Promise<unknown>;
   openWorkspaceFilePath: (filePath: string) => Promise<unknown>;
+  openNavigationTarget: (target: CodeNavigationTarget) => Promise<unknown>;
+  splitEditorPane: (direction: 'left' | 'right' | 'up' | 'down') => boolean;
 } | null>(null);
 const sidebarWidth = ref(DEFAULT_PANEL_LAYOUT.sidebarWidth);
 const terminalHeight = ref(DEFAULT_PANEL_LAYOUT.terminalHeight);
@@ -119,6 +127,10 @@ const workspaceOrder = ref<string[]>([]);
 const terminalCommandPresets = ref<TerminalCommandPreset[]>([]);
 const workspaceSessions = ref<WorkspaceSessionsById>({});
 const workspaceTabs = ref<WorkspaceTabState[]>([]);
+const workspaceEditorPaneLayout = ref<WorkspaceEditorPaneLayout>({
+  panes: [],
+  activePaneId: null,
+});
 const workspaceRecentActivityByTabId = ref<Record<string, boolean>>({});
 const workspaceRecentActivityByWorkspaceId = ref<Record<string, Record<string, boolean>>>({});
 const workspaceAttentionByWorkspaceId = ref<Record<string, Record<string, boolean>>>({});
@@ -139,7 +151,7 @@ const detectedWorktrees = ref<GitWorktreeSummary[]>([]);
 const sessionReady = ref(false);
 const isSwitchingWorkspaceContext = ref(false);
 const isCheckingWorktrees = ref(false);
-const repoToolbarBusyAction = ref<'fetch' | 'push' | 'refresh' | null>(null);
+const repoToolbarBusyAction = ref<'pull' | 'push' | 'refresh' | null>(null);
 const repoOperationStatus = ref<string | null>(null);
 
 const runtimeInfo = window.bridgegit ?? {
@@ -186,19 +198,28 @@ const {
   mergeWorktreeIntoPrimaryBranch,
   removeWorktree,
   removeWorktreeAndDeleteBranch,
+  pullBranch,
   pushBranch,
   dispose,
 } = useGit();
 
 type PanelId = 'sidebar' | 'diff' | 'terminal';
 type ResizeTarget = 'sidebar' | 'content' | null;
+type BackgroundShellSubscription = {
+  workspaceId: string;
+  tabId: string;
+  dispose: () => void;
+};
 
 const activeResize = ref<ResizeTarget>(null);
 const INACTIVE_WORKSPACE_GIT_SUMMARY_POLL_MS = 15_000;
+const BACKGROUND_SHELL_ACTIVITY_TIMEOUT_MS = 1600;
 let persistTimer: number | null = null;
 let projectTitleSaveToastTimer: number | null = null;
 let inactiveWorkspaceGitSummaryTimer: number | null = null;
 let worktreeDetectionTimer: number | null = null;
+const backgroundShellSubscriptions = new Map<string, BackgroundShellSubscription>();
+const backgroundShellActivityTimers = new Map<string, number>();
 const commitDiffDateFormatter = new Intl.DateTimeFormat('en', {
   month: 'short',
   day: 'numeric',
@@ -275,9 +296,178 @@ function getWorkspacePanelIndicators(nextWorkspaceId: string) {
   const attention = workspaceAttentionByWorkspaceId.value[nextWorkspaceId] ?? {};
 
   return {
-    hasPanelActivity: tabs.some((tab) => Boolean(recentActivity[tab.id])),
+    hasPanelActivity: tabs.some((tab) => Boolean(recentActivity[tab.id] || attention[tab.id])),
     hasPanelAttention: tabs.some((tab) => Boolean(attention[tab.id])),
   };
+}
+
+function buildWorkspaceTabRuntimeKey(workspaceId: string, tabId: string) {
+  return `${workspaceId}:${tabId}`;
+}
+
+function updateWorkspaceIndicatorMap(
+  source: typeof workspaceRecentActivityByWorkspaceId | typeof workspaceAttentionByWorkspaceId,
+  workspaceId: string,
+  tabId: string,
+  isActive: boolean,
+) {
+  const currentWorkspaceIndicators = source.value[workspaceId] ?? {};
+  const currentValue = Boolean(currentWorkspaceIndicators[tabId]);
+
+  if (currentValue === isActive) {
+    return currentWorkspaceIndicators;
+  }
+
+  const nextWorkspaceIndicators = { ...currentWorkspaceIndicators };
+
+  if (isActive) {
+    nextWorkspaceIndicators[tabId] = true;
+  } else {
+    delete nextWorkspaceIndicators[tabId];
+  }
+
+  source.value = {
+    ...source.value,
+    [workspaceId]: nextWorkspaceIndicators,
+  };
+
+  return nextWorkspaceIndicators;
+}
+
+function setWorkspaceRecentActivityIndicator(workspaceId: string, tabId: string, isActive: boolean) {
+  const nextWorkspaceIndicators = updateWorkspaceIndicatorMap(
+    workspaceRecentActivityByWorkspaceId,
+    workspaceId,
+    tabId,
+    isActive,
+  );
+
+  if (workspaceId === getCurrentWorkspaceId()) {
+    workspaceRecentActivityByTabId.value = { ...nextWorkspaceIndicators };
+  }
+}
+
+function setWorkspaceAttentionIndicator(workspaceId: string, tabId: string, isActive: boolean) {
+  updateWorkspaceIndicatorMap(workspaceAttentionByWorkspaceId, workspaceId, tabId, isActive);
+}
+
+function clearBackgroundShellActivityTimer(runtimeKey: string) {
+  const timerId = backgroundShellActivityTimers.get(runtimeKey);
+
+  if (timerId !== undefined) {
+    window.clearTimeout(timerId);
+    backgroundShellActivityTimers.delete(runtimeKey);
+  }
+}
+
+function clearBackgroundShellIndicators(workspaceId: string, tabId: string) {
+  setWorkspaceRecentActivityIndicator(workspaceId, tabId, false);
+  setWorkspaceAttentionIndicator(workspaceId, tabId, false);
+}
+
+function handleBackgroundShellActivity(workspaceId: string, tabId: string) {
+  if (workspaceId === getCurrentWorkspaceId()) {
+    return;
+  }
+
+  const runtimeKey = buildWorkspaceTabRuntimeKey(workspaceId, tabId);
+  clearBackgroundShellActivityTimer(runtimeKey);
+  setWorkspaceAttentionIndicator(workspaceId, tabId, false);
+  setWorkspaceRecentActivityIndicator(workspaceId, tabId, true);
+
+  backgroundShellActivityTimers.set(runtimeKey, window.setTimeout(() => {
+    backgroundShellActivityTimers.delete(runtimeKey);
+
+    if (workspaceId === getCurrentWorkspaceId()) {
+      return;
+    }
+
+    setWorkspaceRecentActivityIndicator(workspaceId, tabId, false);
+    setWorkspaceAttentionIndicator(workspaceId, tabId, true);
+  }, BACKGROUND_SHELL_ACTIVITY_TIMEOUT_MS));
+}
+
+function handleBackgroundShellExit(workspaceId: string, tabId: string) {
+  const runtimeKey = buildWorkspaceTabRuntimeKey(workspaceId, tabId);
+  clearBackgroundShellActivityTimer(runtimeKey);
+
+  if (workspaceId === getCurrentWorkspaceId()) {
+    return;
+  }
+
+  setWorkspaceRecentActivityIndicator(workspaceId, tabId, false);
+  setWorkspaceAttentionIndicator(workspaceId, tabId, true);
+}
+
+function getBackgroundShellTabEntries() {
+  const currentWorkspaceId = getCurrentWorkspaceId();
+  const nextEntries = workspaceTabs.value
+    .filter((tab) => tab.type === 'shell')
+    .map((tab) => ({
+      workspaceId: currentWorkspaceId,
+      tabId: tab.id,
+      runtimeKey: buildWorkspaceTabRuntimeKey(currentWorkspaceId, tab.id),
+    }));
+
+  Object.entries(workspaceSessions.value).forEach(([workspaceId, workspaceSession]) => {
+    if (workspaceId === currentWorkspaceId) {
+      return;
+    }
+
+    workspaceSession.tabs.forEach((tab) => {
+      if (tab.type !== 'shell') {
+        return;
+      }
+
+      nextEntries.push({
+        workspaceId,
+        tabId: tab.id,
+        runtimeKey: buildWorkspaceTabRuntimeKey(workspaceId, tab.id),
+      });
+    });
+  });
+
+  return nextEntries;
+}
+
+function syncBackgroundShellSubscriptions() {
+  const nextEntries = getBackgroundShellTabEntries();
+  const nextEntriesByRuntimeKey = new Map(
+    nextEntries.map((entry) => [entry.runtimeKey, entry] as const),
+  );
+
+  backgroundShellSubscriptions.forEach((subscription, runtimeKey) => {
+    if (nextEntriesByRuntimeKey.has(runtimeKey)) {
+      return;
+    }
+
+    subscription.dispose();
+    backgroundShellSubscriptions.delete(runtimeKey);
+    clearBackgroundShellActivityTimer(runtimeKey);
+    clearBackgroundShellIndicators(subscription.workspaceId, subscription.tabId);
+  });
+
+  nextEntries.forEach((entry) => {
+    if (backgroundShellSubscriptions.has(entry.runtimeKey)) {
+      return;
+    }
+
+    const terminalRuntime = useTerminal(entry.runtimeKey);
+    terminalRuntime.attach({
+      onData: () => {
+        handleBackgroundShellActivity(entry.workspaceId, entry.tabId);
+      },
+      onExit: () => {
+        handleBackgroundShellExit(entry.workspaceId, entry.tabId);
+      },
+    });
+
+    backgroundShellSubscriptions.set(entry.runtimeKey, {
+      workspaceId: entry.workspaceId,
+      tabId: entry.tabId,
+      dispose: terminalRuntime.dispose,
+    });
+  });
 }
 
 function buildWorkspaceGitSummary(nextStatus: GitStatusSummary, nextBranch: string | null) {
@@ -795,6 +985,7 @@ function buildWorkspaceSessionState(
   return cloneWorkspaceSessionState({
     tabs,
     activeTabId,
+    editorPaneLayout: cloneWorkspaceEditorPaneLayout(workspaceEditorPaneLayout.value),
   });
 }
 
@@ -811,10 +1002,15 @@ function applyWorkspaceSession(nextWorkspaceId: string | null) {
     : {
         tabs: [],
         activeTabId: null,
+        editorPaneLayout: {
+          panes: [],
+          activePaneId: null,
+        },
       };
 
   workspaceTabs.value = nextWorkspaceSession.tabs;
   activeWorkspaceTabId.value = nextWorkspaceSession.activeTabId;
+  workspaceEditorPaneLayout.value = nextWorkspaceSession.editorPaneLayout;
 }
 
 function captureWorkspaceSession(nextWorkspaceId: string | null) {
@@ -1563,12 +1759,12 @@ async function handleRefreshRepo() {
   }
 }
 
-async function handleFetchRepo() {
-  repoToolbarBusyAction.value = 'fetch';
-  repoOperationStatus.value = 'Fetching from origin…';
+async function handlePullRepo() {
+  repoToolbarBusyAction.value = 'pull';
+  repoOperationStatus.value = 'Pulling current branch…';
 
   try {
-    await refreshRepoStatus({ fetchOrigin: true });
+    await pullBranch();
     await detectWorktrees({ includeDismissed: true });
   } finally {
     repoOperationStatus.value = null;
@@ -2315,6 +2511,17 @@ function handleGlobalKeydown(event: KeyboardEvent) {
   }
 
   if (
+    matchesShortcut(event, SHORTCUTS.workspaceAllTabs)
+    && sessionReady.value
+    && !isSettingsOpen.value
+    && !isCommitHistoryOpen.value
+  ) {
+    event.preventDefault();
+    terminalPanelRef.value?.openAllTabsDialog();
+    return;
+  }
+
+  if (
     matchesShortcut(event, SHORTCUTS.workspaceNewTabMenu)
     && sessionReady.value
     && !isSettingsOpen.value
@@ -2323,6 +2530,48 @@ function handleGlobalKeydown(event: KeyboardEvent) {
     event.preventDefault();
     terminalPanelRef.value?.openCreationMenu();
     return;
+  }
+
+  if (sessionReady.value) {
+    const editorPaneSplitShortcuts: Array<{ shortcut: typeof SHORTCUTS.editorPaneSplitLeft; direction: 'left' | 'right' | 'up' | 'down' }> = [
+      { shortcut: SHORTCUTS.editorPaneSplitLeft, direction: 'left' },
+      { shortcut: SHORTCUTS.editorPaneSplitRight, direction: 'right' },
+      { shortcut: SHORTCUTS.editorPaneSplitUp, direction: 'up' },
+      { shortcut: SHORTCUTS.editorPaneSplitDown, direction: 'down' },
+    ];
+
+    for (const entry of editorPaneSplitShortcuts) {
+      if (!matchesShortcut(event, entry.shortcut)) {
+        continue;
+      }
+
+      const handled = terminalPanelRef.value?.splitEditorPane(entry.direction);
+
+      if (handled) {
+        event.preventDefault();
+        return;
+      }
+    }
+
+    const editorPaneCloseShortcuts: Array<{ shortcut: typeof SHORTCUTS.editorPaneCloseLeft; direction: 'left' | 'right' | 'up' | 'down' }> = [
+      { shortcut: SHORTCUTS.editorPaneCloseLeft, direction: 'left' },
+      { shortcut: SHORTCUTS.editorPaneCloseRight, direction: 'right' },
+      { shortcut: SHORTCUTS.editorPaneCloseUp, direction: 'up' },
+      { shortcut: SHORTCUTS.editorPaneCloseDown, direction: 'down' },
+    ];
+
+    for (const entry of editorPaneCloseShortcuts) {
+      if (!matchesShortcut(event, entry.shortcut)) {
+        continue;
+      }
+
+      const handled = terminalPanelRef.value?.closeEditorPane(entry.direction);
+
+      if (handled) {
+        event.preventDefault();
+        return;
+      }
+    }
   }
 
   if (isEditableTarget(event.target) || isSettingsOpen.value || isCommitHistoryOpen.value) {
@@ -2406,12 +2655,27 @@ async function handleOpenWorkspaceFile(relativePath: string) {
   await terminalPanelRef.value?.openWorkspaceFilePath(filePath);
 }
 
-async function handleOpenCurrentDiffInWorkspace() {
-  if (!selectedPath.value) {
+async function handleOpenCurrentDiffInWorkspace(targetLine?: number) {
+  if (!selectedPath.value || !repoPath.value || !sessionReady.value) {
     return;
   }
 
-  await handleOpenWorkspaceFile(selectedPath.value);
+  if (terminalCollapsed.value) {
+    terminalCollapsed.value = false;
+    scheduleSessionSave();
+  }
+
+  const filePath = resolveRepoFilePath(repoPath.value, selectedPath.value);
+
+  if (targetLine) {
+    await terminalPanelRef.value?.openNavigationTarget({
+      filePath,
+      line: targetLine,
+    });
+    return;
+  }
+
+  await terminalPanelRef.value?.openWorkspaceFilePath(filePath);
 }
 
 async function handleCommit() {
@@ -2565,8 +2829,16 @@ watch(repoPath, () => {
   scheduleSessionSave();
 });
 
-watch([recentRepos, workspaceOrder, appAppearance, editorTheme, workspaceIndicatorVisibility, workspaceTabDefaults, soundNotificationsEnabled, terminalCommandPresets, workspaceTabs, activeWorkspaceTabId, workspaceRepoPanelStates], () => {
+watch([recentRepos, workspaceOrder, appAppearance, editorTheme, workspaceIndicatorVisibility, workspaceTabDefaults, soundNotificationsEnabled, terminalCommandPresets, workspaceTabs, workspaceEditorPaneLayout, activeWorkspaceTabId, workspaceRepoPanelStates], () => {
   scheduleSessionSave();
+}, { deep: true });
+
+watch([workspaceTabs, workspaceSessions, activeWorkspaceId], () => {
+  if (!sessionReady.value) {
+    return;
+  }
+
+  syncBackgroundShellSubscriptions();
 }, { deep: true });
 
 watch([worktreeDetectionIntervalMs, repoPath], () => {
@@ -2720,6 +2992,7 @@ onMounted(async () => {
   markInfoNoteAsSeenWhenActive();
 
   sessionReady.value = true;
+  syncBackgroundShellSubscriptions();
   startInactiveWorkspaceGitSummaryPolling();
   startWorktreeDetectionPolling();
 });
@@ -2745,6 +3018,12 @@ onBeforeUnmount(() => {
   if (worktreeDetectionTimer) {
     window.clearInterval(worktreeDetectionTimer);
   }
+
+  backgroundShellSubscriptions.forEach((subscription, runtimeKey) => {
+    subscription.dispose();
+    clearBackgroundShellActivityTimer(runtimeKey);
+  });
+  backgroundShellSubscriptions.clear();
 });
 </script>
 
@@ -2791,7 +3070,7 @@ onBeforeUnmount(() => {
           @remove-worktree-and-delete-branch="handleRemoveWorkspaceWorktreeAndDeleteBranch"
           @reorder-workspaces="handleReorderWorkspaces"
           @update:repo-panel-state="updateCurrentWorkspaceRepoPanelState($event)"
-          @fetch="handleFetchRepo"
+          @pull="handlePullRepo"
           @push="handlePushRepo"
           @refresh="handleRefreshRepo"
           @toggle-history="handleToggleCommitHistory"
@@ -2879,11 +3158,15 @@ onBeforeUnmount(() => {
             :sound-notifications-enabled="soundNotificationsEnabled"
             :workspace-tab-defaults="workspaceTabDefaults"
             :tabs="workspaceTabs"
+            :editor-pane-layout="workspaceEditorPaneLayout"
             :active-tab-id="activeWorkspaceTabId"
+            :recent-activity="workspaceRecentActivityByWorkspaceId[getCurrentWorkspaceId()] ?? {}"
+            :attention="workspaceAttentionByWorkspaceId[getCurrentWorkspaceId()] ?? {}"
             :can-collapse="canCollapseTerminal"
             :collapse-shortcut-display="SHORTCUTS.panelTerminalToggle.display"
             :collapsed="terminalCollapsed"
             @update:tabs="workspaceTabs = $event"
+            @update:editor-pane-layout="workspaceEditorPaneLayout = $event"
             @update:active-tab-id="activeWorkspaceTabId = $event"
             @update:recent-activity="handleWorkspaceRecentActivityUpdate($event.workspaceId, $event.recentActivity)"
             @update:attention="handleWorkspaceAttentionUpdate($event.workspaceId, $event.attention)"

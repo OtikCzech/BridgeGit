@@ -106,6 +106,8 @@ const bridgegitApi = {
       ipcRenderer.invoke('git:removeWorktree', repoPath) as Promise<RemoveWorktreeResult>,
     removeWorktreeAndDeleteBranch: (repoPath: string) =>
       ipcRenderer.invoke('git:removeWorktreeAndDeleteBranch', repoPath) as Promise<RemoveWorktreeAndDeleteBranchResult>,
+    pull: (repoPath: string) =>
+      ipcRenderer.invoke('git:pull', repoPath) as Promise<GitStatusSummary>,
     push: (repoPath: string) =>
       ipcRenderer.invoke('git:push', repoPath) as Promise<GitStatusSummary>,
   },

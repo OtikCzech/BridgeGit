@@ -40,7 +40,7 @@ interface Props {
   isHistoryOpen: boolean;
   selectedPath: string | null;
   isLoading: boolean;
-  toolbarBusyAction: 'fetch' | 'push' | 'refresh' | null;
+  toolbarBusyAction: 'pull' | 'push' | 'refresh' | null;
   error: string | null;
   errorDetail: string | null;
   operationStatus: string | null;
@@ -66,7 +66,7 @@ const emit = defineEmits<{
   (event: 'remove-worktree-and-delete-branch', workspaceId: string): void;
   (event: 'reorder-workspaces', workspaceIds: string[]): void;
   (event: 'update:repo-panel-state', value: WorkspaceRepoPanelState): void;
-  (event: 'fetch'): void;
+  (event: 'pull'): void;
   (event: 'push'): void;
   (event: 'refresh'): void;
   (event: 'toggle-history'): void;
@@ -149,11 +149,22 @@ interface BranchItemMenuState {
   y: number;
 }
 
+interface BranchBadge {
+  label: string;
+  tone: 'neutral' | 'success' | 'warning' | 'danger';
+}
+
 interface BranchListItem extends BranchInfo {
-  actionLabel: string;
   helperText: string | null;
+  badges: BranchBadge[];
   isWorktreeBranch: boolean;
   hasWorktreeChanges: boolean;
+}
+
+interface BranchListSection {
+  id: 'local' | 'remote';
+  title: string;
+  items: BranchListItem[];
 }
 
 type FileMenuMode = 'actions' | 'discard-confirm';
@@ -200,6 +211,7 @@ const hasRequestedAllFilesLoad = ref(false);
 let isApplyingRepoPanelState = false;
 let allFilesSearchToken = 0;
 let allFilesSearchDebounceTimer: number | null = null;
+let branchSearchFocusTimer: number | null = null;
 const historyCount = computed(() => props.log?.items.length ?? 0);
 const collapseButtonTitle = computed(() => (
   props.canCollapse
@@ -306,11 +318,22 @@ const fileStatusIndicators = computed<FilesStatusIndicator[]>(() => [
 const currentBranchLabel = computed(() => (
   props.status?.currentBranch ?? props.branches?.current ?? 'Detached HEAD'
   ));
-const fetchTitle = computed(() => (
-  props.status?.trackingBranch
-    ? `Fetch ${props.status.trackingBranch}`
-    : 'Fetch origin'
+const canPull = computed(() => (
+  props.isGitRepository
+  && Boolean(props.status?.currentBranch ?? props.branches?.current)
+  && Boolean(props.status?.trackingBranch)
 ));
+const pullTitle = computed(() => {
+  if (!canPull.value) {
+    return 'Pull unavailable without upstream branch';
+  }
+
+  if (!shouldHighlightPull.value) {
+    return 'Already up to date';
+  }
+
+  return `Pull ${props.status?.trackingBranch}`;
+});
 const pushTitle = computed(() => {
   if (!canPush.value) {
     return 'Push unavailable in detached HEAD';
@@ -338,7 +361,7 @@ const aheadBehindLabel = computed(() => (
 const aheadBehindTitle = computed(() => (
   `Ahead / behind: +${props.status?.ahead ?? 0} / -${props.status?.behind ?? 0}`
 ));
-const shouldHighlightFetch = computed(() => (
+const shouldHighlightPull = computed(() => (
   (props.status?.behind ?? 0) > 0
 ));
 const shouldHighlightPush = computed(() => (
@@ -382,7 +405,11 @@ const shouldShowAllFilesSearchHint = computed(() => (
 ));
 const branchFilterQuery = computed(() => branchFilter.value.trim());
 const exactBranchMatch = computed(() => (
-  (props.branches?.all ?? []).find((branch) => branch.name === branchFilterQuery.value) ?? null
+  (props.branches?.local ?? []).find((branch) => branch.name === branchFilterQuery.value)
+  ?? (props.branches?.remote ?? []).find((branch) => (
+    branch.shortName === branchFilterQuery.value || branch.name === branchFilterQuery.value
+  ))
+  ?? null
 ));
 const canCreateBranch = computed(() => (
   Boolean(branchFilterQuery.value) && !exactBranchMatch.value
@@ -415,66 +442,142 @@ const branchCreateHint = computed(() => {
   }
 
   if (exactBranchMatch.value) {
-    return `Branch "${exactBranchMatch.value.name}" already exists.`;
+    return `Branch "${exactBranchMatch.value.displayName}" already exists.`;
   }
 
   return `Press Enter to create branch "${branchFilterQuery.value}" here, or choose New Repo below.`;
 });
 
-const filteredBranches = computed(() => {
-  const searchTerm = branchFilterQuery.value.toLowerCase();
-  const branchItems = (props.branches?.all ?? []).map<BranchListItem>((branch) => {
-    const matchingWorkspace = branch.worktreePath
-      ? props.workspaceItems.find((workspaceItem) => (
-        workspaceItem.path && areRepoPathsEquivalent(workspaceItem.path, branch.worktreePath)
-      )) ?? null
-      : null;
-    const hasWorktreeChanges = Boolean(
-      (matchingWorkspace?.changedCount ?? 0)
-      || (matchingWorkspace?.untrackedCount ?? 0)
-      || (matchingWorkspace?.conflictedCount ?? 0),
-    );
-    const worktreeRepoName = branch.worktreePath
-      ? branch.worktreePath.split(/[\\/]/).filter(Boolean).at(-1) ?? branch.worktreePath
-      : null;
-
-    if (branch.current) {
+function branchStatusBadge(branch: BranchInfo): BranchBadge | null {
+  switch (branch.syncStatus) {
+    case 'local-only':
+      return { label: 'Local only', tone: 'neutral' };
+    case 'remote-untracked':
+      return { label: 'Remote, no track', tone: 'warning' };
+    case 'tracked-synced':
+      return { label: 'Up to date', tone: 'success' };
+    case 'tracked-ahead':
+      return { label: branch.ahead > 0 ? `Ahead ${branch.ahead}` : 'Ahead', tone: 'warning' };
+    case 'tracked-behind':
+      return { label: branch.behind > 0 ? `Behind ${branch.behind}` : 'Behind', tone: 'warning' };
+    case 'tracked-diverged':
       return {
-        ...branch,
-        actionLabel: 'Current',
-        helperText: null,
-        isWorktreeBranch: false,
-        hasWorktreeChanges: false,
+        label: branch.ahead > 0 || branch.behind > 0
+          ? `Diverged ${branch.ahead}/${branch.behind}`
+          : 'Diverged',
+        tone: 'danger',
       };
-    }
+    case 'tracked-gone':
+      return { label: 'Upstream gone', tone: 'danger' };
+    case 'remote-only':
+      return { label: branch.remoteName ?? 'Remote', tone: 'neutral' };
+    default:
+      return null;
+  }
+}
 
-    if (branch.checkedOutElsewhere) {
-      return {
-        ...branch,
-        actionLabel: matchingWorkspace ? 'Switch to repo' : 'Open repo',
-        helperText: matchingWorkspace
-          ? `Checked out in ${matchingWorkspace.title}`
-          : `Checked out in ${worktreeRepoName}`,
-        isWorktreeBranch: true,
-        hasWorktreeChanges,
-      };
-    }
-
-    return {
-      ...branch,
-      actionLabel: 'Checkout',
-      helperText: null,
-      isWorktreeBranch: false,
-      hasWorktreeChanges: false,
-    };
-  });
-
-  if (!searchTerm) {
-    return branchItems;
+function branchHelperText(
+  branch: BranchInfo,
+  worktreeLabel: string | null,
+): string | null {
+  if (branch.checkedOutElsewhere) {
+    return worktreeLabel ? `Checked out in ${worktreeLabel}` : 'Checked out in another repo';
   }
 
-  return branchItems.filter((branch) => branch.name.toLowerCase().includes(searchTerm));
+  if (branch.kind === 'remote') {
+    return `Create local tracking branch from ${branch.name}.`;
+  }
+
+  if (branch.syncStatus === 'tracked-gone' && branch.upstreamName) {
+    return `Upstream ${branch.upstreamName} no longer exists.`;
+  }
+
+  if (branch.syncStatus === 'remote-untracked') {
+    return 'Matching remote branch exists, but this local branch does not track it yet.';
+  }
+
+  if (branch.upstreamName && branch.upstreamName !== `origin/${branch.name}`) {
+    return `Tracks ${branch.upstreamName}.`;
+  }
+
+  return null;
+}
+
+function buildBranchListItem(branch: BranchInfo): BranchListItem {
+  const matchingWorkspace = branch.worktreePath
+    ? props.workspaceItems.find((workspaceItem) => (
+      workspaceItem.path && areRepoPathsEquivalent(workspaceItem.path, branch.worktreePath)
+    )) ?? null
+    : null;
+  const hasWorktreeChanges = Boolean(
+    (matchingWorkspace?.changedCount ?? 0)
+    || (matchingWorkspace?.untrackedCount ?? 0)
+    || (matchingWorkspace?.conflictedCount ?? 0),
+  );
+  const worktreeRepoName = branch.worktreePath
+    ? branch.worktreePath.split(/[\\/]/).filter(Boolean).at(-1) ?? branch.worktreePath
+    : null;
+  const badges: BranchBadge[] = [];
+
+  if (branch.current) {
+    badges.push({ label: 'Current', tone: 'success' });
+  }
+
+  const statusBadge = branchStatusBadge(branch);
+
+  if (statusBadge) {
+    badges.push(statusBadge);
+  }
+
+  return {
+    ...branch,
+    helperText: branchHelperText(branch, matchingWorkspace?.title ?? worktreeRepoName),
+    badges,
+    isWorktreeBranch: branch.checkedOutElsewhere,
+    hasWorktreeChanges,
+  };
+}
+
+const branchSections = computed<BranchListSection[]>(() => {
+  const searchTerm = branchFilterQuery.value.toLowerCase();
+  const matchesBranch = (branch: BranchInfo) => {
+    if (!searchTerm) {
+      return true;
+    }
+
+    return [
+      branch.displayName,
+      branch.name,
+      branch.upstreamName ?? '',
+      branch.remoteName ?? '',
+    ].some((value) => value.toLowerCase().includes(searchTerm));
+  };
+
+  const localItems = (props.branches?.local ?? [])
+    .filter(matchesBranch)
+    .map(buildBranchListItem);
+  const remoteItems = (props.branches?.remote ?? [])
+    .filter(matchesBranch)
+    .map(buildBranchListItem);
+
+  return [
+    localItems.length
+      ? {
+        id: 'local' as const,
+        title: 'Local',
+        items: localItems,
+      }
+      : null,
+    remoteItems.length
+      ? {
+        id: 'remote' as const,
+        title: 'Remote',
+        items: remoteItems,
+      }
+      : null,
+  ].filter((section): section is BranchListSection => Boolean(section));
 });
+const filteredBranches = computed(() => branchSections.value.flatMap((section) => section.items));
 const areFileDetailsLoaded = computed(() => Boolean(props.status));
 const shouldPrepareFileDetails = computed(() => (
   isWorkspaceDetailExpanded.value
@@ -1290,6 +1393,27 @@ function findSectionIdByPath(path: string): SectionId | null {
   return null;
 }
 
+function isEditableTarget(target: EventTarget | null): boolean {
+  if (target instanceof HTMLElement && target.classList.contains('xterm-helper-textarea')) {
+    return false;
+  }
+
+  if (
+    target instanceof HTMLElement
+    && target.closest('.xterm')
+    && target.classList.contains('xterm-helper-textarea')
+  ) {
+    return false;
+  }
+
+  return (
+    target instanceof HTMLInputElement
+    || target instanceof HTMLTextAreaElement
+    || target instanceof HTMLSelectElement
+    || (target instanceof HTMLElement && target.isContentEditable)
+  );
+}
+
 function isSectionCollapsed(sectionId: SectionId): boolean {
   return collapsedSections.value[sectionId];
 }
@@ -1340,6 +1464,11 @@ function toggleBranchMenu() {
   isBranchMenuOpen.value = !isBranchMenuOpen.value;
 
   if (!isBranchMenuOpen.value) {
+    if (branchSearchFocusTimer !== null) {
+      window.clearTimeout(branchSearchFocusTimer);
+      branchSearchFocusTimer = null;
+    }
+
     branchFilter.value = '';
     isBranchCreateMode.value = false;
   }
@@ -1376,7 +1505,28 @@ async function focusBranchSearchInput() {
   branchSearchInputRef.value?.focus({ preventScroll: true });
 }
 
+function scheduleBranchSearchFocus(delay = 1000) {
+  if (branchSearchFocusTimer !== null) {
+    window.clearTimeout(branchSearchFocusTimer);
+  }
+
+  branchSearchFocusTimer = window.setTimeout(() => {
+    branchSearchFocusTimer = null;
+
+    if (!isBranchMenuOpen.value) {
+      return;
+    }
+
+    void focusBranchSearchInput();
+  }, delay);
+}
+
 function closeBranchMenu() {
+  if (branchSearchFocusTimer !== null) {
+    window.clearTimeout(branchSearchFocusTimer);
+    branchSearchFocusTimer = null;
+  }
+
   isBranchMenuOpen.value = false;
   branchFilter.value = '';
   isBranchCreateMode.value = false;
@@ -1528,7 +1678,13 @@ function closeWorkspaceMenu() {
 }
 
 function canDeleteBranch(branch: BranchListItem): boolean {
-  return !branch.current && !branch.checkedOutElsewhere;
+  return branch.kind === 'local' && !branch.current && !branch.checkedOutElsewhere;
+}
+
+function branchItemTitle(branch: BranchListItem) {
+  const branchLabel = branch.kind === 'remote' ? branch.name : branch.displayName;
+
+  return branch.helperText ? `${branchLabel} - ${branch.helperText}` : branchLabel;
 }
 
 function openBranchItemMenu(event: MouseEvent, branch: BranchListItem) {
@@ -1702,6 +1858,28 @@ function handleDocumentPointerDown(event: PointerEvent) {
 }
 
 function handleDocumentKeydown(event: KeyboardEvent) {
+  if (
+    isBranchMenuOpen.value
+    && !isEditableTarget(event.target)
+    && !event.ctrlKey
+    && !event.metaKey
+    && !event.altKey
+  ) {
+    if (event.key === 'Backspace' && branchFilter.value) {
+      event.preventDefault();
+      branchFilter.value = branchFilter.value.slice(0, -1);
+      void focusBranchSearchInput();
+      return;
+    }
+
+    if (event.key.length === 1) {
+      event.preventDefault();
+      branchFilter.value += event.key;
+      void focusBranchSearchInput();
+      return;
+    }
+  }
+
   if (event.key === 'Escape') {
     closeBranchMenu();
     closeFileMenu();
@@ -1823,8 +2001,14 @@ watch(
   () => isBranchMenuOpen.value,
   (isOpen) => {
     if (isOpen) {
-      void focusBranchSearchInput();
+      scheduleBranchSearchFocus();
       void scrollCurrentBranchIntoView();
+      return;
+    }
+
+    if (branchSearchFocusTimer !== null) {
+      window.clearTimeout(branchSearchFocusTimer);
+      branchSearchFocusTimer = null;
     }
   },
 );
@@ -2036,6 +2220,11 @@ onBeforeUnmount(() => {
   if (allFilesSearchDebounceTimer !== null) {
     window.clearTimeout(allFilesSearchDebounceTimer);
     allFilesSearchDebounceTimer = null;
+  }
+
+  if (branchSearchFocusTimer !== null) {
+    window.clearTimeout(branchSearchFocusTimer);
+    branchSearchFocusTimer = null;
   }
 });
 </script>
@@ -2309,15 +2498,15 @@ onBeforeUnmount(() => {
                       <div class="repo-panel__summary-actions">
                         <button
                           class="repo-panel__action"
-                          :class="{ 'repo-panel__action--active': shouldHighlightFetch }"
+                          :class="{ 'repo-panel__action--active': shouldHighlightPull }"
                           type="button"
-                          :disabled="!gitActionsEnabled"
-                          :title="props.isGitRepository ? fetchTitle : 'Initialize Git repository to enable fetch'"
-                          :aria-label="props.isGitRepository ? fetchTitle : 'Fetch unavailable until Git is initialized'"
-                          @click="emit('fetch')"
+                          :disabled="!gitActionsEnabled || !canPull || !shouldHighlightPull"
+                          :title="props.isGitRepository ? pullTitle : 'Initialize Git repository to enable pull'"
+                          :aria-label="props.isGitRepository ? pullTitle : 'Pull unavailable until Git is initialized'"
+                          @click="emit('pull')"
                         >
                           <span
-                            v-if="props.toolbarBusyAction === 'fetch'"
+                            v-if="props.toolbarBusyAction === 'pull'"
                             class="repo-panel__action-loader"
                             aria-hidden="true"
                           />
@@ -2463,40 +2652,71 @@ onBeforeUnmount(() => {
                   </div>
 
                   <div
-                    v-if="!isBranchCreateMode && filteredBranches.length"
+                    v-if="!isBranchCreateMode && branchSections.length"
                     ref="branchListRef"
                     class="repo-panel__branch-list"
                   >
-                    <button
-                      v-for="branch in filteredBranches"
-                      :key="branch.name"
-                      class="repo-panel__branch-item"
-                      :class="{
-                        'repo-panel__branch-item--active': branch.current,
-                        'repo-panel__branch-item--external': branch.checkedOutElsewhere,
-                      }"
-                      type="button"
-                      :title="branch.helperText ? `${branch.name} — ${branch.helperText}` : branch.name"
-                      :disabled="branch.current"
-                      @click="handleBranchSelect(branch)"
-                      @contextmenu="openBranchItemMenu($event, branch)"
+                    <section
+                      v-for="section in branchSections"
+                      :key="section.id"
+                      class="repo-panel__branch-group"
                     >
-                      <span class="repo-panel__branch-item-main">
-                        <span
-                          v-if="branch.isWorktreeBranch"
-                          class="repo-panel__branch-item-icon"
-                          :class="{ 'repo-panel__branch-item-icon--dirty': branch.hasWorktreeChanges }"
-                          aria-hidden="true"
-                        >
-                          <svg viewBox="0 0 24 24">
-                            <path
-                              d="M7.25 6.5a2.75 2.75 0 1 1 2.53 2.74v3.03h4.44a2.75 2.75 0 1 1 0 1.5H8.28V9.24A2.75 2.75 0 0 1 7.25 6.5Zm0 0a1.25 1.25 0 1 0 1.25-1.25A1.25 1.25 0 0 0 7.25 6.5Zm9.5 6.5a1.25 1.25 0 1 0 1.25-1.25A1.25 1.25 0 0 0 16.75 13Zm-9.5 4.5a2.75 2.75 0 1 1 2.53 2.74v-3.74h1.5v3.74A2.75 2.75 0 1 1 7.25 17.5Zm1.25 1.25a1.25 1.25 0 1 0 0-2.5 1.25 1.25 0 0 0 0 2.5Z"
-                            />
-                          </svg>
+                      <header class="repo-panel__branch-section">
+                        <span class="repo-panel__branch-section-title">{{ section.title }}</span>
+                        <span class="repo-panel__branch-section-count">{{ section.items.length }}</span>
+                      </header>
+
+                      <button
+                        v-for="branch in section.items"
+                        :key="branch.name"
+                        class="repo-panel__branch-item"
+                        :class="{
+                          'repo-panel__branch-item--active': branch.current,
+                          'repo-panel__branch-item--external': branch.checkedOutElsewhere,
+                          'repo-panel__branch-item--remote': branch.kind === 'remote',
+                        }"
+                        type="button"
+                        :title="branchItemTitle(branch)"
+                        :disabled="branch.current"
+                        @click="handleBranchSelect(branch)"
+                        @contextmenu="openBranchItemMenu($event, branch)"
+                      >
+                        <span class="repo-panel__branch-item-main">
+                          <span
+                            v-if="branch.isWorktreeBranch"
+                            class="repo-panel__branch-item-icon"
+                            :class="{ 'repo-panel__branch-item-icon--dirty': branch.hasWorktreeChanges }"
+                            aria-hidden="true"
+                          >
+                            <svg viewBox="0 0 24 24">
+                              <path
+                                d="M7.25 6.5a2.75 2.75 0 1 1 2.53 2.74v3.03h4.44a2.75 2.75 0 1 1 0 1.5H8.28V9.24A2.75 2.75 0 0 1 7.25 6.5Zm0 0a1.25 1.25 0 1 0 1.25-1.25A1.25 1.25 0 0 0 7.25 6.5Zm9.5 6.5a1.25 1.25 0 1 0 1.25-1.25A1.25 1.25 0 0 0 16.75 13Zm-9.5 4.5a2.75 2.75 0 1 1 2.53 2.74v-3.74h1.5v3.74A2.75 2.75 0 1 1 7.25 17.5Zm1.25 1.25a1.25 1.25 0 1 0 0-2.5 1.25 1.25 0 0 0 0 2.5Z"
+                              />
+                            </svg>
+                          </span>
+                          <span class="repo-panel__branch-item-text">
+                            <span class="repo-panel__branch-item-name">{{ branch.displayName }}</span>
+                            <span
+                              v-if="branch.helperText && !branch.checkedOutElsewhere"
+                              class="repo-panel__branch-item-helper"
+                            >
+                              {{ branch.helperText }}
+                            </span>
+                          </span>
                         </span>
-                        <span class="repo-panel__branch-item-name">{{ branch.name }}</span>
-                      </span>
-                    </button>
+
+                        <span v-if="branch.badges.length" class="repo-panel__branch-item-badges">
+                          <span
+                            v-for="badge in branch.badges"
+                            :key="`${branch.name}-${badge.label}`"
+                            class="repo-panel__branch-badge"
+                            :class="`repo-panel__branch-badge--${badge.tone}`"
+                          >
+                            {{ badge.label }}
+                          </span>
+                        </span>
+                      </button>
+                    </section>
                   </div>
 
                   <div v-else-if="!isBranchCreateMode" class="repo-panel__branch-empty">
@@ -3963,12 +4183,46 @@ onBeforeUnmount(() => {
 
 .repo-panel__branch-list {
   display: grid;
+  gap: 10px;
+}
+
+.repo-panel__branch-group {
+  display: grid;
   gap: 6px;
+}
+
+.repo-panel__branch-group + .repo-panel__branch-group {
+  padding-top: 10px;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.repo-panel__branch-section {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding-inline: 4px;
+}
+
+.repo-panel__branch-section-title {
+  color: var(--text-dim);
+  font-size: calc(0.68rem * var(--repo-panel-scale));
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.repo-panel__branch-section-count {
+  color: var(--text-muted);
+  font-size: calc(0.68rem * var(--repo-panel-scale));
+  font-variant-numeric: tabular-nums;
 }
 
 .repo-panel__branch-item {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
   padding: var(--repo-panel-item-pad-y) var(--repo-panel-control-pad-x);
   border: 1px solid transparent;
   border-radius: 10px;
@@ -3995,6 +4249,10 @@ onBeforeUnmount(() => {
   border-color: rgba(242, 165, 65, 0.16);
 }
 
+.repo-panel__branch-item--remote {
+  border-color: rgba(110, 197, 255, 0.12);
+}
+
 .repo-panel__branch-item-name {
   min-width: 0;
   overflow: hidden;
@@ -4004,9 +4262,31 @@ onBeforeUnmount(() => {
 
 .repo-panel__branch-item-main {
   display: inline-flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 8px;
   min-width: 0;
+  flex: 1 1 auto;
+}
+
+.repo-panel__branch-item-text {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.repo-panel__branch-item-helper {
+  color: var(--text-dim);
+  font-size: calc(0.71rem * var(--repo-panel-scale));
+  line-height: 1.3;
+}
+
+.repo-panel__branch-item-badges {
+  display: inline-flex;
+  align-items: flex-start;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 6px;
+  flex: 0 0 auto;
 }
 
 .repo-panel__branch-item-icon {
@@ -4031,6 +4311,43 @@ onBeforeUnmount(() => {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.repo-panel__branch-badge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 1.35rem;
+  padding: 0.16rem 0.44rem;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  font-size: calc(0.66rem * var(--repo-panel-scale));
+  font-weight: 600;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.repo-panel__branch-badge--neutral {
+  border-color: rgba(160, 170, 184, 0.18);
+  color: var(--text-muted);
+  background: rgba(130, 140, 154, 0.1);
+}
+
+.repo-panel__branch-badge--success {
+  border-color: rgba(94, 191, 126, 0.22);
+  color: rgba(160, 232, 183, 0.96);
+  background: rgba(40, 98, 61, 0.26);
+}
+
+.repo-panel__branch-badge--warning {
+  border-color: rgba(242, 165, 65, 0.24);
+  color: rgba(255, 210, 145, 0.98);
+  background: rgba(108, 70, 23, 0.28);
+}
+
+.repo-panel__branch-badge--danger {
+  border-color: rgba(236, 99, 99, 0.26);
+  color: rgba(255, 186, 186, 0.98);
+  background: rgba(114, 36, 36, 0.3);
 }
 
 .repo-panel__branch-empty {

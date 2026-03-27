@@ -10,6 +10,8 @@ import type {
   TerminalCommandPreset,
   ThemeVariant,
   WorkspaceCodeTabState,
+  WorkspaceEditorPaneLayout,
+  WorkspaceEditorPaneState,
   WorkspaceExternalFileChangeState,
   WorkspaceNoteTabState,
   WorkspaceShellTabState,
@@ -17,6 +19,7 @@ import type {
   WorkspaceTabState,
 } from '../../shared/bridgegit';
 import {
+  cloneWorkspaceEditorPaneLayout,
   resolveWorkspaceFileTabType,
 } from '../../shared/bridgegit';
 import { SHORTCUTS, formatCommandSlotShortcut } from '../shortcuts';
@@ -43,7 +46,10 @@ interface Props {
   soundNotificationsEnabled: boolean;
   workspaceTabDefaults: WorkspaceTabDefaults;
   tabs: WorkspaceTabState[];
+  editorPaneLayout: WorkspaceEditorPaneLayout;
   activeTabId: string | null;
+  recentActivity: Record<string, boolean>;
+  attention: Record<string, boolean>;
   canCollapse: boolean;
   collapseShortcutDisplay: string;
   collapsed: boolean;
@@ -52,9 +58,17 @@ interface Props {
 const props = defineProps<Props>();
 const CREATION_MENU_ACTION_ORDER = ['shell', 'note', 'open-file'] as const;
 type CreationMenuActionId = (typeof CREATION_MENU_ACTION_ORDER)[number];
+const ALL_TABS_TYPE_FILTER_OPTIONS = [
+  { value: 'all', label: 'All' },
+  { value: 'shell', label: 'Shell' },
+  { value: 'note', label: 'Notes' },
+  { value: 'code', label: 'Code' },
+] as const;
+type AllTabsTypeFilterValue = (typeof ALL_TABS_TYPE_FILTER_OPTIONS)[number]['value'];
 
 const emit = defineEmits<{
   'update:tabs': [tabs: WorkspaceTabState[]];
+  'update:editor-pane-layout': [editorPaneLayout: WorkspaceEditorPaneLayout];
   'update:active-tab-id': [activeTabId: string | null];
   'update:recent-activity': [payload: { workspaceId: string; recentActivity: Record<string, boolean> }];
   'update:attention': [payload: { workspaceId: string; attention: Record<string, boolean> }];
@@ -63,16 +77,26 @@ const emit = defineEmits<{
 }>();
 
 const tabs = ref<WorkspaceTabState[]>([]);
+const editorPaneLayout = ref<WorkspaceEditorPaneLayout>({
+  panes: [],
+  activePaneId: null,
+});
 const activeTabId = ref<string | null>(null);
 const editingTabId = ref<string | null>(null);
 const draftTitle = ref('');
 const editingInput = ref<HTMLInputElement | null>(null);
+const allTabsSearchInput = ref<HTMLInputElement | null>(null);
 const reconnectTokens = ref<Record<string, number>>({});
 const tabMenu = ref<{ tabId: string; x: number; y: number } | null>(null);
 const creationMenu = ref<{ x: number; y: number } | null>(null);
 const commandMenuOpen = ref(false);
+const allTabsDialogOpen = ref(false);
+const allTabsSearchQuery = ref('');
+const allTabsSelectedTabId = ref<string | null>(null);
+const allTabsTypeFilter = ref<AllTabsTypeFilterValue>('all');
+const allTabsFilterMenuOpen = ref(false);
 const noteBusyByTabId = ref<Record<string, boolean>>({});
-const codeNavigationRequestByTabId = ref<Record<string, CodeNavigationRequest>>({});
+const codeNavigationRequestByPaneId = ref<Record<string, CodeNavigationRequest>>({});
 const externalFileChangeByTabId = ref<Record<string, WorkspaceExternalFileChangeState>>({});
 const trackedFileSignatureByTabId = ref<Record<string, string>>({});
 const initializedFileTrackingByTabId = ref<Record<string, boolean>>({});
@@ -94,6 +118,7 @@ const pendingCloseDialog = ref<{
   hasAttention: boolean;
 } | null>(null);
 const creationButtonRef = ref<HTMLElement | null>(null);
+const allTabsFilterButtonRef = ref<HTMLElement | null>(null);
 const creationMenuActiveActionId = ref<CreationMenuActionId>('shell');
 const TAB_ACTIVITY_TIMEOUT_MS = 1600;
 const ACTIVE_SHELL_IDLE_THRESHOLD_MS = 1200;
@@ -102,10 +127,13 @@ const EXTERNAL_FILE_POLL_INTERVAL_MS = 2500;
 const MISSING_FILE_SIGNATURE = '__missing__';
 const tabActivityTimers = new Map<string, number>();
 const sessionViewRefs = new Map<string, TerminalSessionViewExpose>();
+const tabRefs = new Map<string, HTMLElement>();
 const creationMenuItemRefs = new Map<CreationMenuActionId, HTMLButtonElement>();
+const allTabsItemRefs = new Map<string, HTMLButtonElement>();
 let externalFilePollTimer: number | null = null;
 let externalFilePollInFlight = false;
 let nextCodeNavigationToken = 1;
+let isRestoringWorkspaceIndicators = false;
 
 const sortedTabCount = computed(() => tabs.value.length);
 const menuTab = computed(() => (
@@ -123,6 +151,35 @@ const sortedPresets = computed(() => (
     return left.name.localeCompare(right.name);
   })
 ));
+const activeWorkspaceTab = computed(() => (
+  activeTabId.value ? getTabById(activeTabId.value) : null
+));
+const usesEditorPaneLayout = computed(() => Boolean(activeWorkspaceTab.value && isCodeTab(activeWorkspaceTab.value)));
+const visibleEditorPanes = computed(() => {
+  if (!usesEditorPaneLayout.value) {
+    return [];
+  }
+
+  const normalizedLayout = normalizeEditorPaneLayout(editorPaneLayout.value, tabs.value, activeTabId.value);
+
+  return sortEditorPanes(normalizedLayout.panes)
+    .map((pane) => {
+      const tab = pane.tabId ? getTabById(pane.tabId) : null;
+      return tab && isCodeTab(tab)
+        ? { pane, tab }
+        : null;
+    })
+    .filter((entry): entry is { pane: WorkspaceEditorPaneState; tab: WorkspaceCodeTabState } => Boolean(entry));
+});
+const editorPaneGridStyle = computed(() => {
+  const hasSecondColumn = visibleEditorPanes.value.some((entry) => entry.pane.col === 1);
+  const hasSecondRow = visibleEditorPanes.value.some((entry) => entry.pane.row === 1);
+
+  return {
+    gridTemplateColumns: hasSecondColumn ? 'minmax(0, 1fr) minmax(0, 1fr)' : 'minmax(0, 1fr)',
+    gridTemplateRows: hasSecondRow ? 'minmax(0, 1fr) minmax(0, 1fr)' : 'minmax(0, 1fr)',
+  };
+});
 const collapseButtonTitle = computed(() => (
   props.canCollapse
     ? `Collapse tabs panel ${props.collapseShortcutDisplay}`
@@ -148,6 +205,39 @@ const creationMenuActions = computed(() => ([
     key: 'o',
   },
 ]));
+const allTabsResults = computed(() => {
+  const normalizedQuery = allTabsSearchQuery.value.trim().toLocaleLowerCase();
+  const normalizedLayout = normalizeEditorPaneLayout(editorPaneLayout.value, tabs.value, activeTabId.value);
+
+  return tabs.value
+    .map((tab) => {
+      const secondaryMeta = getTabSecondaryMeta(tab);
+      const paneCount = isCodeTab(tab)
+        ? normalizedLayout.panes.filter((pane) => pane.tabId === tab.id).length
+        : 0;
+      const searchText = [
+        tab.title,
+        tab.type,
+        secondaryMeta,
+      ]
+        .filter(Boolean)
+        .join(' ')
+        .toLocaleLowerCase();
+
+      return {
+        tab,
+        paneCount,
+        secondaryMeta,
+        typeLabel: getTabTypeLabel(tab),
+        searchText,
+      };
+    })
+    .filter((entry) => allTabsTypeFilter.value === 'all' || entry.tab.type === allTabsTypeFilter.value)
+    .filter((entry) => !normalizedQuery || entry.searchText.includes(normalizedQuery));
+});
+const activeAllTabsTypeFilterLabel = computed(() => (
+  ALL_TABS_TYPE_FILTER_OPTIONS.find((option) => option.value === allTabsTypeFilter.value)?.label ?? 'All'
+));
 
 function isShellTab(tab: WorkspaceTabState): tab is WorkspaceShellTabState {
   return tab.type === 'shell';
@@ -220,10 +310,36 @@ function sleep(delayMs: number) {
   });
 }
 
-function syncState(nextTabs: WorkspaceTabState[], nextActiveTabId: string | null) {
+function cloneEditorPaneLayoutState(source: WorkspaceEditorPaneLayout) {
+  return cloneWorkspaceEditorPaneLayout(source);
+}
+
+function buildEmptyEditorPaneLayout(): WorkspaceEditorPaneLayout {
+  return {
+    panes: [],
+    activePaneId: null,
+  };
+}
+
+function createEditorPaneId() {
+  return `pane-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function syncState(
+  nextTabs: WorkspaceTabState[],
+  nextActiveTabId: string | null,
+  nextEditorPaneLayout = editorPaneLayout.value,
+) {
+  const normalizedEditorPaneLayout = normalizeEditorPaneLayout(
+    nextEditorPaneLayout,
+    nextTabs,
+    nextActiveTabId,
+  );
   tabs.value = cloneTabs(nextTabs);
+  editorPaneLayout.value = cloneEditorPaneLayoutState(normalizedEditorPaneLayout);
   activeTabId.value = nextActiveTabId;
   emit('update:tabs', cloneTabs(nextTabs));
+  emit('update:editor-pane-layout', cloneEditorPaneLayoutState(normalizedEditorPaneLayout));
   emit('update:active-tab-id', nextActiveTabId);
 }
 
@@ -294,7 +410,33 @@ function setSessionViewRef(
   sessionViewRefs.set(tabId, sessionView);
 }
 
+function setTabRef(
+  tabId: string,
+  element: Element | ComponentPublicInstance | null,
+) {
+  const tabElement = element as HTMLElement | null;
+
+  if (!tabElement) {
+    tabRefs.delete(tabId);
+    return;
+  }
+
+  tabRefs.set(tabId, tabElement);
+}
+
 function setActiveTab(tabId: string) {
+  const targetTab = getTabById(tabId);
+
+  if (targetTab && isCodeTab(targetTab)) {
+    assignTabToActiveEditorPane(tabId);
+    clearTabActivity(tabId);
+    clearTabAttention(tabId);
+    tabMenu.value = null;
+    creationMenu.value = null;
+    commandMenuOpen.value = false;
+    return;
+  }
+
   activeTabId.value = tabId;
   emit('update:active-tab-id', tabId);
   clearTabActivity(tabId);
@@ -302,6 +444,7 @@ function setActiveTab(tabId: string) {
   tabMenu.value = null;
   creationMenu.value = null;
   commandMenuOpen.value = false;
+  closeAllTabsDialog();
 }
 
 function markShellTabAsInteracted(tabId: string) {
@@ -539,6 +682,20 @@ function pruneTabActivityState(nextTabs: WorkspaceTabState[]) {
   if (nextBusyEntries.length !== Object.keys(noteBusyByTabId.value).length) {
     noteBusyByTabId.value = Object.fromEntries(nextBusyEntries);
   }
+
+  const nextInteractedEntries = Object.entries(interactedShellTabs.value)
+    .filter(([tabId]) => nextTabIds.has(tabId));
+
+  if (nextInteractedEntries.length !== Object.keys(interactedShellTabs.value).length) {
+    interactedShellTabs.value = Object.fromEntries(nextInteractedEntries);
+  }
+
+  const nextStartedEntries = Object.entries(startedShellTabs.value)
+    .filter(([tabId]) => nextTabIds.has(tabId));
+
+  if (nextStartedEntries.length !== Object.keys(startedShellTabs.value).length) {
+    startedShellTabs.value = Object.fromEntries(nextStartedEntries);
+  }
 }
 
 function resetTransientTabState() {
@@ -554,10 +711,58 @@ function resetTransientTabState() {
   interactedShellTabs.value = {};
   startedShellTabs.value = {};
   noteBusyByTabId.value = {};
-  codeNavigationRequestByTabId.value = {};
+  codeNavigationRequestByPaneId.value = {};
   externalFileChangeByTabId.value = {};
   trackedFileSignatureByTabId.value = {};
   initializedFileTrackingByTabId.value = {};
+}
+
+function filterIndicatorStateByTabs(
+  source: Record<string, boolean>,
+  nextTabs: WorkspaceTabState[] = tabs.value,
+) {
+  const nextTabIds = new Set(nextTabs.map((tab) => tab.id));
+
+  return Object.fromEntries(
+    Object.entries(source).filter(([tabId, isActive]) => nextTabIds.has(tabId) && Boolean(isActive)),
+  ) as Record<string, boolean>;
+}
+
+function emitWorkspaceIndicators() {
+  emit('update:recent-activity', {
+    workspaceId: props.workspaceId,
+    recentActivity: buildVisualRecentActivity(),
+  });
+  emit('update:attention', {
+    workspaceId: props.workspaceId,
+    attention: buildVisualAttention(),
+  });
+}
+
+function restoreWorkspaceIndicatorState() {
+  const restoredRecentActivity = filterIndicatorStateByTabs(props.recentActivity);
+  const restoredAttention = filterIndicatorStateByTabs(props.attention);
+  const restoredShellIds = new Set([
+    ...Object.keys(restoredRecentActivity),
+    ...Object.keys(restoredAttention),
+  ]);
+
+  tabRecentActivity.value = restoredRecentActivity;
+  tabAttention.value = restoredAttention;
+
+  if (restoredShellIds.size > 0) {
+    interactedShellTabs.value = {
+      ...interactedShellTabs.value,
+      ...Object.fromEntries([...restoredShellIds].map((tabId) => [tabId, true])),
+    };
+
+    tabLastInputAt.value = {
+      ...tabLastInputAt.value,
+      ...Object.fromEntries(
+        Object.keys(restoredAttention).map((tabId) => [tabId, tabLastInputAt.value[tabId] ?? Date.now()]),
+      ),
+    };
+  }
 }
 
 function shouldPlayActivityCompletionSound(tabId: string) {
@@ -632,6 +837,26 @@ function tabTitleTooltip(tab: WorkspaceTabState) {
     : tab.filePath;
 }
 
+function getTabTypeLabel(tab: WorkspaceTabState) {
+  if (isShellTab(tab)) {
+    return 'Shell';
+  }
+
+  if (isNoteTab(tab)) {
+    return 'Notes';
+  }
+
+  return 'Code';
+}
+
+function getTabSecondaryMeta(tab: WorkspaceTabState) {
+  if (isShellTab(tab)) {
+    return tab.cwd;
+  }
+
+  return tab.filePath;
+}
+
 function splitShortcutDisplay(display: string) {
   return display
     .replace(/^\[/, '')
@@ -663,10 +888,10 @@ function setNoteBusy(tabId: string, busy: boolean) {
   noteBusyByTabId.value = nextBusy;
 }
 
-function setCodeNavigationRequest(tabId: string, target: CodeNavigationTarget) {
-  codeNavigationRequestByTabId.value = {
-    ...codeNavigationRequestByTabId.value,
-    [tabId]: {
+function setCodeNavigationRequest(paneId: string, target: CodeNavigationTarget) {
+  codeNavigationRequestByPaneId.value = {
+    ...codeNavigationRequestByPaneId.value,
+    [paneId]: {
       ...target,
       token: nextCodeNavigationToken,
     },
@@ -674,13 +899,13 @@ function setCodeNavigationRequest(tabId: string, target: CodeNavigationTarget) {
   nextCodeNavigationToken += 1;
 }
 
-function clearCodeNavigationRequest(tabId: string) {
-  if (!(tabId in codeNavigationRequestByTabId.value)) {
+function clearCodeNavigationRequest(paneId: string) {
+  if (!(paneId in codeNavigationRequestByPaneId.value)) {
     return;
   }
 
-  const { [tabId]: _removedRequest, ...nextRequests } = codeNavigationRequestByTabId.value;
-  codeNavigationRequestByTabId.value = nextRequests;
+  const { [paneId]: _removedRequest, ...nextRequests } = codeNavigationRequestByPaneId.value;
+  codeNavigationRequestByPaneId.value = nextRequests;
 }
 
 function setTrackedFileSignature(tabId: string, signature: string) {
@@ -756,12 +981,12 @@ function pruneExternalFileRuntimeState(nextTabs: WorkspaceTabState[]) {
   });
 }
 
-function pruneCodeNavigationRequests(nextTabs: WorkspaceTabState[]) {
-  const nextTabIds = new Set(nextTabs.map((tab) => tab.id));
+function pruneCodeNavigationRequests(nextEditorPaneLayout: WorkspaceEditorPaneLayout) {
+  const nextPaneIds = new Set(nextEditorPaneLayout.panes.map((pane) => pane.id));
 
-  Object.keys(codeNavigationRequestByTabId.value).forEach((tabId) => {
-    if (!nextTabIds.has(tabId)) {
-      clearCodeNavigationRequest(tabId);
+  Object.keys(codeNavigationRequestByPaneId.value).forEach((paneId) => {
+    if (!nextPaneIds.has(paneId)) {
+      clearCodeNavigationRequest(paneId);
     }
   });
 }
@@ -849,6 +1074,372 @@ function buildFileBackedCodeTab(filePath: string, content: string): WorkspaceCod
     savedContent: content,
     fontSize: props.workspaceTabDefaults.noteFontSize,
   };
+}
+
+function getCodeTabs(sourceTabs = tabs.value) {
+  return sourceTabs.filter((tab): tab is WorkspaceCodeTabState => isCodeTab(tab));
+}
+
+function sortEditorPanes(panes: WorkspaceEditorPaneState[]) {
+  return [...panes].sort((left, right) => {
+    if (left.row !== right.row) {
+      return left.row - right.row;
+    }
+
+    return left.col - right.col;
+  });
+}
+
+function normalizeEditorPaneLayout(
+  sourceLayout: WorkspaceEditorPaneLayout,
+  nextTabs = tabs.value,
+  nextActiveTabId = activeTabId.value,
+): WorkspaceEditorPaneLayout {
+  const codeTabs = getCodeTabs(nextTabs);
+  const fallbackTabId = (
+    (nextActiveTabId && codeTabs.some((tab) => tab.id === nextActiveTabId) ? nextActiveTabId : null)
+    ?? codeTabs[0]?.id
+    ?? null
+  );
+
+  if (!fallbackTabId) {
+    return buildEmptyEditorPaneLayout();
+  }
+
+  const codeTabIds = new Set(codeTabs.map((tab) => tab.id));
+  const normalizedPanes = sortEditorPanes(sourceLayout.panes)
+    .filter((pane, index, panes) => (
+      panes.findIndex((candidate) => candidate.row === pane.row && candidate.col === pane.col) === index
+    ))
+    .map((pane) => ({
+      ...pane,
+      tabId: pane.tabId && codeTabIds.has(pane.tabId) ? pane.tabId : fallbackTabId,
+    }));
+
+  const panes = normalizedPanes.length > 0
+    ? normalizedPanes
+    : [{
+        id: 'pane-primary',
+        row: 0 as const,
+        col: 0 as const,
+        tabId: fallbackTabId,
+      }];
+
+  const activePaneId = panes.find((pane) => pane.id === sourceLayout.activePaneId)?.id
+    ?? panes.find((pane) => pane.tabId === fallbackTabId)?.id
+    ?? panes[0]?.id
+    ?? null;
+
+  return {
+    panes,
+    activePaneId,
+  };
+}
+
+function getEditorPaneById(paneId: string | null | undefined, sourceLayout = editorPaneLayout.value) {
+  if (!paneId) {
+    return null;
+  }
+
+  return sourceLayout.panes.find((pane) => pane.id === paneId) ?? null;
+}
+
+function getActiveEditorPane(sourceLayout = editorPaneLayout.value) {
+  return getEditorPaneById(sourceLayout.activePaneId, sourceLayout)
+    ?? sourceLayout.panes[0]
+    ?? null;
+}
+
+function setActiveEditorPane(paneId: string) {
+  const normalizedLayout = normalizeEditorPaneLayout(editorPaneLayout.value);
+  const targetPane = getEditorPaneById(paneId, normalizedLayout);
+
+  if (!targetPane || !targetPane.tabId) {
+    return false;
+  }
+
+  syncState(
+    tabs.value,
+    targetPane.tabId,
+    {
+      ...normalizedLayout,
+      activePaneId: targetPane.id,
+    },
+  );
+  return true;
+}
+
+function assignTabToActiveEditorPane(tabId: string) {
+  const normalizedLayout = normalizeEditorPaneLayout(editorPaneLayout.value, tabs.value, tabId);
+  const activePane = getActiveEditorPane(normalizedLayout);
+
+  if (!activePane) {
+    syncState(
+      tabs.value,
+      tabId,
+      normalizeEditorPaneLayout(buildEmptyEditorPaneLayout(), tabs.value, tabId),
+    );
+    return;
+  }
+
+  const nextLayout: WorkspaceEditorPaneLayout = {
+    panes: normalizedLayout.panes.map((pane) => (
+      pane.id === activePane.id
+        ? {
+            ...pane,
+            tabId,
+          }
+        : pane
+    )),
+    activePaneId: activePane.id,
+  };
+
+  syncState(tabs.value, tabId, nextLayout);
+}
+
+function getAdjacentEditorPaneFor(
+  pane: WorkspaceEditorPaneState,
+  direction: 'left' | 'right' | 'up' | 'down',
+  sourceLayout = editorPaneLayout.value,
+) {
+  const targetRow = direction === 'up'
+    ? pane.row - 1
+    : direction === 'down'
+      ? pane.row + 1
+      : pane.row;
+  const targetCol = direction === 'left'
+    ? pane.col - 1
+    : direction === 'right'
+      ? pane.col + 1
+      : pane.col;
+
+  if (targetRow < 0 || targetRow > 1 || targetCol < 0 || targetCol > 1) {
+    return null;
+  }
+
+  return sourceLayout.panes.find((pane) => pane.row === targetRow && pane.col === targetCol) ?? null;
+}
+
+function getAdjacentEditorPane(
+  direction: 'left' | 'right' | 'up' | 'down',
+  sourceLayout = editorPaneLayout.value,
+) {
+  const activePane = getActiveEditorPane(sourceLayout);
+
+  if (!activePane) {
+    return null;
+  }
+
+  return getAdjacentEditorPaneFor(activePane, direction, sourceLayout);
+}
+
+function compactEditorPaneLayout(sourceLayout: WorkspaceEditorPaneLayout): WorkspaceEditorPaneLayout {
+  const sortedPanes = sortEditorPanes(sourceLayout.panes);
+  const rowValues = [...new Set(sortedPanes.map((pane) => pane.row))].sort();
+  const colValues = [...new Set(sortedPanes.map((pane) => pane.col))].sort();
+
+  return {
+    panes: sortedPanes.map((pane) => ({
+      ...pane,
+      row: (rowValues.indexOf(pane.row) === 1 ? 1 : 0),
+      col: (colValues.indexOf(pane.col) === 1 ? 1 : 0),
+    })),
+    activePaneId: sourceLayout.activePaneId,
+  };
+}
+
+function splitEditorPane(direction: 'left' | 'right' | 'up' | 'down') {
+  const activeTab = activeTabId.value ? getTabById(activeTabId.value) : null;
+
+  if (!activeTab || !isCodeTab(activeTab)) {
+    return false;
+  }
+
+  const normalizedLayout = normalizeEditorPaneLayout(editorPaneLayout.value, tabs.value, activeTab.id);
+  const activePane = getActiveEditorPane(normalizedLayout);
+
+  if (!activePane || !activePane.tabId) {
+    return false;
+  }
+
+  const adjacentPane = getAdjacentEditorPaneFor(activePane, direction, normalizedLayout);
+
+  if (adjacentPane) {
+    return setActiveEditorPane(adjacentPane.id);
+  }
+
+  if (normalizedLayout.panes.length >= 4) {
+    return false;
+  }
+
+  const targetRow = direction === 'up'
+    ? activePane.row - 1
+    : direction === 'down'
+      ? activePane.row + 1
+      : activePane.row;
+  const targetCol = direction === 'left'
+    ? activePane.col - 1
+    : direction === 'right'
+      ? activePane.col + 1
+      : activePane.col;
+
+  if (targetRow < 0 || targetRow > 1 || targetCol < 0 || targetCol > 1) {
+    return false;
+  }
+
+  const nextPane: WorkspaceEditorPaneState = {
+    id: createEditorPaneId(),
+    row: targetRow === 1 ? 1 : 0,
+    col: targetCol === 1 ? 1 : 0,
+    tabId: activePane.tabId,
+  };
+  const nextLayout = compactEditorPaneLayout({
+    panes: [...normalizedLayout.panes, nextPane],
+    activePaneId: nextPane.id,
+  });
+  syncState(tabs.value, activePane.tabId, nextLayout);
+  return true;
+}
+
+function closeEditorPane(direction: 'left' | 'right' | 'up' | 'down') {
+  const activeTab = activeTabId.value ? getTabById(activeTabId.value) : null;
+
+  if (!activeTab || !isCodeTab(activeTab)) {
+    return false;
+  }
+
+  const normalizedLayout = normalizeEditorPaneLayout(editorPaneLayout.value, tabs.value, activeTab.id);
+  const activePane = getActiveEditorPane(normalizedLayout);
+
+  if (!activePane || normalizedLayout.panes.length <= 1) {
+    return false;
+  }
+
+  const adjacentPane = getAdjacentEditorPaneFor(activePane, direction, normalizedLayout);
+
+  if (!adjacentPane || !adjacentPane.tabId) {
+    return false;
+  }
+
+  const nextLayout = compactEditorPaneLayout({
+    panes: normalizedLayout.panes.filter((pane) => pane.id !== activePane.id),
+    activePaneId: adjacentPane.id,
+  });
+  syncState(tabs.value, adjacentPane.tabId, nextLayout);
+  return true;
+}
+
+function splitSpecificEditorPane(paneId: string, direction: 'left' | 'right' | 'up' | 'down') {
+  const normalizedLayout = normalizeEditorPaneLayout(editorPaneLayout.value, tabs.value, activeTabId.value);
+  const pane = getEditorPaneById(paneId, normalizedLayout);
+
+  if (!pane || !pane.tabId) {
+    return false;
+  }
+
+  const currentTab = getTabById(pane.tabId);
+
+  if (!currentTab || !isCodeTab(currentTab)) {
+    return false;
+  }
+
+  const adjacentPane = getAdjacentEditorPaneFor(pane, direction, normalizedLayout);
+
+  if (adjacentPane) {
+    return setActiveEditorPane(adjacentPane.id);
+  }
+
+  if (normalizedLayout.panes.length >= 4) {
+    return false;
+  }
+
+  const targetRow = direction === 'up'
+    ? pane.row - 1
+    : direction === 'down'
+      ? pane.row + 1
+      : pane.row;
+  const targetCol = direction === 'left'
+    ? pane.col - 1
+    : direction === 'right'
+      ? pane.col + 1
+      : pane.col;
+
+  if (targetRow < 0 || targetRow > 1 || targetCol < 0 || targetCol > 1) {
+    return false;
+  }
+
+  const nextPane: WorkspaceEditorPaneState = {
+    id: createEditorPaneId(),
+    row: targetRow === 1 ? 1 : 0,
+    col: targetCol === 1 ? 1 : 0,
+    tabId: pane.tabId,
+  };
+  const nextLayout = compactEditorPaneLayout({
+    panes: [...normalizedLayout.panes, nextPane],
+    activePaneId: nextPane.id,
+  });
+  syncState(tabs.value, pane.tabId, nextLayout);
+  return true;
+}
+
+function resolveEditorPaneCloseDirection(paneId: string) {
+  const normalizedLayout = normalizeEditorPaneLayout(editorPaneLayout.value, tabs.value, activeTabId.value);
+  const pane = getEditorPaneById(paneId, normalizedLayout);
+
+  if (!pane) {
+    return null;
+  }
+
+  const directions: Array<'left' | 'right' | 'up' | 'down'> = ['left', 'right', 'up', 'down'];
+  return directions.find((direction) => Boolean(getAdjacentEditorPaneFor(pane, direction, normalizedLayout))) ?? null;
+}
+
+function findClosestRemainingEditorPane(
+  pane: WorkspaceEditorPaneState,
+  panes: WorkspaceEditorPaneState[],
+) {
+  if (!panes.length) {
+    return null;
+  }
+
+  return [...panes]
+    .sort((left, right) => {
+      const leftDistance = Math.abs(left.row - pane.row) + Math.abs(left.col - pane.col);
+      const rightDistance = Math.abs(right.row - pane.row) + Math.abs(right.col - pane.col);
+
+      if (leftDistance !== rightDistance) {
+        return leftDistance - rightDistance;
+      }
+
+      if (left.row !== right.row) {
+        return left.row - right.row;
+      }
+
+      return left.col - right.col;
+    })[0] ?? null;
+}
+
+function closeSpecificEditorPane(paneId: string) {
+  const normalizedLayout = normalizeEditorPaneLayout(editorPaneLayout.value, tabs.value, activeTabId.value);
+  const pane = getEditorPaneById(paneId, normalizedLayout);
+
+  if (!pane || normalizedLayout.panes.length <= 1) {
+    return false;
+  }
+
+  const remainingPanes = normalizedLayout.panes.filter((entry) => entry.id !== paneId);
+  const targetPane = findClosestRemainingEditorPane(pane, remainingPanes);
+
+  if (!targetPane?.tabId) {
+    return false;
+  }
+
+  const nextLayout = compactEditorPaneLayout({
+    panes: remainingPanes,
+    activePaneId: targetPane.id,
+  });
+  syncState(tabs.value, targetPane.tabId, nextLayout);
+  return true;
 }
 
 function suggestNoteFileName(tab: WorkspaceNoteTabState) {
@@ -1193,7 +1784,11 @@ async function openCodeNavigationTarget(target: CodeNavigationTarget) {
   }
 
   if (isCodeTab(openedTab) && (target.line || target.column)) {
-    setCodeNavigationRequest(openedTab.id, target);
+    const activePane = getActiveEditorPane(normalizeEditorPaneLayout(editorPaneLayout.value, tabs.value, openedTab.id));
+
+    if (activePane) {
+      setCodeNavigationRequest(activePane.id, target);
+    }
   }
 
   return openedTab;
@@ -1376,6 +1971,14 @@ function setEditingInput(element: Element | ComponentPublicInstance | null) {
   editingInput.value = element as HTMLInputElement | null;
 }
 
+function setAllTabsSearchInput(element: Element | ComponentPublicInstance | null) {
+  allTabsSearchInput.value = element as HTMLInputElement | null;
+}
+
+function setAllTabsFilterButtonRef(element: Element | ComponentPublicInstance | null) {
+  allTabsFilterButtonRef.value = element as HTMLElement | null;
+}
+
 function setCreationButtonRef(element: Element | ComponentPublicInstance | null) {
   creationButtonRef.value = element as HTMLElement | null;
 }
@@ -1394,10 +1997,125 @@ function setCreationMenuItemRef(
   creationMenuItemRefs.set(actionId, button);
 }
 
+function setAllTabsItemRef(
+  tabId: string,
+  element: Element | ComponentPublicInstance | null,
+) {
+  const button = element as HTMLButtonElement | null;
+
+  if (!button) {
+    allTabsItemRefs.delete(tabId);
+    return;
+  }
+
+  allTabsItemRefs.set(tabId, button);
+}
+
 function focusCreationMenuAction(actionId: CreationMenuActionId) {
   void nextTick(() => {
     creationMenuItemRefs.get(actionId)?.focus({ preventScroll: true });
   });
+}
+
+function scrollTabIntoView(tabId: string | null) {
+  if (!tabId) {
+    return;
+  }
+
+  tabRefs.get(tabId)?.scrollIntoView({
+    block: 'nearest',
+    inline: 'nearest',
+  });
+}
+
+function focusAllTabsSearch() {
+  void nextTick(() => {
+    allTabsSearchInput.value?.focus();
+    allTabsSearchInput.value?.select();
+  });
+}
+
+function scrollSelectedAllTabsItemIntoView() {
+  if (!allTabsSelectedTabId.value) {
+    return;
+  }
+
+  void nextTick(() => {
+    allTabsItemRefs.get(allTabsSelectedTabId.value ?? '')?.scrollIntoView({
+      block: 'nearest',
+      inline: 'nearest',
+    });
+  });
+}
+
+function openAllTabsDialog() {
+  tabMenu.value = null;
+  creationMenu.value = null;
+  commandMenuOpen.value = false;
+  allTabsDialogOpen.value = true;
+  allTabsSearchQuery.value = '';
+  allTabsTypeFilter.value = 'all';
+  allTabsFilterMenuOpen.value = false;
+  allTabsSelectedTabId.value = activeTabId.value ?? tabs.value[0]?.id ?? null;
+  focusAllTabsSearch();
+  scrollSelectedAllTabsItemIntoView();
+}
+
+function closeAllTabsDialog() {
+  allTabsDialogOpen.value = false;
+  allTabsSearchQuery.value = '';
+  allTabsTypeFilter.value = 'all';
+  allTabsFilterMenuOpen.value = false;
+  allTabsSelectedTabId.value = null;
+}
+
+function toggleAllTabsFilterMenu() {
+  allTabsFilterMenuOpen.value = !allTabsFilterMenuOpen.value;
+}
+
+function closeAllTabsFilterMenu() {
+  allTabsFilterMenuOpen.value = false;
+}
+
+function setAllTabsTypeFilter(filter: AllTabsTypeFilterValue) {
+  allTabsTypeFilter.value = filter;
+  closeAllTabsFilterMenu();
+}
+
+function selectAllTabsItem(tabId: string | null) {
+  allTabsSelectedTabId.value = tabId;
+  scrollSelectedAllTabsItemIntoView();
+}
+
+function moveAllTabsSelection(direction: -1 | 1) {
+  if (!allTabsResults.value.length) {
+    return;
+  }
+
+  const currentIndex = allTabsResults.value.findIndex((entry) => entry.tab.id === allTabsSelectedTabId.value);
+  const safeCurrentIndex = currentIndex >= 0 ? currentIndex : 0;
+  const nextIndex = (safeCurrentIndex + direction + allTabsResults.value.length) % allTabsResults.value.length;
+  const nextTabId = allTabsResults.value[nextIndex]?.tab.id ?? null;
+
+  if (nextTabId) {
+    selectAllTabsItem(nextTabId);
+  }
+}
+
+function activateSelectedAllTabsItem() {
+  const targetTabId = allTabsSelectedTabId.value ?? allTabsResults.value[0]?.tab.id ?? null;
+
+  if (!targetTabId) {
+    return false;
+  }
+
+  activateAllTabsItem(targetTabId);
+  return true;
+}
+
+function activateAllTabsItem(tabId: string) {
+  setActiveTab(tabId);
+  closeAllTabsDialog();
 }
 
 function setActiveCreationMenuAction(actionId: CreationMenuActionId, focus = true) {
@@ -1481,6 +2199,49 @@ function handleCreationMenuKeydown(event: KeyboardEvent) {
   setActiveCreationMenuAction(matchedAction.id, false);
   void activateCreationMenuAction(matchedAction.id);
   return true;
+}
+
+function handleAllTabsDialogKeydown(event: KeyboardEvent) {
+  if (!allTabsDialogOpen.value) {
+    return false;
+  }
+
+  if (event.key === 'ArrowDown' || (event.key === 'Tab' && !event.shiftKey)) {
+    event.preventDefault();
+    moveAllTabsSelection(1);
+    return true;
+  }
+
+  if (event.key === 'ArrowUp' || (event.key === 'Tab' && event.shiftKey)) {
+    event.preventDefault();
+    moveAllTabsSelection(-1);
+    return true;
+  }
+
+  if (event.key === 'Home') {
+    event.preventDefault();
+    selectAllTabsItem(allTabsResults.value[0]?.tab.id ?? null);
+    return true;
+  }
+
+  if (event.key === 'End') {
+    event.preventDefault();
+    selectAllTabsItem(allTabsResults.value.at(-1)?.tab.id ?? null);
+    return true;
+  }
+
+  if (event.key === 'Enter') {
+    event.preventDefault();
+    return activateSelectedAllTabsItem();
+  }
+
+  if ((event.ctrlKey || event.metaKey) && event.key.toLocaleLowerCase() === 'f') {
+    event.preventDefault();
+    focusAllTabsSearch();
+    return true;
+  }
+
+  return false;
 }
 
 function performCloseTab(tabId: string) {
@@ -1781,6 +2542,7 @@ function cancelEditing() {
 function openTabMenu(event: MouseEvent, tab: WorkspaceTabState) {
   event.preventDefault();
   creationMenu.value = null;
+  closeAllTabsDialog();
   tabMenu.value = {
     tabId: tab.id,
     x: event.clientX,
@@ -1792,6 +2554,7 @@ function openCreationMenu(event?: MouseEvent) {
   event?.preventDefault();
   tabMenu.value = null;
   commandMenuOpen.value = false;
+  closeAllTabsDialog();
 
   const fallbackRect = creationButtonRef.value?.getBoundingClientRect();
   const fallbackX = fallbackRect ? Math.round(fallbackRect.left + fallbackRect.width / 2) : 24;
@@ -1816,6 +2579,7 @@ function toggleCommandMenu() {
   commandMenuOpen.value = !commandMenuOpen.value;
   tabMenu.value = null;
   creationMenu.value = null;
+  closeAllTabsDialog();
 }
 
 function closeCommandMenu() {
@@ -1840,14 +2604,23 @@ function handleDocumentPointerDown(event: PointerEvent) {
   if (!target.closest('.terminal-panel__commands')) {
     closeCommandMenu();
   }
+
+  if (!target.closest('.terminal-panel__switcher-filter')) {
+    closeAllTabsFilterMenu();
+  }
 }
 
 function handleDocumentKeydown(event: KeyboardEvent) {
+  if (handleAllTabsDialogKeydown(event)) {
+    return;
+  }
+
   if (handleCreationMenuKeydown(event)) {
     return;
   }
 
   if (event.key === 'Escape') {
+    closeAllTabsDialog();
     closePendingCloseDialog();
     closeTabMenu();
     closeCreationMenu();
@@ -1936,13 +2709,54 @@ async function executePresetBySlot(slot: number) {
 }
 
 watch(
+  [activeTabId, () => tabs.value.map((tab) => tab.id).join('|')],
+  async () => {
+    await nextTick();
+    scrollTabIntoView(activeTabId.value);
+  },
+  { immediate: true },
+);
+
+watch(
+  allTabsResults,
+  (nextResults) => {
+    if (!allTabsDialogOpen.value) {
+      return;
+    }
+
+    const hasSelectedTab = nextResults.some((entry) => entry.tab.id === allTabsSelectedTabId.value);
+
+    if (hasSelectedTab) {
+      scrollSelectedAllTabsItemIntoView();
+      return;
+    }
+
+    allTabsSelectedTabId.value = nextResults.find((entry) => entry.tab.id === activeTabId.value)?.tab.id
+      ?? nextResults[0]?.tab.id
+      ?? null;
+    scrollSelectedAllTabsItemIntoView();
+  },
+  { deep: true },
+);
+
+watch(
   () => props.tabs,
   (nextTabs) => {
     tabs.value = cloneTabs(nextTabs);
     pruneTabActivityState(nextTabs);
     pruneExternalFileRuntimeState(nextTabs);
-    pruneCodeNavigationRequests(nextTabs);
+    editorPaneLayout.value = normalizeEditorPaneLayout(editorPaneLayout.value, nextTabs, activeTabId.value);
+    pruneCodeNavigationRequests(editorPaneLayout.value);
     void pollExternalFileChanges();
+  },
+  { deep: true },
+);
+
+watch(
+  () => props.editorPaneLayout,
+  (nextEditorPaneLayout) => {
+    editorPaneLayout.value = normalizeEditorPaneLayout(nextEditorPaneLayout, tabs.value, activeTabId.value);
+    pruneCodeNavigationRequests(editorPaneLayout.value);
   },
   { deep: true },
 );
@@ -1950,6 +2764,10 @@ watch(
 watch(
   [tabRecentActivity, activeTabId, tabLastTypingAt, () => props.collapsed, tabs, interactedShellTabs],
   () => {
+    if (isRestoringWorkspaceIndicators) {
+      return;
+    }
+
     emit('update:recent-activity', {
       workspaceId: props.workspaceId,
       recentActivity: buildVisualRecentActivity(),
@@ -1961,6 +2779,10 @@ watch(
 watch(
   [tabAttention, tabLastInputAt, tabs, interactedShellTabs],
   () => {
+    if (isRestoringWorkspaceIndicators) {
+      return;
+    }
+
     emit('update:attention', {
       workspaceId: props.workspaceId,
       attention: buildVisualAttention(),
@@ -1973,6 +2795,7 @@ watch(
   () => props.activeTabId,
   (nextActiveTabId) => {
     activeTabId.value = nextActiveTabId ?? props.tabs[0]?.id ?? null;
+    editorPaneLayout.value = normalizeEditorPaneLayout(editorPaneLayout.value, tabs.value, activeTabId.value);
 
     if (activeTabId.value) {
       markShellTabAsStarted(activeTabId.value);
@@ -1992,32 +2815,28 @@ watch(
 
 watch(
   () => props.workspaceId,
-  (nextWorkspaceId, previousWorkspaceId) => {
+  async (nextWorkspaceId, previousWorkspaceId) => {
     if (!nextWorkspaceId || nextWorkspaceId === previousWorkspaceId) {
       return;
     }
 
-    if (previousWorkspaceId) {
-      emit('update:recent-activity', {
-        workspaceId: previousWorkspaceId,
-        recentActivity: {},
-      });
-      emit('update:attention', {
-        workspaceId: previousWorkspaceId,
-        attention: {},
-      });
-    }
-
+    isRestoringWorkspaceIndicators = true;
     resetTransientTabState();
+    await nextTick();
+    restoreWorkspaceIndicatorState();
+    isRestoringWorkspaceIndicators = false;
+    emitWorkspaceIndicators();
   },
 );
 
 onMounted(async () => {
   tabs.value = cloneTabs(props.tabs);
+  editorPaneLayout.value = normalizeEditorPaneLayout(props.editorPaneLayout, props.tabs, props.activeTabId ?? props.tabs[0]?.id ?? null);
   activeTabId.value = props.activeTabId ?? props.tabs[0]?.id ?? null;
   if (activeTabId.value) {
     markShellTabAsStarted(activeTabId.value);
   }
+  restoreWorkspaceIndicatorState();
   ensureTab();
   document.addEventListener('pointerdown', handleDocumentPointerDown);
   document.addEventListener('keydown', handleDocumentKeydown);
@@ -2053,13 +2872,17 @@ defineExpose({
   addShellTab,
   addNoteTab,
   closeActiveTab,
+  closeEditorPane: (direction: 'left' | 'right' | 'up' | 'down') => closeEditorPane(direction),
   focusPreviousTab: () => selectAdjacentTab(-1),
   focusNextTab: () => selectAdjacentTab(1),
   executePresetBySlot,
+  openAllTabsDialog,
   openCreationMenu: () => openCreationMenu(),
   openFile: () => openWorkspaceFile(),
   openNoteFilePath: (filePath: string) => openNoteFilePath(filePath),
   openWorkspaceFilePath: (filePath: string) => openWorkspaceFilePath(filePath),
+  openNavigationTarget: (target: CodeNavigationTarget) => openCodeNavigationTarget(target),
+  splitEditorPane: (direction: 'left' | 'right' | 'up' | 'down') => splitEditorPane(direction),
 });
 </script>
 
@@ -2070,6 +2893,7 @@ defineExpose({
         <div
           v-for="tab in tabs"
           :key="tab.id"
+          :ref="(element) => setTabRef(tab.id, element)"
           class="terminal-panel__tab"
           :class="{
             'terminal-panel__tab--active': hasTabActiveChrome(tab),
@@ -2153,6 +2977,22 @@ defineExpose({
       </div>
 
       <div class="terminal-panel__controls">
+        <button
+          class="terminal-panel__all-tabs"
+          type="button"
+          :title="`Show all tabs ${SHORTCUTS.workspaceAllTabs.display} (${sortedTabCount})`"
+          aria-label="Show all tabs"
+          @click="openAllTabsDialog"
+        >
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M5.25 7.25h13.5" />
+            <path d="M5.25 12h13.5" />
+            <path d="M5.25 16.75h13.5" />
+          </svg>
+          <span class="terminal-panel__all-tabs-copy">Tabs</span>
+          <span class="terminal-panel__all-tabs-count">{{ sortedTabCount }}</span>
+        </button>
+
         <div class="terminal-panel__commands">
           <button
             class="terminal-panel__commands-button"
@@ -2260,7 +3100,7 @@ defineExpose({
         />
 
         <CodeTabView
-          v-else-if="tab.type === 'code'"
+          v-else-if="tab.type === 'code' && !usesEditorPaneLayout"
           :key="buildWorkspaceTabRuntimeKey(props.workspaceId, tab.id)"
           class="terminal-panel__view"
           :class="{ 'terminal-panel__view--active': tab.id === activeTabId }"
@@ -2271,7 +3111,7 @@ defineExpose({
           :project-root="props.projectRoot"
           :editor-theme="props.editorTheme"
           :theme-variant="props.editorThemeVariant"
-          :navigation-request="codeNavigationRequestByTabId[tab.id] ?? null"
+          :navigation-request="null"
           :is-dirty="tab.content !== tab.savedContent"
           :external-change="externalFileChangeByTabId[tab.id] ?? null"
           :font-size="tab.fontSize"
@@ -2287,6 +3127,251 @@ defineExpose({
           @update:font-size="updateCodeFontSize(tab.id, $event)"
         />
       </template>
+
+      <div
+        v-if="usesEditorPaneLayout && visibleEditorPanes.length"
+        class="terminal-panel__editor-panes"
+        :style="editorPaneGridStyle"
+      >
+        <section
+          v-for="entry in visibleEditorPanes"
+          :key="`${entry.pane.id}:${entry.tab.id}`"
+          class="terminal-panel__editor-pane"
+          :class="{ 'terminal-panel__editor-pane--active': entry.pane.id === editorPaneLayout.activePaneId }"
+          :style="{
+            gridColumn: String(entry.pane.col + 1),
+            gridRow: String(entry.pane.row + 1),
+          }"
+          @pointerdown="setActiveEditorPane(entry.pane.id)"
+        >
+          <header class="terminal-panel__editor-pane-header">
+            <button
+              class="terminal-panel__editor-pane-title"
+              type="button"
+              :title="entry.tab.filePath"
+              @click="setActiveEditorPane(entry.pane.id)"
+            >
+              {{ entry.tab.title }}
+            </button>
+
+            <div class="terminal-panel__editor-pane-actions">
+              <button
+                class="terminal-panel__editor-pane-action"
+                type="button"
+                :title="`Split right ${SHORTCUTS.editorPaneSplitRight.display}`"
+                :aria-label="`Split ${entry.tab.title} to the right`"
+                @click.stop="splitSpecificEditorPane(entry.pane.id, 'right')"
+              >
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M4.75 6A1.25 1.25 0 0 1 6 4.75h12A1.25 1.25 0 0 1 19.25 6v12A1.25 1.25 0 0 1 18 19.25H6A1.25 1.25 0 0 1 4.75 18V6Z" />
+                  <path d="M12 4.75v14.5" />
+                  <path d="M15.75 12h4.5" />
+                </svg>
+              </button>
+
+              <button
+                class="terminal-panel__editor-pane-action"
+                type="button"
+                :title="`Split down ${SHORTCUTS.editorPaneSplitDown.display}`"
+                :aria-label="`Split ${entry.tab.title} down`"
+                @click.stop="splitSpecificEditorPane(entry.pane.id, 'down')"
+              >
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M4.75 6A1.25 1.25 0 0 1 6 4.75h12A1.25 1.25 0 0 1 19.25 6v12A1.25 1.25 0 0 1 18 19.25H6A1.25 1.25 0 0 1 4.75 18V6Z" />
+                  <path d="M4.75 12h14.5" />
+                  <path d="M12 15.75v4.5" />
+                </svg>
+              </button>
+
+              <button
+                class="terminal-panel__editor-pane-action"
+                type="button"
+                :disabled="visibleEditorPanes.length <= 1"
+                title="Close pane"
+                :aria-label="`Close pane for ${entry.tab.title}`"
+                @click.stop="closeSpecificEditorPane(entry.pane.id)"
+              >
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M7 7l10 10" />
+                  <path d="M17 7 7 17" />
+                </svg>
+              </button>
+            </div>
+          </header>
+
+          <CodeTabView
+            :key="buildWorkspaceTabRuntimeKey(props.workspaceId, `${entry.pane.id}:${entry.tab.id}`)"
+            class="terminal-panel__editor-pane-view"
+            :active="entry.pane.id === editorPaneLayout.activePaneId && !collapsed"
+            :busy="Boolean(noteBusyByTabId[entry.tab.id])"
+            :content="entry.tab.content"
+            :file-path="entry.tab.filePath"
+            :project-root="props.projectRoot"
+            :editor-theme="props.editorTheme"
+            :theme-variant="props.editorThemeVariant"
+            :navigation-request="codeNavigationRequestByPaneId[entry.pane.id] ?? null"
+            :is-dirty="entry.tab.content !== entry.tab.savedContent"
+            :external-change="externalFileChangeByTabId[entry.tab.id] ?? null"
+            :font-size="entry.tab.fontSize"
+            @focus-previous-tab="selectAdjacentTab(-1)"
+            @focus-next-tab="selectAdjacentTab(1)"
+            @open-file="openWorkspaceFile(entry.tab.id)"
+            @open-navigation-target="openCodeNavigationTarget($event)"
+            @reload-from-disk="reloadEditableTabFromDisk(entry.tab.id)"
+            @save-file="saveCodeFile(entry.tab.id)"
+            @save-file-as="saveCodeFileAs(entry.tab.id)"
+            @dismiss-external-change="dismissExternalFileChange(entry.tab.id)"
+            @update:content="updateCodeContent(entry.tab.id, $event)"
+            @update:font-size="updateCodeFontSize(entry.tab.id, $event)"
+          />
+        </section>
+      </div>
+    </div>
+
+    <div
+      v-if="allTabsDialogOpen"
+      class="terminal-panel__switcher-backdrop"
+      @click.self="closeAllTabsDialog"
+    >
+      <section
+        class="terminal-panel__switcher"
+        role="dialog"
+        aria-modal="true"
+        aria-label="All tabs"
+        @click.stop
+      >
+        <header class="terminal-panel__switcher-header">
+          <div class="terminal-panel__switcher-heading">
+            <span class="terminal-panel__switcher-eyebrow">Workspace</span>
+            <h3 class="terminal-panel__switcher-title">All Tabs</h3>
+            <p class="terminal-panel__switcher-meta">
+              {{ sortedTabCount.toLocaleString() }} open
+              <span v-if="activeWorkspaceTab">current: {{ activeWorkspaceTab.title }}</span>
+            </p>
+          </div>
+
+          <button
+            class="terminal-panel__switcher-close"
+            type="button"
+            aria-label="Close all tabs list"
+            @click="closeAllTabsDialog"
+          >
+            ×
+          </button>
+        </header>
+
+        <div class="terminal-panel__switcher-toolbar">
+          <label class="terminal-panel__switcher-search">
+            <span class="terminal-panel__switcher-search-label">Search tabs</span>
+            <input
+              :ref="setAllTabsSearchInput"
+              v-model="allTabsSearchQuery"
+              class="terminal-panel__switcher-search-input"
+              type="text"
+              placeholder="title, file path, shell cwd"
+              @keydown="handleAllTabsDialogKeydown"
+            >
+          </label>
+
+          <div class="terminal-panel__switcher-filter">
+            <span class="terminal-panel__switcher-search-label">Type</span>
+            <button
+              :ref="setAllTabsFilterButtonRef"
+              class="terminal-panel__switcher-filter-button"
+              type="button"
+              :aria-expanded="allTabsFilterMenuOpen"
+              aria-haspopup="menu"
+              aria-label="Filter tabs by type"
+              @click="toggleAllTabsFilterMenu"
+            >
+              <span>{{ activeAllTabsTypeFilterLabel }}</span>
+              <svg viewBox="0 0 16 16" aria-hidden="true">
+                <path d="M4.5 6.25 8 9.75l3.5-3.5" />
+              </svg>
+            </button>
+
+            <div
+              v-if="allTabsFilterMenuOpen"
+              class="terminal-panel__switcher-filter-menu terminal-panel__menu"
+              role="menu"
+              @pointerdown.stop
+            >
+              <button
+                v-for="option in ALL_TABS_TYPE_FILTER_OPTIONS"
+                :key="option.value"
+                class="terminal-panel__menu-item"
+                :class="{ 'terminal-panel__menu-item--selected': allTabsTypeFilter === option.value }"
+                type="button"
+                role="menuitemradio"
+                :aria-checked="allTabsTypeFilter === option.value"
+                @click="setAllTabsTypeFilter(option.value)"
+              >
+                {{ option.label }}
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div class="terminal-panel__switcher-body">
+          <div
+            v-if="allTabsResults.length"
+            class="terminal-panel__switcher-list"
+            role="listbox"
+            aria-label="Open workspace tabs"
+          >
+            <button
+              v-for="entry in allTabsResults"
+              :key="entry.tab.id"
+              :ref="(element) => setAllTabsItemRef(entry.tab.id, element)"
+              class="terminal-panel__switcher-item"
+              :class="{
+                'terminal-panel__switcher-item--selected': entry.tab.id === allTabsSelectedTabId,
+                'terminal-panel__switcher-item--active': entry.tab.id === activeTabId,
+              }"
+              type="button"
+              role="option"
+              :aria-selected="entry.tab.id === allTabsSelectedTabId"
+              @mouseenter="selectAllTabsItem(entry.tab.id)"
+              @click="activateAllTabsItem(entry.tab.id)"
+            >
+              <span
+                class="terminal-panel__switcher-dot"
+                :class="{
+                  'terminal-panel__switcher-dot--dirty': isEditableTabDirty(entry.tab),
+                  'terminal-panel__switcher-dot--attention': hasAttention(entry.tab.id),
+                  'terminal-panel__switcher-dot--active': entry.tab.id === activeTabId,
+                }"
+                aria-hidden="true"
+              />
+
+              <span class="terminal-panel__switcher-copy">
+                <span class="terminal-panel__switcher-row">
+                  <span class="terminal-panel__switcher-name">{{ entry.tab.title }}</span>
+                  <span class="terminal-panel__switcher-badges">
+                    <span class="terminal-panel__switcher-badge terminal-panel__switcher-badge--type">
+                      {{ entry.typeLabel }}
+                    </span>
+                    <span v-if="entry.paneCount > 1" class="terminal-panel__switcher-badge">
+                      {{ entry.paneCount }} panes
+                    </span>
+                    <span
+                      v-if="isEditableTabDirty(entry.tab)"
+                      class="terminal-panel__switcher-badge terminal-panel__switcher-badge--dirty"
+                    >
+                      Dirty
+                    </span>
+                  </span>
+                </span>
+                <span v-if="entry.secondaryMeta" class="terminal-panel__switcher-path">{{ entry.secondaryMeta }}</span>
+              </span>
+            </button>
+          </div>
+
+          <div v-else class="terminal-panel__switcher-empty">
+            No tabs match the current search.
+          </div>
+        </div>
+      </section>
     </div>
 
     <div
@@ -2519,17 +3604,19 @@ defineExpose({
 .terminal-panel__tabs-header {
   display: flex;
   align-items: center;
-  justify-content: space-between;
   gap: 10px;
+  min-width: 0;
   padding: 10px 12px 0;
 }
 
 .terminal-panel__tabs {
   display: flex;
   align-items: center;
+  flex: 1 1 auto;
   gap: 8px;
   min-width: 0;
   overflow-x: auto;
+  overflow-y: hidden;
   padding-bottom: 2px;
 }
 
@@ -2538,6 +3625,7 @@ defineExpose({
   align-items: center;
   flex: 0 0 auto;
   gap: 8px;
+  margin-left: auto;
 }
 
 .terminal-panel__commands {
@@ -2547,6 +3635,7 @@ defineExpose({
 .terminal-panel__tab {
   display: inline-flex;
   align-items: center;
+  flex: 0 0 auto;
   gap: 4px;
   min-width: 0;
   border: 1px solid var(--border-subtle);
@@ -2717,6 +3806,7 @@ defineExpose({
 }
 
 .terminal-panel__tab-close svg,
+.terminal-panel__all-tabs svg,
 .terminal-panel__add svg,
 .terminal-panel__commands-button svg,
 .terminal-panel__collapse svg {
@@ -2739,6 +3829,43 @@ defineExpose({
   border: 1px solid var(--border-subtle);
   background: var(--terminal-panel-control-bg);
   color: var(--text-primary);
+}
+
+.terminal-panel__all-tabs {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  height: 30px;
+  padding: 0 10px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 999px;
+  background: var(--terminal-panel-control-bg);
+  color: var(--text-primary);
+  white-space: nowrap;
+}
+
+.terminal-panel__all-tabs:hover {
+  border-color: rgba(110, 197, 255, 0.2);
+  background: var(--terminal-panel-menu-hover-bg);
+}
+
+.terminal-panel__all-tabs-copy {
+  font-size: 0.76rem;
+  font-weight: 600;
+}
+
+.terminal-panel__all-tabs-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: rgba(110, 197, 255, 0.14);
+  color: var(--text-muted);
+  font-size: 0.72rem;
+  font-weight: 700;
 }
 
 .terminal-panel__collapse {
@@ -2773,6 +3900,105 @@ defineExpose({
 
 .terminal-panel__views {
   position: relative;
+  min-height: 0;
+}
+
+.terminal-panel__editor-panes {
+  display: grid;
+  gap: 12px;
+  min-height: 0;
+  height: 100%;
+}
+
+.terminal-panel__editor-pane {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  min-width: 0;
+  min-height: 0;
+  border: 1px solid var(--border-subtle);
+  border-radius: 14px;
+  overflow: hidden;
+  background: rgba(10, 14, 19, 0.82);
+}
+
+.terminal-panel__editor-pane--active {
+  border-color: rgba(110, 197, 255, 0.34);
+  box-shadow: inset 0 0 0 1px rgba(110, 197, 255, 0.12);
+}
+
+.terminal-panel__editor-pane-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+  padding: 8px 10px;
+  border-bottom: 1px solid rgba(108, 124, 148, 0.12);
+  background: rgba(15, 20, 27, 0.92);
+}
+
+.terminal-panel__editor-pane-title {
+  min-width: 0;
+  max-width: 100%;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.terminal-panel__editor-pane--active .terminal-panel__editor-pane-title {
+  color: var(--text-primary);
+}
+
+.terminal-panel__editor-pane-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+
+.terminal-panel__editor-pane-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 1px solid rgba(108, 124, 148, 0.18);
+  border-radius: 8px;
+  background: rgba(10, 14, 19, 0.32);
+  color: var(--text-muted);
+}
+
+.terminal-panel__editor-pane-action:hover:not(:disabled) {
+  border-color: rgba(110, 197, 255, 0.24);
+  background: rgba(24, 33, 43, 0.86);
+  color: var(--text-primary);
+}
+
+.terminal-panel__editor-pane-action:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.terminal-panel__editor-pane-action svg {
+  width: 14px;
+  height: 14px;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.8;
+}
+
+.terminal-panel__editor-pane-view {
+  min-width: 0;
   min-height: 0;
 }
 
@@ -2941,6 +4167,292 @@ defineExpose({
   color: #ffb3ad;
 }
 
+.terminal-panel__switcher-backdrop {
+  position: absolute;
+  inset: 0;
+  z-index: 18;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(4, 8, 12, 0.38);
+  backdrop-filter: blur(2px);
+}
+
+.terminal-panel__switcher {
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  gap: 14px;
+  width: min(720px, 100%);
+  max-height: min(620px, 100%);
+  min-height: 0;
+  padding: 18px;
+  border: 1px solid var(--border-strong);
+  border-radius: 18px;
+  background:
+    linear-gradient(160deg, rgba(69, 151, 250, 0.08), transparent 32%),
+    var(--terminal-panel-menu-bg);
+  color-scheme: dark;
+  box-shadow: 0 24px 54px rgba(0, 0, 0, 0.42);
+}
+
+.terminal-panel[data-appearance-theme='bridgegit-light'] .terminal-panel__switcher,
+.terminal-panel[data-appearance-theme='github-light'] .terminal-panel__switcher {
+  color-scheme: light;
+}
+
+.terminal-panel__switcher-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.terminal-panel__switcher-heading {
+  display: grid;
+  gap: 4px;
+}
+
+.terminal-panel__switcher-eyebrow {
+  color: var(--text-dim);
+  font-size: 0.72rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.terminal-panel__switcher-title {
+  margin: 0;
+  color: var(--text-primary);
+  font-family: var(--font-display);
+  font-size: 1.06rem;
+}
+
+.terminal-panel__switcher-meta {
+  margin: 0;
+  color: var(--text-dim);
+  font-size: 0.78rem;
+}
+
+.terminal-panel__switcher-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 10px;
+  background: rgba(17, 23, 31, 0.9);
+  color: var(--text-primary);
+  font-size: 1.12rem;
+  line-height: 1;
+}
+
+.terminal-panel__switcher-toolbar {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: end;
+}
+
+.terminal-panel__switcher-search,
+.terminal-panel__switcher-filter {
+  display: grid;
+  gap: 6px;
+}
+
+.terminal-panel__switcher-search-label {
+  color: var(--text-dim);
+  font-size: 0.74rem;
+  font-weight: 600;
+}
+
+.terminal-panel__switcher-search-input,
+.terminal-panel__switcher-filter-button {
+  width: 100%;
+  padding: 0.72rem 0.86rem;
+  border: 1px solid rgba(108, 124, 148, 0.18);
+  border-radius: 12px;
+  background: rgba(8, 12, 17, 0.42);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 0.82rem;
+  line-height: 1.2;
+}
+
+.terminal-panel__switcher-filter {
+  position: relative;
+  width: 156px;
+  flex: 0 0 auto;
+}
+
+.terminal-panel__switcher-filter-button {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  cursor: pointer;
+}
+
+.terminal-panel__switcher-filter-button svg {
+  width: 14px;
+  height: 14px;
+  flex: 0 0 auto;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.7;
+}
+
+.terminal-panel__switcher-search-input:focus,
+.terminal-panel__switcher-filter-button:focus,
+.terminal-panel__switcher-filter-button[aria-expanded='true'] {
+  outline: none;
+  border-color: rgba(110, 197, 255, 0.34);
+  box-shadow: 0 0 0 3px rgba(110, 197, 255, 0.08);
+}
+
+.terminal-panel__switcher-filter-menu {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  left: auto;
+  min-width: 156px;
+  z-index: 1;
+}
+
+.terminal-panel__switcher-body {
+  min-height: 0;
+}
+
+.terminal-panel__switcher-list {
+  display: grid;
+  gap: 8px;
+  max-height: 100%;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.terminal-panel__switcher-item {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: 12px;
+  width: 100%;
+  padding: 0.8rem 0.92rem;
+  border: 1px solid rgba(108, 124, 148, 0.14);
+  border-radius: 14px;
+  background: rgba(17, 23, 31, 0.72);
+  color: var(--text-primary);
+  text-align: left;
+}
+
+.terminal-panel__switcher-item:hover,
+.terminal-panel__switcher-item--selected {
+  border-color: rgba(110, 197, 255, 0.28);
+  background: rgba(24, 33, 43, 0.92);
+}
+
+.terminal-panel__switcher-item--active {
+  box-shadow: inset 0 0 0 1px rgba(110, 197, 255, 0.12);
+}
+
+.terminal-panel__switcher-dot {
+  width: 8px;
+  height: 8px;
+  margin-top: 0.42rem;
+  border-radius: 999px;
+  background: rgba(108, 124, 148, 0.52);
+}
+
+.terminal-panel__switcher-dot--dirty {
+  background: rgba(255, 176, 102, 0.82);
+}
+
+.terminal-panel__switcher-dot--attention {
+  background: rgba(255, 176, 102, 0.82);
+  box-shadow: 0 0 0 1px rgba(255, 176, 102, 0.24);
+}
+
+.terminal-panel__switcher-dot--active {
+  background: #6cb0ff;
+  box-shadow: 0 0 10px rgba(108, 176, 255, 0.36);
+}
+
+.terminal-panel__switcher-copy {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.terminal-panel__switcher-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.terminal-panel__switcher-name {
+  min-width: 0;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.terminal-panel__switcher-badges {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  flex: 0 0 auto;
+  margin-left: auto;
+  flex-wrap: wrap;
+}
+
+.terminal-panel__switcher-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.12rem 0.42rem;
+  border: 1px solid rgba(108, 124, 148, 0.16);
+  border-radius: 999px;
+  background: rgba(8, 12, 17, 0.42);
+  color: var(--text-dim);
+  font-size: 0.68rem;
+  white-space: nowrap;
+}
+
+.terminal-panel__switcher-badge--type {
+  border-color: rgba(110, 197, 255, 0.3);
+  background: rgba(69, 151, 250, 0.16);
+  color: #c6e2ff;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+}
+
+.terminal-panel__switcher-badge--dirty {
+  border-color: rgba(255, 176, 102, 0.24);
+  color: #ffcd93;
+}
+
+.terminal-panel__switcher-path {
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: 0.73rem;
+  line-height: 1.45;
+  word-break: break-word;
+}
+
+.terminal-panel__switcher-empty {
+  display: grid;
+  place-items: center;
+  min-height: 180px;
+  padding: 18px;
+  border: 1px dashed rgba(108, 124, 148, 0.16);
+  border-radius: 16px;
+  color: var(--text-dim);
+  text-align: center;
+}
+
 .terminal-panel__view {
   position: absolute;
   inset: 0;
@@ -2962,6 +4474,17 @@ defineExpose({
 
   .terminal-panel__controls {
     align-self: flex-end;
+  }
+
+  .terminal-panel__switcher {
+    width: 100%;
+    max-height: 100%;
+  }
+
+  .terminal-panel__switcher-row {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 6px;
   }
 }
 </style>

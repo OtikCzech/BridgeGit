@@ -4,6 +4,12 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import electronPath from 'electron';
 
+const NOISY_DBUS_PATTERNS = [
+  /^dbus-daemon\[\d+\]: .*org\.a11y\.Bus.*$/,
+  /^dbus-daemon\[\d+\]: Failed to start message bus: .*$/,
+  /^dbus-run-session: .*$/,
+];
+
 function resolveBusSocketPath(busAddress) {
   if (!busAddress) {
     return null;
@@ -48,10 +54,17 @@ function shouldWrapWithDbus(env) {
 }
 
 function buildChildEnv(extraEnv = {}) {
-  return {
+  const childEnv = {
     ...process.env,
     ...extraEnv,
   };
+
+  // Avoid AT-SPI bridge activation noise during local Linux Electron launches.
+  if (process.platform === 'linux' && childEnv.NO_AT_BRIDGE == null) {
+    childEnv.NO_AT_BRIDGE = '1';
+  }
+
+  return childEnv;
 }
 
 function ensureDbusRuntimeDir() {
@@ -67,6 +80,7 @@ export function launchElectron(options = {}) {
     stdio = 'inherit',
     extraEnv = {},
     dbusMode = 'auto',
+    quietDbusLogs = true,
   } = options;
 
   const childEnv = buildChildEnv(extraEnv);
@@ -80,11 +94,14 @@ export function launchElectron(options = {}) {
       childEnv.GSETTINGS_BACKEND = 'memory';
     }
 
-    return spawn('dbus-run-session', ['--', electronPath, ...args], {
+    const childProcess = spawn('dbus-run-session', ['--', electronPath, ...args], {
       cwd,
-      stdio,
+      stdio: quietDbusLogs && stdio === 'inherit' ? ['inherit', 'pipe', 'pipe'] : stdio,
       env: childEnv,
     });
+
+    attachFilteredOutput(childProcess, quietDbusLogs && stdio === 'inherit');
+    return childProcess;
   }
 
   if (dbusMode === 'off' && shouldWrapWithDbus(childEnv)) {
@@ -95,9 +112,49 @@ export function launchElectron(options = {}) {
     }
   }
 
-  return spawn(electronPath, args, {
+  const childProcess = spawn(electronPath, args, {
     cwd,
-    stdio,
+    stdio: quietDbusLogs && stdio === 'inherit' ? ['inherit', 'pipe', 'pipe'] : stdio,
     env: childEnv,
   });
+  attachFilteredOutput(childProcess, quietDbusLogs && stdio === 'inherit');
+  return childProcess;
+}
+
+function shouldSuppressOutputLine(line) {
+  return NOISY_DBUS_PATTERNS.some((pattern) => pattern.test(line.trim()));
+}
+
+function relayStream(source, target) {
+  if (!source) {
+    return;
+  }
+
+  let pending = '';
+  source.setEncoding('utf8');
+  source.on('data', (chunk) => {
+    pending += chunk;
+    const lines = pending.split(/\r?\n/);
+    pending = lines.pop() ?? '';
+
+    for (const line of lines) {
+      if (!shouldSuppressOutputLine(line)) {
+        target.write(`${line}\n`);
+      }
+    }
+  });
+  source.on('end', () => {
+    if (pending && !shouldSuppressOutputLine(pending)) {
+      target.write(pending);
+    }
+  });
+}
+
+function attachFilteredOutput(childProcess, enabled) {
+  if (!enabled) {
+    return;
+  }
+
+  relayStream(childProcess.stdout, process.stdout);
+  relayStream(childProcess.stderr, process.stderr);
 }

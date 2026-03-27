@@ -5,19 +5,19 @@ BridgeGit is a desktop Git client with an integrated terminal workspace, built w
 It combines:
 - Git status/staging/commit workflows
 - Diff viewer (side-by-side and unified)
-- Workspace tabs for shell sessions, notes, and code files
+- Split code panes up to 2x2
+- Workspace tabs for shell sessions and notes
 - Session persistence (repo, layout, tabs, presets)
 
 ## Highlights
 
 - Three-panel layout: Repository panel, Diff panel, Workspace panel
+- Syntax-highlighted diff viewer with open-in-editor flow
+- Split code panes with keyboard and mouse controls
+- All Tabs switcher with search and `Ctrl+E`
 - Shell tabs with multi-session support and reconnect
-- Notes tabs with Markdown source/split/preview modes plus Mermaid diagrams
-- Code editor tabs powered by CodeMirror 6
-- Worktree-aware branch switching and guarded branch/worktree actions
-- Flexible layout settings for repository side and diff placement
-- Repo family focus mode for working inside one repo family
-- Custom command presets (including default Codex/Claude presets)
+- Notes tabs with Markdown source/split/preview modes
+- Custom command presets
 - Keyboard-driven workflow for common actions
 
 ## Tech Stack
@@ -74,18 +74,20 @@ npm run start
 - `npm run dist:win` – build Windows NSIS installer
 - `npm run dist:win:portable` – build Windows portable package
 
-
 ## Default Keyboard Shortcuts
 
 - `Ctrl+1` / `Ctrl+2` / `Ctrl+3` – toggle repository/diff/workspace panels
 - `Ctrl+N` – new shell tab
 - `Ctrl+Shift+N` – new notes tab
+- `Ctrl+E` – open All Tabs switcher
 - `Ctrl+PgUp` / `Ctrl+PgDn` – previous/next shell tab
 - `Ctrl+F4` – close active shell tab
 - `Ctrl+H` – open git history
 - `Ctrl+Shift+F` – focus history search
 - `Alt+Up` / `Alt+Down` – previous/next diff item
 - `Alt+Enter` – stage current diff and continue
+- `Ctrl+Alt+Arrow` – split or focus code pane in a direction
+- `Ctrl+Alt+Shift+Arrow` – close or merge current code pane
 
 ## Security Notes
 
@@ -96,7 +98,3 @@ npm run start
 ## License
 
 MIT
-
-## Windows Note
-
-Windows may show a SmartScreen warning on first launch because BridgeGit is not yet code-signed.

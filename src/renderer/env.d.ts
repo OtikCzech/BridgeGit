@@ -95,6 +95,7 @@ declare global {
         mergeWorktreeIntoPrimaryBranch: (repoPath: string) => Promise<MergeWorktreeIntoPrimaryBranchResult>;
         removeWorktree: (repoPath: string) => Promise<RemoveWorktreeResult>;
         removeWorktreeAndDeleteBranch: (repoPath: string) => Promise<RemoveWorktreeAndDeleteBranchResult>;
+        pull: (repoPath: string) => Promise<GitStatusSummary>;
         push: (repoPath: string) => Promise<GitStatusSummary>;
       };
       terminal: {

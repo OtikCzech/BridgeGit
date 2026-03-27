@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.4.0 - 2026-03-27
+
+Workspace ergonomics release focused on reading diffs faster and managing larger editing sessions with less friction.
+
+- Syntax-highlighted `DiffViewer` with direct open-in-editor flow for changed files
+- Split code panes up to a `2x2` grid, including same-file side-by-side editing
+- `All Tabs` switcher with search, type filter and `Ctrl+E` shortcut for large workspace sessions
+- Mouse split controls and close actions for editor panes alongside the keyboard pane shortcuts
+- Quieter Linux start flow by suppressing noisy DBus accessibility wrapper logs
+
 ## v0.3.0 - 2026-03-26
 
 Workspace and repository workflow release focused on multi-repo clarity, worktree handling and repo-panel control.

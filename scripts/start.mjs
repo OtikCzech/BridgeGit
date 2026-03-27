@@ -1,8 +1,17 @@
 import { dirname, resolve } from 'node:path';
+import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { launchElectron } from './electron-launch.mjs';
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const { name: packageName, version: packageVersion } = JSON.parse(
+  readFileSync(resolve(projectRoot, 'package.json'), 'utf8'),
+);
+
+function logLifecycleEnd(details) {
+  const suffix = details ? ` ${details}` : '';
+  console.log(`> ${packageName}@${packageVersion} end${suffix}`);
+}
 
 function startElectronProcess(dbusMode = 'auto') {
   return launchElectron({
@@ -16,6 +25,7 @@ function attachExitHandler(electronProcess, dbusMode) {
 
   electronProcess.on('exit', (code, signal) => {
     if (signal) {
+      logLifecycleEnd(`(signal ${signal})`);
       process.kill(process.pid, signal);
       return;
     }
@@ -28,6 +38,7 @@ function attachExitHandler(electronProcess, dbusMode) {
       return;
     }
 
+    logLifecycleEnd(code ? `(code ${code})` : '');
     process.exit(code ?? 0);
   });
 }

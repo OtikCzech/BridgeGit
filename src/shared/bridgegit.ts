@@ -33,16 +33,40 @@ export interface GitStatusRequestOptions {
   fetchOrigin?: boolean;
 }
 
+export type BranchKind = 'local' | 'remote';
+
+export type BranchSyncStatus =
+  | 'local-only'
+  | 'remote-untracked'
+  | 'tracked-synced'
+  | 'tracked-ahead'
+  | 'tracked-behind'
+  | 'tracked-diverged'
+  | 'tracked-gone'
+  | 'remote-only';
+
 export interface BranchInfo {
   name: string;
+  shortName: string;
+  displayName: string;
+  kind: BranchKind;
   current: boolean;
   checkedOutElsewhere: boolean;
   worktreePath: string | null;
+  remoteName: string | null;
+  upstreamName: string | null;
+  ahead: number;
+  behind: number;
+  syncStatus: BranchSyncStatus;
+  hasMatchingRemote: boolean;
+  hasMatchingLocal: boolean;
 }
 
 export interface BranchSummary {
   current: string | null;
   all: BranchInfo[];
+  local: BranchInfo[];
+  remote: BranchInfo[];
 }
 
 export interface CreateBranchOptions {
@@ -307,6 +331,18 @@ export interface WorkspaceCodeTabState {
   fontSize: number;
 }
 
+export interface WorkspaceEditorPaneState {
+  id: string;
+  row: 0 | 1;
+  col: 0 | 1;
+  tabId: string | null;
+}
+
+export interface WorkspaceEditorPaneLayout {
+  panes: WorkspaceEditorPaneState[];
+  activePaneId: string | null;
+}
+
 export interface CodeNavigationTarget {
   filePath: string;
   line?: number;
@@ -332,6 +368,7 @@ export type WorkspaceTabState = WorkspaceShellTabState | WorkspaceNoteTabState |
 export interface WorkspaceSessionState {
   tabs: WorkspaceTabState[];
   activeTabId: string | null;
+  editorPaneLayout: WorkspaceEditorPaneLayout;
 }
 
 export type WorkspaceKind = 'global' | 'project';
@@ -574,10 +611,20 @@ export function cloneWorkspaceTabs(workspaceTabs: WorkspaceTabState[]): Workspac
   return workspaceTabs.map((tab) => ({ ...tab }));
 }
 
+export function cloneWorkspaceEditorPaneLayout(
+  workspaceEditorPaneLayout: WorkspaceEditorPaneLayout,
+): WorkspaceEditorPaneLayout {
+  return {
+    panes: workspaceEditorPaneLayout.panes.map((pane) => ({ ...pane })),
+    activePaneId: workspaceEditorPaneLayout.activePaneId,
+  };
+}
+
 export function cloneWorkspaceSessionState(workspaceSession: WorkspaceSessionState): WorkspaceSessionState {
   return {
     tabs: cloneWorkspaceTabs(workspaceSession.tabs),
     activeTabId: workspaceSession.activeTabId,
+    editorPaneLayout: cloneWorkspaceEditorPaneLayout(workspaceSession.editorPaneLayout),
   };
 }
 

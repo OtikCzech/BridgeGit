@@ -735,7 +735,7 @@ function formatPresetTarget(target: TerminalCommandPreset['target']): string {
               <div v-if="!draftCommandPresets.length" class="settings-dialog__empty">
                 <p class="settings-dialog__empty-title">No presets yet</p>
                 <p class="settings-dialog__empty-copy">
-                  Add your first preset for flows like <code>wsl</code>, wait for prompt, then <code>codex --continue</code>.
+                  Add your first preset for flows like <code>wsl</code>, wait for prompt, then <code>npm run build</code>.
                 </p>
               </div>
 
@@ -872,7 +872,7 @@ function formatPresetTarget(target: TerminalCommandPreset['target']): string {
                               v-model="step.value"
                               class="settings-dialog__textarea"
                               rows="3"
-                              placeholder="codex --continue"
+                              placeholder="npm run build"
                             />
                           </label>
 

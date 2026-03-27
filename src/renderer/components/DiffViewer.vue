@@ -1,8 +1,23 @@
 <script setup lang="ts">
 import { html as renderDiffHtml } from 'diff2html';
 import { ColorSchemeType } from 'diff2html/lib/types';
+import { Diff2HtmlUI } from 'diff2html/lib-esm/ui/js/diff2html-ui-base';
+import hljs from 'highlight.js/lib/core';
+import bashLanguage from 'highlight.js/lib/languages/bash';
+import cssLanguage from 'highlight.js/lib/languages/css';
+import javascriptLanguage from 'highlight.js/lib/languages/javascript';
+import jsonLanguage from 'highlight.js/lib/languages/json';
+import markdownLanguage from 'highlight.js/lib/languages/markdown';
+import phpLanguage from 'highlight.js/lib/languages/php';
+import powershellLanguage from 'highlight.js/lib/languages/powershell';
+import scssLanguage from 'highlight.js/lib/languages/scss';
+import shellLanguage from 'highlight.js/lib/languages/shell';
+import sqlLanguage from 'highlight.js/lib/languages/sql';
+import typescriptLanguage from 'highlight.js/lib/languages/typescript';
+import xmlLanguage from 'highlight.js/lib/languages/xml';
+import yamlLanguage from 'highlight.js/lib/languages/yaml';
 import type { GitDiffMode } from '../../shared/bridgegit';
-import { computed, ref } from 'vue';
+import { computed, onMounted, onUpdated, ref } from 'vue';
 
 interface Props {
   repoPath: string | null;
@@ -32,10 +47,48 @@ const emit = defineEmits<{
   'select-next': [];
   'stage-current': [];
   'discard-current': [];
-  'open-current-file': [];
+  'open-current-file': [targetLine?: number];
   'discard-hunk': [patch: string];
   'toggle-collapse': [];
 }>();
+
+hljs.registerLanguage('bash', bashLanguage);
+hljs.registerLanguage('css', cssLanguage);
+hljs.registerLanguage('javascript', javascriptLanguage);
+hljs.registerLanguage('json', jsonLanguage);
+hljs.registerLanguage('markdown', markdownLanguage);
+hljs.registerLanguage('php', phpLanguage);
+hljs.registerLanguage('powershell', powershellLanguage);
+hljs.registerLanguage('scss', scssLanguage);
+hljs.registerLanguage('shell', shellLanguage);
+hljs.registerLanguage('sql', sqlLanguage);
+hljs.registerLanguage('typescript', typescriptLanguage);
+hljs.registerLanguage('xml', xmlLanguage);
+hljs.registerLanguage('yaml', yamlLanguage);
+
+const HIGHLIGHT_LANGUAGE_MAP = new Map<string, string>([
+  ['cjs', 'javascript'],
+  ['dockerfile', 'bash'],
+  ['htm', 'xml'],
+  ['html', 'xml'],
+  ['js', 'javascript'],
+  ['jsonc', 'json'],
+  ['jsx', 'javascript'],
+  ['mjs', 'javascript'],
+  ['md', 'markdown'],
+  ['ps1', 'powershell'],
+  ['psm1', 'powershell'],
+  ['pwsh', 'powershell'],
+  ['sass', 'scss'],
+  ['sh', 'bash'],
+  ['svg', 'xml'],
+  ['ts', 'typescript'],
+  ['tsx', 'typescript'],
+  ['vue', 'xml'],
+  ['xml', 'xml'],
+  ['yml', 'yaml'],
+  ['zsh', 'bash'],
+]);
 
 interface DiffHunkSection {
   id: string;
@@ -55,6 +108,7 @@ interface ParsedHunkLine {
   newLineNumber: number | null;
 }
 
+const rootRef = ref<HTMLElement | null>(null);
 const viewMode = ref<'side-by-side' | 'line-by-line'>('side-by-side');
 const isCommitMode = computed(() => props.viewerMode === 'commit');
 const isSideBySide = computed(() => viewMode.value === 'side-by-side');
@@ -67,6 +121,10 @@ const collapseButtonTitle = computed(() => (
     : 'Diff panel cannot be collapsed while it is the last visible panel'
 ));
 const canDiscardHunks = computed(() => !isCommitMode.value && props.gitDiffMode !== 'working-tree' ? true : !isCommitMode.value);
+const currentDiffTargetLine = computed(() => findFirstChangedLine(props.diff));
+const openCurrentFileLabel = computed(() => (
+  currentDiffTargetLine.value ? `Open at line ${currentDiffTargetLine.value}` : 'Open file'
+));
 
 const hasDiff = computed(() => props.diff.includes('diff --git'));
 const renderedDiff = computed(() => {
@@ -289,10 +347,89 @@ function buildLineActions(headerLines: string[], hunkLines: string[], hunkIndex:
 
   return lineActions;
 }
+
+function findFirstChangedLine(diffText: string) {
+  if (!diffText.includes('diff --git')) {
+    return null;
+  }
+
+  const normalizedDiff = diffText.replace(/\r\n/g, '\n');
+  const diffLines = normalizedDiff.split('\n');
+  const firstHunkIndex = diffLines.findIndex((line) => line.startsWith('@@ '));
+
+  if (firstHunkIndex < 0) {
+    return null;
+  }
+
+  const hunkLines = diffLines.slice(firstHunkIndex);
+  let currentHunk: string[] = [];
+
+  for (const line of hunkLines) {
+    if (line.startsWith('@@ ') && currentHunk.length > 0) {
+      const targetLine = findFirstChangedLineInHunk(currentHunk);
+      if (targetLine) {
+        return targetLine;
+      }
+      currentHunk = [];
+    }
+
+    currentHunk.push(line);
+  }
+
+  return currentHunk.length > 0 ? findFirstChangedLineInHunk(currentHunk) : null;
+}
+
+function findFirstChangedLineInHunk(hunkLines: string[]) {
+  const parsedLines = parseHunkLines(hunkLines);
+  const firstChangedLine = parsedLines.find((line) => line.prefix !== ' ' && line.prefix !== '\\');
+
+  return firstChangedLine?.newLineNumber ?? firstChangedLine?.oldLineNumber ?? null;
+}
+
+function applySyntaxHighlighting() {
+  if (!rootRef.value) {
+    return;
+  }
+
+  const highlightTargets = rootRef.value.querySelectorAll<HTMLElement>(
+    '.diff-viewer__rendered:not(.diff-viewer__rendered--hunks), .diff-viewer__hunk-rendered',
+  );
+
+  highlightTargets.forEach((target) => {
+    const codeLines = target.querySelectorAll('.d2h-code-line-ctn');
+
+    if (!codeLines.length) {
+      return;
+    }
+
+    const hasUnhighlightedLines = Array.from(codeLines).some((line) => !line.classList.contains('hljs'));
+
+    if (!hasUnhighlightedLines) {
+      return;
+    }
+
+    try {
+      const diffUi = new Diff2HtmlUI(target, undefined, {
+        highlightLanguages: HIGHLIGHT_LANGUAGE_MAP,
+      }, hljs);
+      diffUi.highlightCode();
+    } catch (error) {
+      console.error('Failed to apply diff syntax highlighting.', error);
+    }
+  });
+}
+
+onMounted(() => {
+  applySyntaxHighlighting();
+});
+
+onUpdated(() => {
+  applySyntaxHighlighting();
+});
 </script>
 
 <template>
-  <section class="diff-viewer">
+  <section ref="rootRef" class="diff-viewer">
     <header class="diff-viewer__header">
       <div class="diff-viewer__heading">
         <span class="diff-viewer__eyebrow">
@@ -319,7 +456,24 @@ function buildLineActions(headerLines: string[], hunkLines: string[], hunkIndex:
         </button>
 
         <span class="diff-viewer__navigator-count">
-          {{ changeCount ? `${changePosition} / ${changeCount}` : '0 / 0' }}
+          <span class="diff-viewer__navigator-count-value">
+            {{ changePosition }}
+          </span>
+          <button
+            class="diff-viewer__icon-button diff-viewer__icon-button--inline"
+            type="button"
+            :disabled="!canOpenCurrentFile"
+            :title="openCurrentFileLabel"
+            :aria-label="openCurrentFileLabel"
+            @click="emit('open-current-file', currentDiffTargetLine ?? undefined)"
+          >
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M15.86 4.64a2.25 2.25 0 1 1 3.18 3.18l-9.9 9.9a.75.75 0 0 1-.33.2l-3.5 1a.75.75 0 0 1-.93-.93l1-3.5a.75.75 0 0 1 .2-.33l9.9-9.9Zm2.12 1.06a.75.75 0 0 0-1.06 0l-9.74 9.74-.58 2.03 2.03-.58 9.74-9.74a.75.75 0 0 0 0-1.06l-.39-.39Z" />
+            </svg>
+          </button>
+          <span class="diff-viewer__navigator-count-value">
+            {{ changeCount }}
+          </span>
         </span>
 
         <button
@@ -334,8 +488,11 @@ function buildLineActions(headerLines: string[], hunkLines: string[], hunkIndex:
             <path d="M9.22 5.97a.75.75 0 0 1 1.06 0l4.5 4.5a.75.75 0 0 1 0 1.06l-4.5 4.5a.75.75 0 1 1-1.06-1.06L13.19 11 9.22 7.03a.75.75 0 0 1 0-1.06Z" />
           </svg>
         </button>
+      </div>
 
+      <div class="diff-viewer__toolbar">
         <button
+          v-if="!isCommitMode"
           class="diff-viewer__stage"
           type="button"
           :disabled="!canStageCurrent"
@@ -345,6 +502,7 @@ function buildLineActions(headerLines: string[], hunkLines: string[], hunkIndex:
         </button>
 
         <button
+          v-if="!isCommitMode"
           class="diff-viewer__stage diff-viewer__stage--danger"
           type="button"
           :disabled="!canDiscardCurrent"
@@ -353,17 +511,6 @@ function buildLineActions(headerLines: string[], hunkLines: string[], hunkIndex:
           Discard current
         </button>
 
-        <button
-          class="diff-viewer__stage diff-viewer__stage--neutral"
-          type="button"
-          :disabled="!canOpenCurrentFile"
-          @click="emit('open-current-file')"
-        >
-          Open file
-        </button>
-      </div>
-
-      <div class="diff-viewer__toolbar">
         <button
           class="diff-viewer__icon-button diff-viewer__icon-button--view-toggle"
           type="button"
@@ -479,7 +626,7 @@ function buildLineActions(headerLines: string[], hunkLines: string[], hunkIndex:
 
 .diff-viewer__header {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto auto;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
   align-items: center;
   gap: 16px;
 }
@@ -526,11 +673,18 @@ function buildLineActions(headerLines: string[], hunkLines: string[], hunkIndex:
 }
 
 .diff-viewer__navigator-count {
-  min-width: 52px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 72px;
   color: var(--text-dim);
   font-family: var(--font-mono);
   font-size: 0.78rem;
   text-align: center;
+}
+
+.diff-viewer__navigator-count-value {
+  min-width: 1ch;
 }
 
 .diff-viewer__icon-button,
@@ -558,6 +712,12 @@ function buildLineActions(headerLines: string[], hunkLines: string[], hunkIndex:
 
 .diff-viewer__icon-button--view-toggle {
   color: rgba(123, 208, 255, 0.9);
+}
+
+.diff-viewer__icon-button--inline {
+  width: 24px;
+  height: 24px;
+  color: rgba(123, 208, 255, 0.92);
 }
 
 .diff-viewer__stage {

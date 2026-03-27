@@ -49,6 +49,10 @@ function buildOnboardingWorkspaceSession(
       },
     ],
     activeTabId: WELCOME_NOTE_TAB_ID,
+    editorPaneLayout: {
+      panes: [],
+      activePaneId: null,
+    },
   };
 }
 

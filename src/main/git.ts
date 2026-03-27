@@ -8,6 +8,7 @@ import { simpleGit, type FileStatusResult, type SimpleGit } from 'simple-git';
 import {
   areRepoPathsEquivalent,
   BranchInfo,
+  BranchSyncStatus,
   BranchSummary,
   CreateBranchOptions,
   CreateBranchResult,
@@ -426,46 +427,162 @@ function sortAndDedupe(changes: GitChange[]): GitChange[] {
   return [...unique.values()].sort((left, right) => left.path.localeCompare(right.path));
 }
 
-function parseBranchList(rawBranches: string): BranchInfo[] {
+interface LocalBranchRef {
+  name: string;
+  current: boolean;
+  upstreamName: string | null;
+  upstreamTrack: string | null;
+  upstreamTrackShort: string | null;
+}
+
+interface RemoteBranchRef {
+  name: string;
+  shortName: string;
+  remoteName: string | null;
+}
+
+function parseLocalBranchRefs(rawBranches: string, currentBranchName: string | null): LocalBranchRef[] {
   return rawBranches
     .split('\n')
     .map((line) => line.trimEnd())
     .filter(Boolean)
     .map((line) => {
-      const current = line.startsWith('* ');
-      const name = line.slice(2).trim();
+      const [name = '', upstreamName = '', upstreamTrack = '', upstreamTrackShort = ''] = line.split('\t');
+      const trimmedName = name.trim();
+
       return {
-        name,
-        current,
-        checkedOutElsewhere: false,
-        worktreePath: null,
+        name: trimmedName,
+        current: Boolean(trimmedName) && trimmedName === currentBranchName,
+        upstreamName: upstreamName.trim() || null,
+        upstreamTrack: upstreamTrack.trim() || null,
+        upstreamTrackShort: upstreamTrackShort.trim() || null,
       };
     })
-    .filter((branch) => branch.name && !branch.name.startsWith('('));
+    .filter((branch) => Boolean(branch.name));
+}
+
+function parseRemoteBranchRefs(rawBranches: string): RemoteBranchRef[] {
+  return rawBranches
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .filter((name) => !name.endsWith('/HEAD'))
+    .map((name) => {
+      const [remoteName = '', ...shortNameParts] = name.split('/');
+      const shortName = shortNameParts.join('/').trim();
+
+      return {
+        name,
+        shortName,
+        remoteName: remoteName.trim() || null,
+      };
+    })
+    .filter((branch) => Boolean(branch.shortName));
+}
+
+function parseBranchAheadBehind(upstreamTrack: string | null): Pick<BranchInfo, 'ahead' | 'behind'> {
+  if (!upstreamTrack) {
+    return {
+      ahead: 0,
+      behind: 0,
+    };
+  }
+
+  return {
+    ahead: Number(upstreamTrack.match(/\bahead (\d+)\b/)?.[1] ?? 0),
+    behind: Number(upstreamTrack.match(/\bbehind (\d+)\b/)?.[1] ?? 0),
+  };
+}
+
+function resolveLocalBranchSyncStatus(
+  branch: LocalBranchRef,
+  remoteBranchShortNames: Set<string>,
+): BranchSyncStatus {
+  if (!branch.upstreamName) {
+    return remoteBranchShortNames.has(branch.name) ? 'remote-untracked' : 'local-only';
+  }
+
+  if (branch.upstreamTrack?.includes('gone')) {
+    return 'tracked-gone';
+  }
+
+  switch (branch.upstreamTrackShort) {
+    case '>':
+      return 'tracked-ahead';
+    case '<':
+      return 'tracked-behind';
+    case '<>':
+      return 'tracked-diverged';
+    case '=':
+    default:
+      return 'tracked-synced';
+  }
 }
 
 async function buildBranchSummary(
-  branches: BranchInfo[],
+  localBranchRefs: LocalBranchRef[],
+  remoteBranchRefs: RemoteBranchRef[],
   worktrees: GitWorktreeSummary[],
 ): Promise<BranchSummary> {
-  const all = branches.map((branch) => {
+  const remoteBranchShortNames = new Set(remoteBranchRefs.map((branch) => branch.shortName));
+  const localBranchNames = new Set(localBranchRefs.map((branch) => branch.name));
+  const localTrackedRemoteNames = new Set(
+    localBranchRefs
+      .map((branch) => branch.upstreamName)
+      .filter((branchName): branchName is string => Boolean(branchName)),
+  );
+
+  const local = localBranchRefs.map<BranchInfo>((branch) => {
     const matchingWorktree = worktrees.find((worktree) => (
       !worktree.current
       && !worktree.detached
       && !worktree.bare
       && worktree.branch === branch.name
     ));
+    const { ahead, behind } = parseBranchAheadBehind(branch.upstreamTrack);
 
     return {
-      ...branch,
+      name: branch.name,
+      shortName: branch.name,
+      displayName: branch.name,
+      kind: 'local',
+      current: branch.current,
       checkedOutElsewhere: Boolean(matchingWorktree),
       worktreePath: matchingWorktree?.path ?? null,
+      remoteName: branch.upstreamName?.split('/')[0] ?? null,
+      upstreamName: branch.upstreamName,
+      ahead,
+      behind,
+      syncStatus: resolveLocalBranchSyncStatus(branch, remoteBranchShortNames),
+      hasMatchingRemote: remoteBranchShortNames.has(branch.name),
+      hasMatchingLocal: true,
     };
   });
 
+  const remote = remoteBranchRefs
+    .filter((branch) => !localBranchNames.has(branch.shortName) && !localTrackedRemoteNames.has(branch.name))
+    .map<BranchInfo>((branch) => ({
+      name: branch.name,
+      shortName: branch.shortName,
+      displayName: branch.shortName,
+      kind: 'remote',
+      current: false,
+      checkedOutElsewhere: false,
+      worktreePath: null,
+      remoteName: branch.remoteName,
+      upstreamName: null,
+      ahead: 0,
+      behind: 0,
+      syncStatus: 'remote-only',
+      hasMatchingRemote: true,
+      hasMatchingLocal: false,
+    }));
+
   return {
-    current: all.find((branch) => branch.current)?.name ?? null,
-    all,
+    current: local.find((branch) => branch.current)?.name ?? null,
+    all: [...local, ...remote],
+    local,
+    remote,
   };
 }
 
@@ -777,22 +894,27 @@ async function getStatusSummary(
 
 async function getBranches(repoPath: string): Promise<BranchSummary> {
   const repository = await resolveRepository(repoPath);
-  const branchArgs = ['branch', '--list', '--no-color'];
+  const localBranchArgs = [
+    'for-each-ref',
+    '--format=%(refname:short)\t%(upstream:short)\t%(upstream:track,nobracket)\t%(upstream:trackshort)',
+    'refs/heads',
+  ];
+  const remoteBranchArgs = ['for-each-ref', '--format=%(refname:short)', 'refs/remotes'];
   const worktreeArgs = ['worktree', 'list', '--porcelain'];
+  const currentBranchArgs = ['branch', '--show-current'];
   const currentRepoPath = resolveRepoPath(repoPath);
 
-  const [rawBranches, rawWorktrees] = repository.mode === 'wsl'
-    ? await Promise.all([
-      runWslGit(repository, branchArgs),
-      runWslGit(repository, worktreeArgs),
-    ])
-    : await Promise.all([
-      repository.git.raw(branchArgs),
-      repository.git.raw(worktreeArgs),
-    ]);
+  const [rawLocalBranches, rawRemoteBranches, rawWorktrees, rawCurrentBranch] = await Promise.all([
+    runGit(repository, localBranchArgs),
+    runGit(repository, remoteBranchArgs),
+    runGit(repository, worktreeArgs),
+    runGit(repository, currentBranchArgs),
+  ]);
+  const currentBranchName = rawCurrentBranch.trim() || null;
 
   return buildBranchSummary(
-    parseBranchList(rawBranches),
+    parseLocalBranchRefs(rawLocalBranches, currentBranchName),
+    parseRemoteBranchRefs(rawRemoteBranches),
     parseWorktreeSummary(rawWorktrees, repository, currentRepoPath),
   );
 }
@@ -1555,7 +1677,16 @@ async function checkoutBranch(repoPath: string, branchName: string): Promise<Bra
   const branches = await getBranches(repoPath);
   const targetBranch = branches.all.find((branch) => branch.name === branchName) ?? null;
 
-  if (targetBranch?.checkedOutElsewhere) {
+  if (!targetBranch) {
+    throw new Error(`Branch "${branchName}" was not found.`);
+  }
+
+  if (targetBranch.kind === 'remote') {
+    await runGit(repository, ['checkout', '--track', targetBranch.name]);
+    return getBranches(repoPath);
+  }
+
+  if (targetBranch.checkedOutElsewhere) {
     const detail = targetBranch.worktreePath
       ? ` Checked out at ${targetBranch.worktreePath}.`
       : '';
@@ -1644,6 +1775,10 @@ async function deleteBranch(repoPath: string, branchName: string): Promise<Delet
     throw new Error(`Branch "${validatedBranchName}" does not exist.`);
   }
 
+  if (targetBranch.kind !== 'local') {
+    throw new Error(`Remote branch "${validatedBranchName}" cannot be deleted here.`);
+  }
+
   if (targetBranch.current) {
     throw new Error(`Branch "${validatedBranchName}" is currently checked out.`);
   }
@@ -1707,8 +1842,13 @@ async function resolveMergeTargetBranch(repository: RepositoryContext): Promise<
     // Fallback to local branch detection below.
   }
 
-  const rawBranches = await runGit(repository, ['branch', '--list', '--no-color', 'master', 'main']);
-  const branchNames = new Set(parseBranchList(rawBranches).map((branch) => branch.name));
+  const rawBranches = await runGit(repository, ['for-each-ref', '--format=%(refname:short)', 'refs/heads/master', 'refs/heads/main']);
+  const branchNames = new Set(
+    rawBranches
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean),
+  );
 
   if (branchNames.has('main')) {
     return 'main';
@@ -1898,6 +2038,28 @@ async function pushCurrentBranch(repoPath: string): Promise<GitStatusSummary> {
   return getStatusSummary(repoPath);
 }
 
+async function pullCurrentBranch(repoPath: string): Promise<GitStatusSummary> {
+  const repository = await resolveRepository(repoPath);
+  const status = await getStatusSummary(repoPath);
+  const currentBranch = status.currentBranch?.trim() ?? '';
+
+  if (!currentBranch) {
+    throw new Error('Cannot pull from detached HEAD.');
+  }
+
+  if (!status.trackingBranch) {
+    throw new Error(`Branch "${currentBranch}" does not track a remote branch.`);
+  }
+
+  if (repository.mode === 'wsl') {
+    await runWslGit(repository, ['pull', '--ff-only']);
+  } else {
+    await repository.git.raw(['pull', '--ff-only']);
+  }
+
+  return getStatusSummary(repoPath);
+}
+
 export function registerGitIpcHandlers() {
   ipcMain.handle('git:isRepository', (_event, repoPath: string) => isRepository(repoPath));
   ipcMain.handle('git:initRepository', (_event, repoPath: string) => initRepository(repoPath));
@@ -1961,6 +2123,9 @@ export function registerGitIpcHandlers() {
   );
   ipcMain.handle('git:removeWorktreeAndDeleteBranch', (_event, repoPath: string) =>
     removeWorktreeAndDeleteBranch(repoPath),
+  );
+  ipcMain.handle('git:pull', (_event, repoPath: string) =>
+    pullCurrentBranch(repoPath),
   );
   ipcMain.handle('git:push', (_event, repoPath: string) =>
     pushCurrentBranch(repoPath),

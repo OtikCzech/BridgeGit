@@ -132,3 +132,63 @@
 .d2h-wrapper .d2h-deleted-tag {
   border: 0;
 }
+
+.d2h-wrapper .hljs {
+  color: inherit;
+  background: transparent;
+}
+
+.d2h-wrapper .hljs-comment,
+.d2h-wrapper .hljs-quote {
+  color: var(--code-token-comment);
+  font-style: italic;
+}
+
+.d2h-wrapper .hljs-string,
+.d2h-wrapper .hljs-regexp,
+.d2h-wrapper .hljs-meta-string {
+  color: var(--code-token-string);
+}
+
+.d2h-wrapper .hljs-number,
+.d2h-wrapper .hljs-literal,
+.d2h-wrapper .hljs-symbol {
+  color: var(--code-token-number);
+}
+
+.d2h-wrapper .hljs-keyword,
+.d2h-wrapper .hljs-operator,
+.d2h-wrapper .hljs-selector-tag,
+.d2h-wrapper .hljs-meta,
+.d2h-wrapper .hljs-section {
+  color: var(--code-token-keyword);
+}
+
+.d2h-wrapper .hljs-variable,
+.d2h-wrapper .hljs-template-variable,
+.d2h-wrapper .hljs-name,
+.d2h-wrapper .hljs-title {
+  color: var(--code-token-variable);
+}
+
+.d2h-wrapper .hljs-property,
+.d2h-wrapper .hljs-attr,
+.d2h-wrapper .hljs-attribute,
+.d2h-wrapper .hljs-selector-id,
+.d2h-wrapper .hljs-selector-class {
+  color: var(--code-token-property);
+}
+
+.d2h-wrapper .hljs-tag,
+.d2h-wrapper .hljs-type,
+.d2h-wrapper .hljs-built_in {
+  color: var(--code-token-tag);
+}
+
+.d2h-wrapper .hljs-punctuation {
+  color: var(--code-token-punctuation);
+}
+
+.d2h-wrapper .hljs-subst {
+  color: inherit;
+}
