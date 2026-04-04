@@ -35,7 +35,7 @@ Workspace and repository workflow release focused on multi-repo clarity, worktre
 
 Post-release fix for the in-app update note and settings guidance.
 
-- Updated the internal welcome/update note for the 0.2.x release line
+- Updated the in-app welcome/update note for the 0.2.x release line
 - Added an explicit `Ctrl + wheel` font-size hint in Settings
 
 ## v0.2.0 - 2026-03-21

@@ -7,5 +7,3 @@ release/
 *.log
 .DS_Store
 Thumbs.db
-.gstack/
-.codex

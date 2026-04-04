@@ -1,6 +1,6 @@
 param(
   [string]$ProjectRoot = $(Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path,
-  [string]$PythonPath = "C:\Users\otik\AppData\Local\Programs\Python\Python312\python.exe"
+  [string]$PythonPath = ""
 )
 
 Set-Location $ProjectRoot
@@ -11,14 +11,70 @@ $unpackedDir = Join-Path $releaseDir "win-unpacked"
 $exePath = Join-Path $unpackedDir "BridgeGit.exe"
 $iconPath = Join-Path $ProjectRoot "assets\icons\bridgegit.ico"
 
-if (Test-Path $PythonPath) {
-  $env:PYTHON = $PythonPath
-  $env:NODE_GYP_FORCE_PYTHON = $PythonPath
-  Write-Output "[BridgeGit] Using Python at $PythonPath"
+function Resolve-CommandPath {
+  param(
+    [string[]]$Names
+  )
+
+  foreach ($name in $Names) {
+    $command = Get-Command $name -ErrorAction SilentlyContinue | Select-Object -First 1
+
+    if ($command -and $command.Source) {
+      return $command.Source
+    }
+  }
+
+  return $null
+}
+
+function Resolve-PythonPath {
+  param(
+    [string]$PreferredPath
+  )
+
+  if ($PreferredPath -and (Test-Path $PreferredPath)) {
+    return (Resolve-Path $PreferredPath).Path
+  }
+
+  $pyLauncher = Resolve-CommandPath @("py")
+  if ($pyLauncher) {
+    $resolvedPython = & $pyLauncher -3 -c "import sys; print(sys.executable)" 2>$null
+    if ($LASTEXITCODE -eq 0) {
+      $resolvedPython = $resolvedPython.Trim()
+      if ($resolvedPython -and (Test-Path $resolvedPython)) {
+        return $resolvedPython
+      }
+    }
+  }
+
+  $pythonCommand = Resolve-CommandPath @("python", "python3")
+  if ($pythonCommand) {
+    return $pythonCommand
+  }
+
+  return $null
+}
+
+function Get-RceditOverrideRoot {
+  if ($env:LOCALAPPDATA) {
+    return Join-Path $env:LOCALAPPDATA "BridgeGit\tools\rcedit"
+  }
+
+  return Join-Path ([System.IO.Path]::GetTempPath()) "BridgeGit\rcedit"
+}
+
+$resolvedPythonPath = Resolve-PythonPath $PythonPath
+
+if ($resolvedPythonPath) {
+  $env:PYTHON = $resolvedPythonPath
+  $env:NODE_GYP_FORCE_PYTHON = $resolvedPythonPath
+  Write-Output "[BridgeGit] Using Python at $resolvedPythonPath"
+} else {
+  Write-Warning "[BridgeGit] Python not found automatically. npm install may still work if node-gyp is already configured, otherwise rerun with -PythonPath <path>."
 }
 
 $electronBuilderCache = Join-Path $env:LOCALAPPDATA "electron-builder\Cache\winCodeSign"
-$rceditOverrideRoot = Join-Path $env:LOCALAPPDATA "bridgegit-tools\rcedit"
+$rceditOverrideRoot = Get-RceditOverrideRoot
 $rceditCandidates = @()
 
 if (Test-Path $electronBuilderCache) {
@@ -69,7 +125,7 @@ if ($LASTEXITCODE -ne 0) {
 
 $rceditExe = Join-Path $rceditOverrideRoot "rcedit-x64.exe"
 if (!(Test-Path $rceditExe)) {
-  Write-Error "[BridgeGit] Missing RCEdit binary at $rceditExe"
+  Write-Error "[BridgeGit] Missing RCEdit binary at $rceditExe. Re-run after electron-builder downloads winCodeSign tools."
   exit 1
 }
 
