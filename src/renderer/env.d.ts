@@ -6,11 +6,15 @@ import type {
   CreateBranchResult,
   DeleteBranchResult,
   GitChange,
+  GitCommitDetail,
   GitDiffMode,
+  GitLogRequest,
+  GitLogScope,
   GitLogResult,
   GitStatusRequestOptions,
   GitStatusSummary,
   GitTextSearchMatch,
+  GitTextSearchOptions,
   GitWorktreeSummary,
   MergeWorktreeIntoPrimaryBranchResult,
   NoteFileHandle,
@@ -65,12 +69,13 @@ declare global {
         status: (repoPath: string, options?: GitStatusRequestOptions) => Promise<GitStatusSummary>;
         branches: (repoPath: string) => Promise<BranchSummary>;
         listDirectory: (repoPath: string, relativePath?: string) => Promise<RepoDirectoryEntry[]>;
+        listFiles: (repoPath: string) => Promise<string[]>;
         searchFiles: (repoPath: string, query: string, limit?: number) => Promise<string[]>;
         searchText: (
           repoPath: string,
           query: string,
           limit?: number,
-          wholeWord?: boolean,
+          options?: GitTextSearchOptions,
         ) => Promise<GitTextSearchMatch[]>;
         worktrees: (repoPath: string) => Promise<GitWorktreeSummary[]>;
         diff: (repoPath: string, filePath?: string, mode?: GitDiffMode) => Promise<string>;
@@ -78,8 +83,15 @@ declare global {
           repoPath: string,
           commitHash: string,
           parentHash?: string | null,
+          filePath?: string | null,
         ) => Promise<string>;
-        log: (repoPath: string, limit?: number) => Promise<GitLogResult>;
+        log: (repoPath: string, request?: GitLogRequest) => Promise<GitLogResult>;
+        commitDetail: (repoPath: string, commitHash: string) => Promise<GitCommitDetail>;
+        updateCommitMessage: (
+          repoPath: string,
+          commitHash: string,
+          message: string,
+        ) => Promise<GitCommitDetail>;
         stage: (repoPath: string, files: string[]) => Promise<GitStatusSummary>;
         unstage: (repoPath: string, files: string[]) => Promise<GitStatusSummary>;
         discard: (repoPath: string, change: GitChange) => Promise<GitStatusSummary>;

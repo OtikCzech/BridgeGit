@@ -55,6 +55,21 @@ function getWindowIconPath() {
   return join(app.getAppPath(), 'assets/icons/bridgegit.ico');
 }
 
+function applyWindowsTaskbarDetails(window: BrowserWindow) {
+  if (process.platform !== 'win32' || !app.isPackaged) {
+    return;
+  }
+
+  const windowIconPath = getWindowIconPath();
+
+  window.setAppDetails({
+    appId: WINDOWS_APP_ID,
+    relaunchCommand: process.execPath,
+    relaunchDisplayName: 'BridgeGit',
+    ...(existsSync(windowIconPath) ? { appIconPath: windowIconPath, appIconIndex: 0 } : {}),
+  });
+}
+
 function getDialogWindow() {
   return BrowserWindow.getFocusedWindow() ?? mainWindow ?? undefined;
 }
@@ -246,6 +261,8 @@ async function createMainWindow() {
       nodeIntegration: false,
     },
   });
+
+  applyWindowsTaskbarDetails(mainWindow);
 
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     void shell.openExternal(url);

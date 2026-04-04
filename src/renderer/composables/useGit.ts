@@ -5,8 +5,10 @@ import type {
   CreateBranchResult,
   DeleteBranchResult,
   GitChange,
+  GitCommitDetail,
   GitDiffMode,
   GitLogEntry,
+  GitLogScope,
   GitLogResult,
   GitStatusSummary,
   MergeWorktreeIntoPrimaryBranchResult,
@@ -28,12 +30,24 @@ interface SelectFileOptions {
   diffMode?: GitDiffMode;
 }
 
+interface SelectHistoryCommitOptions {
+  force?: boolean;
+}
+
+interface LoadLogOptions {
+  scope?: GitLogScope;
+  query?: string;
+  append?: boolean;
+  preserveSelection?: boolean;
+}
+
 interface RepoStateCacheEntry {
   status: GitStatusSummary;
   branches: BranchSummary;
 }
 
-const HISTORY_LIMIT = 120;
+const HISTORY_PAGE_SIZE = 100;
+const SILENT_REFRESH_FAILURES_BEFORE_ERROR = 2;
 
 function extractRawErrorMessage(error: unknown): string {
   if (error instanceof Error) {
@@ -138,26 +152,48 @@ function normalizeGitError(error: unknown): { message: string; detail: string | 
   };
 }
 
+function areGitLogScopesEqual(left: GitLogScope, right: GitLogScope): boolean {
+  return left.kind === right.kind && (left.branchName ?? '') === (right.branchName ?? '');
+}
+
 export function useGit() {
   const repoPath = ref<string | null>(null);
   const status = ref<GitStatusSummary | null>(null);
   const branches = ref<BranchSummary | null>(null);
   const log = ref<GitLogResult | null>(null);
+  const historyScope = ref<GitLogScope>({ kind: 'all' });
+  const historyQuery = ref('');
+  const hasMoreHistoryCommits = ref(false);
+  const selectedHistoryCommitHash = ref<string | null>(null);
+  const commitDetail = ref<GitCommitDetail | null>(null);
   const selectedPath = ref<string | null>(null);
   const selectedDiffMode = ref<GitDiffMode>('working-tree');
   const selectedCommit = ref<GitLogEntry | null>(null);
+  const selectedCommitDiffPath = ref<string | null>(null);
+  const historyPreviewCommitHash = ref<string | null>(null);
+  const historyPreviewDiffPath = ref<string | null>(null);
+  const historyPreviewDiff = ref('');
   const diff = ref('');
   const commitDiff = ref('');
   const isLoading = ref(false);
   const isLoadingLog = ref(false);
   const error = ref<string | null>(null);
   const errorDetail = ref<string | null>(null);
+  const commitDetailError = ref<string | null>(null);
   const commitDiffError = ref<string | null>(null);
+  const historyPreviewDiffError = ref<string | null>(null);
+  const isUpdatingCommitMessage = ref(false);
+  const isLoadingCommitDetail = ref(false);
   const isLoadingCommitDiff = ref(false);
+  const isLoadingHistoryPreviewDiff = ref(false);
+  const isLoadingMoreHistoryCommits = ref(false);
   const isRefreshing = ref(false);
   let pollTimer: number | null = null;
   let refreshInFlight = false;
   let repoRequestVersion = 0;
+  let logRequestVersion = 0;
+  let commitDetailRequestVersion = 0;
+  let consecutiveSilentRefreshFailures = 0;
   const repoStateCache = new Map<string, RepoStateCacheEntry>();
 
   function createRepoRequestSnapshot(expectedRepoPath: string | null = repoPath.value) {
@@ -190,17 +226,66 @@ export function useGit() {
     };
   }
 
+  function cloneHistoryScope(nextScope: GitLogScope): GitLogScope {
+    return nextScope.kind === 'branch'
+      ? { kind: 'branch', branchName: nextScope.branchName ?? '' }
+      : { kind: nextScope.kind };
+  }
+
+  function normalizeHistoryQueryValue(nextQuery: string | null | undefined): string {
+    return nextQuery?.trim() ?? '';
+  }
+
+  function toGitLogEntry(detail: GitCommitDetail): GitLogEntry {
+    return {
+      hash: detail.hash,
+      shortHash: detail.shortHash,
+      parentHashes: [...detail.parentHashes],
+      date: detail.date,
+      message: detail.subject,
+      authorName: detail.authorName,
+      refs: detail.refs.map((ref) => ({ ...ref })),
+    };
+  }
+
   function clearCommitDiffState() {
     selectedCommit.value = null;
+    selectedCommitDiffPath.value = null;
     commitDiff.value = '';
     commitDiffError.value = null;
     isLoadingCommitDiff.value = false;
   }
 
+  function clearHistoryPreviewDiffState() {
+    historyPreviewCommitHash.value = null;
+    historyPreviewDiffPath.value = null;
+    historyPreviewDiff.value = '';
+    historyPreviewDiffError.value = null;
+    isLoadingHistoryPreviewDiff.value = false;
+  }
+
+  function clearCommitDetailState() {
+    selectedHistoryCommitHash.value = null;
+    commitDetail.value = null;
+    commitDetailError.value = null;
+    isLoadingCommitDetail.value = false;
+  }
+
+  function clearHistoryState() {
+    log.value = null;
+    historyScope.value = { kind: 'all' };
+    historyQuery.value = '';
+    hasMoreHistoryCommits.value = false;
+    clearCommitDetailState();
+    clearHistoryPreviewDiffState();
+    isLoadingLog.value = false;
+    isLoadingMoreHistoryCommits.value = false;
+  }
+
   function clearState() {
     status.value = null;
     branches.value = null;
-    log.value = null;
+    clearHistoryState();
     selectedPath.value = null;
     selectedDiffMode.value = 'working-tree';
     diff.value = '';
@@ -211,6 +296,10 @@ export function useGit() {
   function clearErrorState() {
     error.value = null;
     errorDetail.value = null;
+  }
+
+  function resetSilentRefreshFailures() {
+    consecutiveSilentRefreshFailures = 0;
   }
 
   function assignGitError(nextError: unknown) {
@@ -300,6 +389,7 @@ export function useGit() {
         status: cloneStatusSummary(nextStatus),
         branches: cloneBranchSummary(nextBranches),
       });
+      resetSilentRefreshFailures();
       clearErrorState();
 
       const shouldReloadDiff = options.reloadDiff ?? true;
@@ -330,6 +420,18 @@ export function useGit() {
         return;
       }
 
+      if (options.silent) {
+        consecutiveSilentRefreshFailures += 1;
+
+        if (consecutiveSilentRefreshFailures < SILENT_REFRESH_FAILURES_BEFORE_ERROR) {
+          return;
+        }
+
+        assignGitError(nextError);
+        return;
+      }
+
+      resetSilentRefreshFailures();
       clearState();
       assignGitError(nextError);
     } finally {
@@ -383,7 +485,10 @@ export function useGit() {
     isLoading.value = false;
     isRefreshing.value = false;
     isLoadingLog.value = false;
+    isLoadingCommitDetail.value = false;
     isLoadingCommitDiff.value = false;
+    isUpdatingCommitMessage.value = false;
+    resetSilentRefreshFailures();
     clearErrorState();
 
     if (!nextRepoPath) {
@@ -758,13 +863,15 @@ export function useGit() {
     }
   }
 
-  async function openCommitDiff(commit: GitLogEntry) {
+  async function openCommitDiff(commit: GitLogEntry, filePath?: string | null) {
     if (!repoPath.value || !window.bridgegit?.git) {
       return;
     }
 
     const request = createRepoRequestSnapshot();
+    const normalizedFilePath = filePath?.trim() || null;
     selectedCommit.value = commit;
+    selectedCommitDiffPath.value = normalizedFilePath;
     commitDiff.value = '';
     commitDiffError.value = null;
     isLoadingCommitDiff.value = true;
@@ -774,6 +881,7 @@ export function useGit() {
         request.repoPath!,
         commit.hash,
         commit.parentHashes[0] ?? null,
+        normalizedFilePath,
       );
 
       if (!isRepoRequestCurrent(request)) {
@@ -797,6 +905,163 @@ export function useGit() {
 
   function clearCommitDiff() {
     clearCommitDiffState();
+  }
+
+  async function previewHistoryCommitDiff(commit: GitLogEntry, filePath: string) {
+    if (!repoPath.value || !window.bridgegit?.git) {
+      return;
+    }
+
+    const normalizedFilePath = filePath.trim();
+
+    if (!normalizedFilePath) {
+      clearHistoryPreviewDiffState();
+      return;
+    }
+
+    const request = createRepoRequestSnapshot();
+    historyPreviewCommitHash.value = commit.hash;
+    historyPreviewDiffPath.value = normalizedFilePath;
+    historyPreviewDiff.value = '';
+    historyPreviewDiffError.value = null;
+    isLoadingHistoryPreviewDiff.value = true;
+
+    try {
+      const nextPreviewDiff = await window.bridgegit.git.commitDiff(
+        request.repoPath!,
+        commit.hash,
+        commit.parentHashes[0] ?? null,
+        normalizedFilePath,
+      );
+
+      if (!isRepoRequestCurrent(request)) {
+        return;
+      }
+
+      historyPreviewDiff.value = nextPreviewDiff;
+    } catch (nextError) {
+      if (!isRepoRequestCurrent(request)) {
+        return;
+      }
+
+      historyPreviewDiff.value = '';
+      historyPreviewDiffError.value = extractRawErrorMessage(nextError);
+    } finally {
+      if (isRepoRequestCurrent(request)) {
+        isLoadingHistoryPreviewDiff.value = false;
+      }
+    }
+  }
+
+  async function selectHistoryCommit(
+    commitHash: string | null,
+    options: SelectHistoryCommitOptions = {},
+  ): Promise<GitCommitDetail | null> {
+    if (!repoPath.value || !window.bridgegit?.git) {
+      clearCommitDetailState();
+      return null;
+    }
+
+    const normalizedCommitHash = commitHash?.trim() ?? null;
+    const shouldReload = options.force ?? false;
+
+    if (!normalizedCommitHash) {
+      clearCommitDetailState();
+      return null;
+    }
+
+    if (
+      !shouldReload
+      && selectedHistoryCommitHash.value === normalizedCommitHash
+      && commitDetail.value?.hash === normalizedCommitHash
+    ) {
+      return commitDetail.value;
+    }
+
+    selectedHistoryCommitHash.value = normalizedCommitHash;
+    commitDetail.value = null;
+    commitDetailError.value = null;
+    clearHistoryPreviewDiffState();
+    isLoadingCommitDetail.value = true;
+    const request = createRepoRequestSnapshot();
+    const requestVersion = ++commitDetailRequestVersion;
+
+    try {
+      const nextCommitDetail = await window.bridgegit.git.commitDetail(
+        request.repoPath!,
+        normalizedCommitHash,
+      );
+
+      if (!isRepoRequestCurrent(request) || requestVersion !== commitDetailRequestVersion) {
+        return null;
+      }
+
+      commitDetail.value = nextCommitDetail;
+      clearErrorState();
+      return nextCommitDetail;
+    } catch (nextError) {
+      if (!isRepoRequestCurrent(request) || requestVersion !== commitDetailRequestVersion) {
+        return null;
+      }
+
+      commitDetail.value = null;
+      commitDetailError.value = extractRawErrorMessage(nextError);
+      return null;
+    } finally {
+      if (isRepoRequestCurrent(request) && requestVersion === commitDetailRequestVersion) {
+        isLoadingCommitDetail.value = false;
+      }
+    }
+  }
+
+  async function updateCommitMessage(commitHash: string, message: string): Promise<GitCommitDetail | null> {
+    if (!repoPath.value || !window.bridgegit?.git) {
+      return null;
+    }
+
+    const normalizedCommitHash = commitHash.trim();
+
+    if (!normalizedCommitHash) {
+      return null;
+    }
+
+    isUpdatingCommitMessage.value = true;
+    commitDetailError.value = null;
+
+    try {
+      const nextCommitDetail = await window.bridgegit.git.updateCommitMessage(
+        repoPath.value,
+        normalizedCommitHash,
+        message,
+      );
+      const shouldRefreshOpenCommitDiff = selectedCommit.value?.hash === normalizedCommitHash;
+      const openCommitDiffPath = shouldRefreshOpenCommitDiff ? selectedCommitDiffPath.value : null;
+
+      selectedHistoryCommitHash.value = nextCommitDetail.hash;
+      commitDetail.value = nextCommitDetail;
+      clearErrorState();
+
+      await refresh({ reloadDiff: false });
+
+      if (shouldRefreshOpenCommitDiff) {
+        await openCommitDiff(toGitLogEntry(nextCommitDetail), openCommitDiffPath);
+      }
+
+      await loadLog({
+        scope: historyScope.value,
+        query: historyQuery.value,
+        preserveSelection: true,
+      });
+      return nextCommitDetail;
+    } catch (nextError) {
+      const normalizedError = normalizeGitError(nextError);
+      error.value = normalizedError.message;
+      errorDetail.value = normalizedError.detail;
+      commitDetailError.value = normalizedError.message;
+      return null;
+    } finally {
+      isUpdatingCommitMessage.value = false;
+    }
   }
 
   function startPolling() {
@@ -826,37 +1091,112 @@ export function useGit() {
     stopPolling();
   }
 
-  async function loadLog(limit = HISTORY_LIMIT) {
+  async function loadLog(options: LoadLogOptions = {}) {
     if (!repoPath.value || !window.bridgegit?.git) {
-      log.value = null;
+      clearHistoryState();
       return null;
     }
 
     const request = createRepoRequestSnapshot();
-    isLoadingLog.value = true;
+    const requestVersion = ++logRequestVersion;
+    const nextScope = cloneHistoryScope(options.scope ?? historyScope.value);
+    const previousScope = cloneHistoryScope(historyScope.value);
+    const nextQuery = normalizeHistoryQueryValue(options.query ?? historyQuery.value);
+    const previousQuery = historyQuery.value;
+    const scopeChanged = !areGitLogScopesEqual(previousScope, nextScope);
+    const queryChanged = previousQuery !== nextQuery;
+    const append = options.append === true && !scopeChanged && !queryChanged;
+    const previousItems = append ? (log.value?.items ?? []) : [];
+    const nextOffset = append ? previousItems.length : 0;
+    const shouldPreserveSelection = options.preserveSelection === true;
+
+    historyScope.value = nextScope;
+    historyQuery.value = nextQuery;
+
+    if (scopeChanged || queryChanged || !append) {
+      clearHistoryPreviewDiffState();
+    }
+
+    if (scopeChanged || queryChanged) {
+      clearCommitDetailState();
+    }
+
+    if (append) {
+      isLoadingMoreHistoryCommits.value = true;
+    } else {
+      isLoadingLog.value = true;
+    }
 
     try {
-      const nextLog = await window.bridgegit.git.log(request.repoPath!, limit);
+      const nextLog = await window.bridgegit.git.log(request.repoPath!, {
+        limit: HISTORY_PAGE_SIZE,
+        offset: nextOffset,
+        query: nextQuery,
+        scope: nextScope,
+      });
 
-      if (!isRepoRequestCurrent(request)) {
+      if (!isRepoRequestCurrent(request) || requestVersion !== logRequestVersion) {
         return null;
       }
 
-      log.value = nextLog;
+      const mergedItems = append
+        ? [...previousItems, ...nextLog.items.filter((item) => !previousItems.some((existing) => existing.hash === item.hash))]
+        : nextLog.items;
+
+      log.value = {
+        ...nextLog,
+        items: mergedItems,
+        total: mergedItems.length,
+        offset: 0,
+      };
+      hasMoreHistoryCommits.value = nextLog.hasMore;
+
+      const selectedHashStillVisible = Boolean(
+        selectedHistoryCommitHash.value
+        && mergedItems.some((commit) => commit.hash === selectedHistoryCommitHash.value),
+      );
+      const shouldSelectFirstCommit = !append && !shouldPreserveSelection && !selectedHashStillVisible;
+      const nextSelectedHash = selectedHashStillVisible
+        ? selectedHistoryCommitHash.value
+        : (shouldSelectFirstCommit ? (mergedItems[0]?.hash ?? null) : null);
+
+      if (!nextSelectedHash) {
+        clearCommitDetailState();
+      } else if (
+        nextSelectedHash !== selectedHistoryCommitHash.value
+        || commitDetail.value?.hash !== nextSelectedHash
+      ) {
+        await selectHistoryCommit(nextSelectedHash, {
+          force: commitDetail.value?.hash === nextSelectedHash,
+        });
+      }
+
       clearErrorState();
-      return nextLog;
+      return log.value;
     } catch (nextError) {
-      if (!isRepoRequestCurrent(request)) {
+      if (!isRepoRequestCurrent(request) || requestVersion !== logRequestVersion) {
         return null;
       }
 
       assignGitError(nextError);
       return null;
     } finally {
-      if (isRepoRequestCurrent(request)) {
+      if (isRepoRequestCurrent(request) && requestVersion === logRequestVersion) {
         isLoadingLog.value = false;
+        isLoadingMoreHistoryCommits.value = false;
       }
     }
+  }
+
+  async function loadMoreLog() {
+    if (!hasMoreHistoryCommits.value || isLoadingMoreHistoryCommits.value) {
+      return null;
+    }
+
+    return loadLog({
+      append: true,
+      preserveSelection: true,
+    });
   }
 
   return {
@@ -864,25 +1204,45 @@ export function useGit() {
     status,
     branches,
     log,
+    historyScope,
+    historyQuery,
+    hasMoreHistoryCommits,
+    selectedHistoryCommitHash,
+    commitDetail,
     selectedPath,
     selectedDiffMode,
     selectedCommit,
+    selectedCommitDiffPath,
+    historyPreviewCommitHash,
+    historyPreviewDiffPath,
     diff,
     commitDiff,
+    historyPreviewDiff,
     isLoading,
     isLoadingLog,
     isRefreshing,
     error,
     errorDetail,
+    commitDetailError,
     commitDiffError,
+    historyPreviewDiffError,
+    isUpdatingCommitMessage,
+    isLoadingCommitDetail,
     isLoadingCommitDiff,
+    isLoadingHistoryPreviewDiff,
+    isLoadingMoreHistoryCommits,
     refresh,
     loadLog,
+    loadMoreLog,
+    selectHistoryCommit,
+    updateCommitMessage,
     setRepoPath,
     ensureFullStatus,
     selectFile,
     openCommitDiff,
+    previewHistoryCommitDiff,
     clearCommitDiff,
+    clearHistoryPreviewDiffState,
     stageFiles,
     unstageFiles,
     discardFile,

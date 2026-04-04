@@ -123,6 +123,37 @@ export interface GitLogEntry {
 export interface GitLogResult {
   total: number;
   items: GitLogEntry[];
+  hasMore: boolean;
+  offset: number;
+  limit: number | null;
+  query: string;
+}
+
+export type GitLogScopeKind = 'all' | 'head' | 'branch';
+
+export interface GitLogScope {
+  kind: GitLogScopeKind;
+  branchName?: string;
+}
+
+export interface GitLogRequest {
+  limit?: number;
+  offset?: number;
+  query?: string;
+  scope?: GitLogScope;
+}
+
+export interface GitCommitDetail {
+  hash: string;
+  shortHash: string;
+  parentHashes: string[];
+  date: string;
+  subject: string;
+  message: string;
+  authorName: string;
+  refs: GitCommitRef[];
+  files: GitChange[];
+  isHead: boolean;
 }
 
 export interface GitCommitRef {
@@ -259,6 +290,7 @@ export interface WorkspaceRepoPanelFilesState {
   viewMode: RepoPanelFileListMode;
   showAll: boolean;
   collapsedSections: RepoPanelSectionState;
+  expandedDirectories: string[];
 }
 
 export interface WorkspaceRepoPanelState {
@@ -359,6 +391,12 @@ export interface GitTextSearchMatch {
   line: number;
   column: number;
   text: string;
+}
+
+export interface GitTextSearchOptions {
+  wholeWord?: boolean;
+  fileGlob?: string | null;
+  includeUntracked?: boolean;
 }
 
 export type WorkspaceExternalFileChangeState = 'changed' | 'unavailable' | 'session-dirty';
@@ -667,6 +705,7 @@ export function cloneWorkspaceRepoPanelState(workspaceRepoPanelState: WorkspaceR
       viewMode: workspaceRepoPanelState.files.viewMode,
       showAll: workspaceRepoPanelState.files.showAll,
       collapsedSections: cloneRepoPanelSectionState(workspaceRepoPanelState.files.collapsedSections),
+      expandedDirectories: [...(workspaceRepoPanelState.files.expandedDirectories ?? [])],
     },
   };
 }

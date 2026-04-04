@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
+import CopyableErrorNotice from './CopyableErrorNotice.vue';
 import type {
   BranchInfo,
   BranchSummary,
@@ -39,6 +40,8 @@ interface Props {
   log: GitLogResult | null;
   isHistoryOpen: boolean;
   selectedPath: string | null;
+  revealedPath: string | null;
+  revealPathToken: number;
   isLoading: boolean;
   toolbarBusyAction: 'pull' | 'push' | 'refresh' | null;
   error: string | null;
@@ -110,6 +113,26 @@ interface AllFilesTreeRow {
   message?: string;
 }
 
+interface NavigableAllFilesRow {
+  type: 'directory' | 'file';
+  path: string;
+  parentPath: string | null;
+  isExpanded?: boolean;
+}
+
+interface FilteredAllFilesFileNode {
+  name: string;
+  path: string;
+  item?: GitChange;
+}
+
+interface FilteredAllFilesDirectoryNode {
+  name: string;
+  path: string;
+  directories: Map<string, FilteredAllFilesDirectoryNode>;
+  files: FilteredAllFilesFileNode[];
+}
+
 interface RepoSectionViewModel {
   id: SectionId;
   title: string;
@@ -171,6 +194,7 @@ type FileMenuMode = 'actions' | 'discard-confirm';
 type WorkspaceMenuMode = 'actions' | 'rename' | 'remove-confirm' | 'worktree-remove-confirm' | 'worktree-remove-delete-confirm';
 type BranchItemMenuMode = 'actions' | 'delete-confirm';
 
+const rootRef = ref<HTMLElement | null>(null);
 const branchPickerRef = ref<HTMLElement | HTMLElement[] | null>(null);
 const branchListRef = ref<HTMLElement | HTMLElement[] | null>(null);
 const branchSearchInputRef = ref<HTMLInputElement | null>(null);
@@ -204,13 +228,17 @@ const allFilesEntriesByDirectory = ref<Record<string, RepoDirectoryEntry[]>>({})
 const allFilesDirectoryLoading = ref<Record<string, boolean>>({});
 const allFilesDirectoryErrors = ref<Record<string, string | null>>({});
 const expandedAllFilesDirectories = ref<Record<string, boolean>>({});
+const transientExpandedAllFilesDirectories = ref<Record<string, boolean>>({});
 const allFilesSearchResults = ref<string[] | null>(null);
 const allFilesSearchError = ref<string | null>(null);
 const isSearchingAllFiles = ref(false);
 const hasRequestedAllFilesLoad = ref(false);
+const focusedAllFilesPath = ref<string | null>(null);
+const allFilesTypeSelectQuery = ref('');
 let isApplyingRepoPanelState = false;
 let allFilesSearchToken = 0;
 let allFilesSearchDebounceTimer: number | null = null;
+let allFilesTypeSelectTimer: number | null = null;
 let branchSearchFocusTimer: number | null = null;
 const historyCount = computed(() => props.log?.items.length ?? 0);
 const collapseButtonTitle = computed(() => (
@@ -386,17 +414,16 @@ const visibleOperationStatus = computed(() => (
 const filesFilterQuery = computed(() => filesFilter.value.trim());
 const normalizedFilesFilterQuery = computed(() => filesFilterQuery.value.toLowerCase());
 const hasFilesFilter = computed(() => Boolean(filesFilterQuery.value));
-const shouldShowFilesFilterRow = computed(() => (
-  isFilesExpanded.value && (isFilesFilterVisible.value || hasFilesFilter.value)
+const isFilesFilterOpen = computed(() => isFilesExpanded.value && isFilesFilterVisible.value);
+const shouldShowFilesFilterRow = computed(() => isFilesExpanded.value && isFilesFilterVisible.value);
+const filesFilterToggleTitle = computed(() => (
+  isFilesFilterVisible.value ? 'Close file filter' : 'Focus file filter'
 ));
-const filesFilterToggleTitle = computed(() => {
-  if (hasFilesFilter.value) {
-    return 'Clear file filter';
-  }
-
-  return isFilesFilterVisible.value ? 'Hide file filter' : 'Show file filter';
-});
+const filesFilterPlaceholder = computed(() => 'Filter files');
 const isAllFilesSearchMode = computed(() => hasFilesFilter.value);
+const isAllFilesTreeFilterMode = computed(() => (
+  isAllFilesSearchMode.value && fileListMode.value === 'tree'
+));
 const shouldLoadAllFiles = computed(() => (
   hasRequestedAllFilesLoad.value || Boolean(filesFilterQuery.value)
 ));
@@ -626,7 +653,19 @@ const treeRowsBySection = computed<Record<SectionId, TreeRow[]>>(() => {
 });
 const allFilesChangeMap = computed(() => buildAllFilesChangeMap(props.status));
 const allFilesTreeRows = computed<AllFilesTreeRow[]>(() => {
-  if (isAllFilesSearchMode.value || !props.repoPath) {
+  if (!props.repoPath) {
+    return [];
+  }
+
+  if (isAllFilesTreeFilterMode.value) {
+    if (shouldShowAllFilesSearchHint.value || (isSearchingAllFiles.value && allFilesSearchResults.value === null)) {
+      return [];
+    }
+
+    return buildFilteredAllFilesTreeRows(allFilesSearchResults.value ?? []);
+  }
+
+  if (isAllFilesSearchMode.value) {
     return [];
   }
 
@@ -645,6 +684,33 @@ const allFilesSearchResultsWithChanges = computed(() => (
     item: allFilesChangeMap.value.get(path),
   }))
 ));
+const persistedExpandedAllFilesDirectories = computed(() => normalizeExpandedDirectories(
+  Object.entries(expandedAllFilesDirectories.value)
+    .filter(([, isExpanded]) => Boolean(isExpanded))
+    .map(([path]) => path),
+));
+const navigableAllFilesRows = computed<NavigableAllFilesRow[]>(() => {
+  if (!props.repoPath || !isWorkspaceDetailExpanded.value || !isFilesExpanded.value || !isAllFilesExpanded.value) {
+    return [];
+  }
+
+  if (isAllFilesSearchMode.value && fileListMode.value === 'list') {
+    return allFilesSearchResultsWithChanges.value.map((entry) => ({
+      type: 'file',
+      path: entry.path,
+      parentPath: getParentPath(entry.path),
+    }));
+  }
+
+  return allFilesTreeRows.value
+    .filter((row): row is AllFilesTreeRow & { type: 'directory' | 'file' } => row.type !== 'message')
+    .map((row) => ({
+      type: row.type,
+      path: row.path,
+      parentPath: getParentPath(row.path),
+      isExpanded: row.isExpanded,
+    }));
+});
 const allFilesCountLabel = computed(() => {
   if (!isAllFilesSearchMode.value || shouldShowAllFilesSearchHint.value) {
     return null;
@@ -716,6 +782,30 @@ function fileDirectory(path: string) {
 
 function compareText(left: string, right: string) {
   return left.localeCompare(right, undefined, { numeric: true, sensitivity: 'base' });
+}
+
+function getParentPath(path: string) {
+  const parts = splitPath(path);
+
+  if (parts.length <= 1) {
+    return null;
+  }
+
+  return parts.slice(0, -1).join('/');
+}
+
+function normalizeExpandedDirectories(paths: string[]) {
+  return [...new Set(
+    paths
+      .map((path) => normalizePathSeparators(path).trim())
+      .filter(Boolean),
+  )].sort(compareText);
+}
+
+function normalizeTypeSelectQuery(value: string) {
+  return normalizePathSeparators(value)
+    .toLocaleLowerCase()
+    .trim();
 }
 
 function matchesFilesFilter(path: string) {
@@ -815,16 +905,21 @@ function resetAllFilesState() {
   allFilesEntriesByDirectory.value = {};
   allFilesDirectoryLoading.value = {};
   allFilesDirectoryErrors.value = {};
-  expandedAllFilesDirectories.value = {};
+  expandedAllFilesDirectories.value = Object.fromEntries(
+    normalizeExpandedDirectories(props.repoPanelState.files.expandedDirectories).map((path) => [path, true]),
+  );
+  transientExpandedAllFilesDirectories.value = {};
   allFilesSearchResults.value = null;
   allFilesSearchError.value = null;
   isSearchingAllFiles.value = false;
   hasRequestedAllFilesLoad.value = false;
+  focusedAllFilesPath.value = null;
+  resetAllFilesTypeSelectQuery();
   allFilesSearchToken += 1;
 }
 
 function isAllFilesDirectoryExpanded(path: string) {
-  return Boolean(expandedAllFilesDirectories.value[path]);
+  return Boolean(expandedAllFilesDirectories.value[path] || transientExpandedAllFilesDirectories.value[path]);
 }
 
 function hasAllFilesDirectoryLoaded(path: string) {
@@ -902,6 +997,92 @@ function buildAllFilesTreeRows(relativePath = '', depth = 0): AllFilesTreeRow[] 
   return rows;
 }
 
+function createFilteredAllFilesDirectoryNode(name: string, path: string): FilteredAllFilesDirectoryNode {
+  return {
+    name,
+    path,
+    directories: new Map<string, FilteredAllFilesDirectoryNode>(),
+    files: [],
+  };
+}
+
+function buildFilteredAllFilesTreeRowsFromDirectory(
+  directory: FilteredAllFilesDirectoryNode,
+  depth: number,
+): AllFilesTreeRow[] {
+  const rows: AllFilesTreeRow[] = [];
+  const childDirectories = [...directory.directories.values()]
+    .sort((left, right) => compareText(left.name, right.name));
+  const childFiles = [...directory.files]
+    .sort((left, right) => compareText(left.name, right.name));
+
+  childDirectories.forEach((childDirectory) => {
+    rows.push({
+      type: 'directory',
+      name: childDirectory.name,
+      path: childDirectory.path,
+      depth,
+      isExpanded: true,
+    });
+    rows.push(...buildFilteredAllFilesTreeRowsFromDirectory(childDirectory, depth + 1));
+  });
+
+  childFiles.forEach((file) => {
+    rows.push({
+      type: 'file',
+      name: file.name,
+      path: file.path,
+      depth,
+      item: file.item,
+    });
+  });
+
+  return rows;
+}
+
+function buildFilteredAllFilesTreeRows(paths: string[]): AllFilesTreeRow[] {
+  const rootDirectory = createFilteredAllFilesDirectoryNode('', '');
+
+  [...new Set(paths.map((path) => normalizePathSeparators(path)).filter(Boolean))]
+    .sort(compareText)
+    .forEach((path) => {
+      const segments = splitPath(path);
+
+      if (!segments.length) {
+        return;
+      }
+
+      let currentDirectory = rootDirectory;
+      let currentPath = '';
+
+      segments.slice(0, -1).forEach((segment) => {
+        currentPath = currentPath ? `${currentPath}/${segment}` : segment;
+        let nextDirectory = currentDirectory.directories.get(segment);
+
+        if (!nextDirectory) {
+          nextDirectory = createFilteredAllFilesDirectoryNode(segment, currentPath);
+          currentDirectory.directories.set(segment, nextDirectory);
+        }
+
+        currentDirectory = nextDirectory;
+      });
+
+      const fileSegment = segments.at(-1);
+
+      if (!fileSegment) {
+        return;
+      }
+
+      currentDirectory.files.push({
+        name: fileSegment,
+        path,
+        item: allFilesChangeMap.value.get(path),
+      });
+    });
+
+  return buildFilteredAllFilesTreeRowsFromDirectory(rootDirectory, 0);
+}
+
 async function ensureDirectoryLoaded(relativePath = '') {
   if (!props.repoPath || !window.bridgegit?.git) {
     return;
@@ -953,6 +1134,14 @@ async function ensureDirectoryLoaded(relativePath = '') {
   }
 }
 
+async function ensureExpandedAllFilesDirectoriesLoaded() {
+  const expandedPaths = persistedExpandedAllFilesDirectories.value;
+
+  for (const path of expandedPaths) {
+    await ensureDirectoryLoaded(path);
+  }
+}
+
 function toggleAllFilesDirectory(path: string) {
   const nextExpanded = !isAllFilesDirectoryExpanded(path);
 
@@ -960,10 +1149,265 @@ function toggleAllFilesDirectory(path: string) {
     ...expandedAllFilesDirectories.value,
     [path]: nextExpanded,
   };
+  transientExpandedAllFilesDirectories.value = {
+    ...transientExpandedAllFilesDirectories.value,
+    [path]: false,
+  };
 
   if (nextExpanded) {
     void ensureDirectoryLoaded(path);
   }
+}
+
+function handleAllFilesDirectoryClick(path: string) {
+  if (isAllFilesTreeFilterMode.value) {
+    return;
+  }
+
+  toggleAllFilesDirectory(path);
+}
+
+function getAllFilesPathButton(path: string) {
+  if (!rootRef.value) {
+    return null;
+  }
+
+  const buttons = rootRef.value.querySelectorAll<HTMLButtonElement>('[data-all-files-path]');
+  return [...buttons].find((button) => button.dataset.allFilesPath === path) ?? null;
+}
+
+async function focusAllFilesPath(path: string, options: { scrollIntoView?: boolean } = {}) {
+  focusedAllFilesPath.value = path;
+  await nextTick();
+  const button = getAllFilesPathButton(path);
+
+  if (!button) {
+    return false;
+  }
+
+  if (options.scrollIntoView !== false) {
+    button.scrollIntoView({ block: 'nearest' });
+  }
+
+  button.focus({ preventScroll: options.scrollIntoView !== true });
+  return true;
+}
+
+function getFocusedAllFilesRowIndex() {
+  return navigableAllFilesRows.value.findIndex((row) => row.path === focusedAllFilesPath.value);
+}
+
+function getFallbackAllFilesFocusPath() {
+  const visiblePaths = navigableAllFilesRows.value.map((row) => row.path);
+
+  if (!visiblePaths.length) {
+    return null;
+  }
+
+  if (props.revealedPath && visiblePaths.includes(props.revealedPath)) {
+    return props.revealedPath;
+  }
+
+  if (props.selectedPath && visiblePaths.includes(props.selectedPath)) {
+    return props.selectedPath;
+  }
+
+  return visiblePaths[0] ?? null;
+}
+
+function setFocusedAllFilesPath(path: string | null) {
+  focusedAllFilesPath.value = path;
+}
+
+function resetAllFilesTypeSelectQuery() {
+  allFilesTypeSelectQuery.value = '';
+
+  if (allFilesTypeSelectTimer !== null) {
+    window.clearTimeout(allFilesTypeSelectTimer);
+    allFilesTypeSelectTimer = null;
+  }
+}
+
+function scheduleAllFilesTypeSelectReset() {
+  if (allFilesTypeSelectTimer !== null) {
+    window.clearTimeout(allFilesTypeSelectTimer);
+  }
+
+  allFilesTypeSelectTimer = window.setTimeout(() => {
+    allFilesTypeSelectTimer = null;
+    allFilesTypeSelectQuery.value = '';
+  }, 900);
+}
+
+function getAllFilesTypeSelectRank(row: NavigableAllFilesRow, query: string) {
+  const normalizedQuery = normalizeTypeSelectQuery(query);
+
+  if (!normalizedQuery) {
+    return Number.MAX_SAFE_INTEGER;
+  }
+
+  const normalizedPath = normalizeTypeSelectQuery(row.path);
+  const normalizedName = normalizeTypeSelectQuery(fileName(row.path));
+  const segments = splitPath(row.path).map((segment) => segment.toLocaleLowerCase());
+
+  if (normalizedName === normalizedQuery) {
+    return 0;
+  }
+
+  if (normalizedName.startsWith(normalizedQuery)) {
+    return 1;
+  }
+
+  if (segments.some((segment) => segment === normalizedQuery)) {
+    return 2;
+  }
+
+  if (segments.some((segment) => segment.startsWith(normalizedQuery))) {
+    return 3;
+  }
+
+  if (segments.some((segment) => segment.includes(normalizedQuery))) {
+    return 4;
+  }
+
+  if (normalizedPath.startsWith(normalizedQuery)) {
+    return 5;
+  }
+
+  if (normalizedPath.includes(normalizedQuery)) {
+    return 6;
+  }
+
+  return Number.MAX_SAFE_INTEGER;
+}
+
+async function focusAllFilesTypeSelectMatch(query: string) {
+  const normalizedQuery = normalizeTypeSelectQuery(query);
+
+  if (!normalizedQuery) {
+    return false;
+  }
+
+  let bestMatchPath: string | null = null;
+  let bestRank = Number.MAX_SAFE_INTEGER;
+
+  navigableAllFilesRows.value.forEach((row) => {
+    const rank = getAllFilesTypeSelectRank(row, normalizedQuery);
+
+    if (rank < bestRank) {
+      bestRank = rank;
+      bestMatchPath = row.path;
+    }
+  });
+
+  if (!bestMatchPath || bestRank === Number.MAX_SAFE_INTEGER) {
+    return false;
+  }
+
+  return focusAllFilesPath(bestMatchPath, { scrollIntoView: true });
+}
+
+async function focusAdjacentAllFilesRow(direction: -1 | 1) {
+  if (!navigableAllFilesRows.value.length) {
+    return false;
+  }
+
+  const currentIndex = getFocusedAllFilesRowIndex();
+  const safeCurrentIndex = currentIndex >= 0
+    ? currentIndex
+    : Math.max(0, navigableAllFilesRows.value.findIndex((row) => row.path === getFallbackAllFilesFocusPath()));
+  const nextIndex = Math.min(
+    navigableAllFilesRows.value.length - 1,
+    Math.max(0, safeCurrentIndex + direction),
+  );
+  const nextPath = navigableAllFilesRows.value[nextIndex]?.path ?? null;
+
+  if (!nextPath) {
+    return false;
+  }
+
+  return focusAllFilesPath(nextPath, { scrollIntoView: true });
+}
+
+async function handleAllFilesArrowRight() {
+  const focusedRow = navigableAllFilesRows.value.find((row) => row.path === focusedAllFilesPath.value);
+
+  if (!focusedRow) {
+    const fallbackPath = getFallbackAllFilesFocusPath();
+    return fallbackPath ? focusAllFilesPath(fallbackPath, { scrollIntoView: true }) : false;
+  }
+
+  if (focusedRow.type === 'file') {
+    selectAllFilesPath(focusedRow.path);
+    return true;
+  }
+
+  if (isAllFilesTreeFilterMode.value) {
+    const focusedIndex = getFocusedAllFilesRowIndex();
+    const nextRow = focusedIndex >= 0 ? navigableAllFilesRows.value[focusedIndex + 1] : null;
+
+    if (nextRow?.parentPath === focusedRow.path) {
+      return focusAllFilesPath(nextRow.path, { scrollIntoView: true });
+    }
+
+    return true;
+  }
+
+  if (!focusedRow.isExpanded) {
+    toggleAllFilesDirectory(focusedRow.path);
+    await nextTick();
+    return true;
+  }
+
+  const focusedIndex = getFocusedAllFilesRowIndex();
+  const nextRow = focusedIndex >= 0 ? navigableAllFilesRows.value[focusedIndex + 1] : null;
+
+  if (nextRow?.parentPath === focusedRow.path) {
+    return focusAllFilesPath(nextRow.path, { scrollIntoView: true });
+  }
+
+  return true;
+}
+
+async function handleAllFilesArrowLeft() {
+  const focusedRow = navigableAllFilesRows.value.find((row) => row.path === focusedAllFilesPath.value);
+
+  if (!focusedRow) {
+    const fallbackPath = getFallbackAllFilesFocusPath();
+    return fallbackPath ? focusAllFilesPath(fallbackPath, { scrollIntoView: true }) : false;
+  }
+
+  if (focusedRow.type === 'directory' && focusedRow.isExpanded && !isAllFilesTreeFilterMode.value) {
+    toggleAllFilesDirectory(focusedRow.path);
+    await nextTick();
+    return true;
+  }
+
+  if (!focusedRow.parentPath) {
+    return true;
+  }
+
+  return focusAllFilesPath(focusedRow.parentPath, { scrollIntoView: true });
+}
+
+function activateFocusedAllFilesRow() {
+  const focusedRow = navigableAllFilesRows.value.find((row) => row.path === focusedAllFilesPath.value);
+
+  if (!focusedRow) {
+    return false;
+  }
+
+  if (focusedRow.type === 'file') {
+    selectAllFilesPath(focusedRow.path);
+    return true;
+  }
+
+  if (!isAllFilesTreeFilterMode.value) {
+    toggleAllFilesDirectory(focusedRow.path);
+    return true;
+  }
+
+  return false;
 }
 
 async function runAllFilesSearch(query: string) {
@@ -1224,6 +1668,14 @@ function areSectionStatesEqual(left: SectionState, right: SectionState) {
     && left.conflicts === right.conflicts;
 }
 
+function areExpandedDirectoryListsEqual(left: string[], right: string[]) {
+  if (left.length !== right.length) {
+    return false;
+  }
+
+  return left.every((path, index) => path === right[index]);
+}
+
 function areRepoPanelStatesEqual(left: WorkspaceRepoPanelState, right: WorkspaceRepoPanelState) {
   return left.fontSize === right.fontSize
     && left.historyOpen === right.historyOpen
@@ -1232,7 +1684,8 @@ function areRepoPanelStatesEqual(left: WorkspaceRepoPanelState, right: Workspace
     && left.files.expanded === right.files.expanded
     && left.files.viewMode === right.files.viewMode
     && left.files.showAll === right.files.showAll
-    && areSectionStatesEqual(left.files.collapsedSections, right.files.collapsedSections);
+    && areSectionStatesEqual(left.files.collapsedSections, right.files.collapsedSections)
+    && areExpandedDirectoryListsEqual(left.files.expandedDirectories, right.files.expandedDirectories);
 }
 
 function buildRepoPanelState(): WorkspaceRepoPanelState {
@@ -1246,6 +1699,7 @@ function buildRepoPanelState(): WorkspaceRepoPanelState {
       viewMode: fileListMode.value,
       showAll: isAllFilesExpanded.value,
       collapsedSections: cloneSectionState(collapsedSections.value),
+      expandedDirectories: persistedExpandedAllFilesDirectories.value,
     },
   };
 }
@@ -1259,6 +1713,10 @@ function applyRepoPanelState(nextRepoPanelState: WorkspaceRepoPanelState) {
   isWorkspaceDetailExpanded.value = nextRepoPanelState.workspaceDetailExpanded;
   isWorkspaceFamilyFocus.value = nextRepoPanelState.workspaceFamilyFocus;
   collapsedSections.value = cloneSectionState(nextRepoPanelState.files.collapsedSections);
+  expandedAllFilesDirectories.value = Object.fromEntries(
+    normalizeExpandedDirectories(nextRepoPanelState.files.expandedDirectories).map((path) => [path, true]),
+  );
+  transientExpandedAllFilesDirectories.value = {};
   isApplyingRepoPanelState = false;
 }
 
@@ -1324,6 +1782,66 @@ function selectAllFilesPath(path: string) {
 
 function canInteractWithAllFilesPath(path: string) {
   return supportsWorkspaceFileOpen(path) || Boolean(findSectionIdByPath(path));
+}
+
+function isHighlightedAllFilesPath(path: string) {
+  return props.selectedPath === path || props.revealedPath === path;
+}
+
+async function expandAllFilesDirectoriesForPath(path: string) {
+  const parentSegments = splitPath(path).slice(0, -1);
+
+  if (!parentSegments.length) {
+    return;
+  }
+
+  transientExpandedAllFilesDirectories.value = {};
+  let currentPath = '';
+
+  for (const segment of parentSegments) {
+    currentPath = currentPath ? `${currentPath}/${segment}` : segment;
+
+    if (!expandedAllFilesDirectories.value[currentPath]) {
+      transientExpandedAllFilesDirectories.value = {
+        ...transientExpandedAllFilesDirectories.value,
+        [currentPath]: true,
+      };
+    }
+
+    await ensureDirectoryLoaded(currentPath);
+  }
+}
+
+async function revealAllFilesPath(path: string) {
+  if (!props.repoPath || !path) {
+    return;
+  }
+
+  const normalizedPath = normalizePathSeparators(path);
+
+  if (!isWorkspaceDetailExpanded.value) {
+    isWorkspaceDetailExpanded.value = true;
+  }
+
+  if (!isFilesExpanded.value) {
+    isFilesExpanded.value = true;
+  }
+
+  if (!isAllFilesExpanded.value) {
+    isAllFilesExpanded.value = true;
+  }
+
+  requestAllFilesLoad();
+
+  if (filesFilter.value) {
+    filesFilter.value = '';
+  }
+
+  await nextTick();
+  await ensureDirectoryLoaded('');
+  await expandAllFilesDirectoriesForPath(normalizedPath);
+  await nextTick();
+  await focusAllFilesPath(normalizedPath, { scrollIntoView: true });
 }
 
 function getSectionDiffMode(sectionId: SectionId): GitDiffMode {
@@ -1430,6 +1948,10 @@ function handleCommitMessageUpdate(event: Event) {
   emit('update:commit-message', target?.value ?? '');
 }
 
+function handleFilesFilterToggleClick() {
+  void toggleFilesFilter();
+}
+
 async function focusCommitInput() {
   await nextTick();
   commitInputRef.value?.focus({ preventScroll: true });
@@ -1476,17 +1998,37 @@ function toggleBranchMenu() {
 
 async function toggleFilesFilter() {
   if (isFilesFilterVisible.value) {
-    if (hasFilesFilter.value) {
-      filesFilter.value = '';
-    }
-
-    isFilesFilterVisible.value = false;
+    closeFilesFilter();
     return;
+  }
+
+  await focusFilesFilter(true);
+}
+
+async function focusFilesFilter(selectContents = false) {
+  if (!isWorkspaceDetailExpanded.value) {
+    isWorkspaceDetailExpanded.value = true;
+  }
+
+  if (!isFilesExpanded.value) {
+    isFilesExpanded.value = true;
   }
 
   isFilesFilterVisible.value = true;
   await nextTick();
   filesFilterInputRef.value?.focus({ preventScroll: true });
+
+  if (selectContents) {
+    filesFilterInputRef.value?.select();
+  }
+}
+
+function closeFilesFilter() {
+  isFilesFilterVisible.value = false;
+  void nextTick().then(() => {
+    filesFilter.value = '';
+    filesFilterInputRef.value?.blur();
+  });
 }
 
 async function scrollCurrentBranchIntoView() {
@@ -1857,7 +2399,114 @@ function handleDocumentPointerDown(event: PointerEvent) {
   }
 }
 
+function isKeyboardEventInsideRepoPanel(target: EventTarget | null) {
+  return target instanceof Node && Boolean(rootRef.value?.contains(target));
+}
+
+function isKeyboardEventInsideAllFilesScope(target: EventTarget | null) {
+  return target instanceof Element && Boolean(target.closest('[data-all-files-scope]'));
+}
+
+function isKeyboardEventOnAllFilesRow(target: EventTarget | null) {
+  return target instanceof Element && Boolean(target.closest('[data-all-files-path]'));
+}
+
 function handleDocumentKeydown(event: KeyboardEvent) {
+  if (event.key === 'Escape' && document.activeElement === filesFilterInputRef.value) {
+    event.preventDefault();
+
+    if (hasFilesFilter.value) {
+      filesFilter.value = '';
+      return;
+    }
+
+    closeFilesFilter();
+    return;
+  }
+
+  const handlesAllFilesKeyboardInput = (
+    isKeyboardEventInsideRepoPanel(event.target)
+    && isKeyboardEventInsideAllFilesScope(event.target)
+    && isKeyboardEventOnAllFilesRow(event.target)
+    && !isEditableTarget(event.target)
+    && !event.ctrlKey
+    && !event.metaKey
+    && !event.altKey
+    && !isBranchMenuOpen.value
+    && !fileMenu.value
+    && !workspaceMenu.value
+    && !branchItemMenu.value
+    && navigableAllFilesRows.value.length > 0
+  );
+
+  if (handlesAllFilesKeyboardInput && event.key === 'Escape' && allFilesTypeSelectQuery.value) {
+    event.preventDefault();
+    resetAllFilesTypeSelectQuery();
+    return;
+  }
+
+  if (handlesAllFilesKeyboardInput && event.key === 'Backspace' && allFilesTypeSelectQuery.value) {
+    event.preventDefault();
+    const nextQuery = allFilesTypeSelectQuery.value.slice(0, -1);
+    allFilesTypeSelectQuery.value = nextQuery;
+
+    if (!nextQuery) {
+      resetAllFilesTypeSelectQuery();
+      return;
+    }
+
+    scheduleAllFilesTypeSelectReset();
+    void focusAllFilesTypeSelectMatch(nextQuery);
+    return;
+  }
+
+  if (
+    handlesAllFilesKeyboardInput
+  ) {
+    if (event.key === 'ArrowDown') {
+      event.preventDefault();
+      resetAllFilesTypeSelectQuery();
+      void focusAdjacentAllFilesRow(1);
+      return;
+    }
+
+    if (event.key === 'ArrowUp') {
+      event.preventDefault();
+      resetAllFilesTypeSelectQuery();
+      void focusAdjacentAllFilesRow(-1);
+      return;
+    }
+
+    if (event.key === 'ArrowRight') {
+      event.preventDefault();
+      resetAllFilesTypeSelectQuery();
+      void handleAllFilesArrowRight();
+      return;
+    }
+
+    if (event.key === 'ArrowLeft') {
+      event.preventDefault();
+      resetAllFilesTypeSelectQuery();
+      void handleAllFilesArrowLeft();
+      return;
+    }
+
+    if (event.key === 'Enter' && activateFocusedAllFilesRow()) {
+      event.preventDefault();
+      resetAllFilesTypeSelectQuery();
+      return;
+    }
+
+    if (event.key.length === 1 && !event.repeat) {
+      event.preventDefault();
+      const nextQuery = `${allFilesTypeSelectQuery.value}${event.key}`;
+      allFilesTypeSelectQuery.value = nextQuery;
+      scheduleAllFilesTypeSelectReset();
+      void focusAllFilesTypeSelectMatch(nextQuery);
+      return;
+    }
+  }
+
   if (
     isBranchMenuOpen.value
     && !isEditableTarget(event.target)
@@ -2070,6 +2719,13 @@ watch(
 );
 
 watch(
+  () => persistedExpandedAllFilesDirectories.value,
+  () => {
+    emitRepoPanelState();
+  },
+);
+
+watch(
   () => isFilesExpanded.value,
   (isExpanded) => {
     if (!isExpanded) {
@@ -2102,6 +2758,7 @@ watch(
     () => isAllFilesExpanded.value,
     () => isNonGitRepository.value,
     () => filesFilterQuery.value,
+    () => persistedExpandedAllFilesDirectories.value.join('\u0000'),
   ],
   ([nextRepoPath, workspaceDetailExpanded, filesExpanded, allFilesExpanded, nonGitRepository, currentQuery]) => {
     if (
@@ -2117,6 +2774,7 @@ watch(
     }
 
     void ensureDirectoryLoaded('');
+    void ensureExpandedAllFilesDirectoriesLoaded();
   },
   { immediate: true },
 );
@@ -2129,6 +2787,7 @@ watch(
     () => isAllFilesExpanded.value,
     () => isNonGitRepository.value,
     () => filesFilterQuery.value,
+    () => persistedExpandedAllFilesDirectories.value.join('\u0000'),
   ],
   ([nextRepoPath, workspaceDetailExpanded, filesExpanded, allFilesExpanded, nonGitRepository, currentQuery]) => {
     if (allFilesSearchDebounceTimer !== null) {
@@ -2192,6 +2851,34 @@ watch(
 );
 
 watch(
+  () => navigableAllFilesRows.value.map((row) => row.path),
+  (visiblePaths) => {
+    if (!visiblePaths.length) {
+      focusedAllFilesPath.value = null;
+      return;
+    }
+
+    if (focusedAllFilesPath.value && visiblePaths.includes(focusedAllFilesPath.value)) {
+      return;
+    }
+
+    focusedAllFilesPath.value = getFallbackAllFilesFocusPath();
+  },
+  { immediate: true },
+);
+
+watch(
+  () => props.revealPathToken,
+  () => {
+    if (!props.revealedPath) {
+      return;
+    }
+
+    void revealAllFilesPath(props.revealedPath);
+  },
+);
+
+watch(
   () => props.status?.staged.length ?? 0,
   (nextCount) => {
     if (!nextCount) {
@@ -2226,11 +2913,17 @@ onBeforeUnmount(() => {
     window.clearTimeout(branchSearchFocusTimer);
     branchSearchFocusTimer = null;
   }
+
+  if (allFilesTypeSelectTimer !== null) {
+    window.clearTimeout(allFilesTypeSelectTimer);
+    allFilesTypeSelectTimer = null;
+  }
 });
 </script>
 
 <template>
   <section
+    ref="rootRef"
     class="git-panel"
     :data-appearance-theme="props.appearanceTheme"
     :style="repoPanelStyle"
@@ -2727,10 +3420,12 @@ onBeforeUnmount(() => {
 
               <div
                 v-if="visibleError"
-                class="repo-panel__error"
-                :title="visibleErrorTitle ?? undefined"
               >
-                {{ visibleError }}
+                <CopyableErrorNotice
+                  class="repo-panel__error"
+                  :message="visibleError"
+                  :detail="visibleErrorTitle"
+                />
               </div>
 
               <div
@@ -2797,7 +3492,7 @@ onBeforeUnmount(() => {
                       type="button"
                       :title="filesFilterToggleTitle"
                       :aria-label="filesFilterToggleTitle"
-                      @click="toggleFilesFilter"
+                      @click.stop.prevent="handleFilesFilterToggleClick"
                     >
                       <svg viewBox="0 0 24 24" aria-hidden="true">
                         <path
@@ -2814,7 +3509,7 @@ onBeforeUnmount(() => {
                     v-model="filesFilter"
                     class="repo-panel__files-filter"
                     type="search"
-                    placeholder="Filter files"
+                    :placeholder="filesFilterPlaceholder"
                     autocomplete="off"
                     spellcheck="false"
                   />
@@ -2822,7 +3517,7 @@ onBeforeUnmount(() => {
               </div>
 
               <div v-if="isFilesExpanded" class="repo-panel__groups">
-                <section class="repo-panel__group">
+                <section class="repo-panel__group" data-all-files-scope="true">
                   <header class="repo-panel__group-header">
                     <button
                       class="repo-panel__group-toggle"
@@ -2870,9 +3565,11 @@ onBeforeUnmount(() => {
                     Type at least 2 characters to search files.
                   </div>
 
-                  <div v-else-if="visibleAllFilesSearchError" class="repo-panel__error">
-                    {{ visibleAllFilesSearchError }}
-                  </div>
+                  <CopyableErrorNotice
+                    v-else-if="visibleAllFilesSearchError"
+                    class="repo-panel__error"
+                    :message="visibleAllFilesSearchError"
+                  />
 
                   <p
                     v-else-if="isAllFilesSearchMode && isSearchingAllFiles && allFilesSearchResults === null"
@@ -2890,7 +3587,10 @@ onBeforeUnmount(() => {
 
                   <div v-else-if="!shouldLoadAllFiles" />
 
-                  <ul v-else-if="isAllFilesSearchMode && allFilesSearchResultsWithChanges.length" class="repo-panel__files">
+                  <ul
+                    v-else-if="isAllFilesSearchMode && fileListMode === 'list' && allFilesSearchResultsWithChanges.length"
+                    class="repo-panel__files"
+                  >
                     <li
                       v-for="entry in allFilesSearchResultsWithChanges"
                       :key="`search:${entry.path}`"
@@ -2899,8 +3599,13 @@ onBeforeUnmount(() => {
                       <button
                         v-if="canInteractWithAllFilesPath(entry.path)"
                         class="repo-panel__file-main"
-                        :class="{ 'repo-panel__file-main--selected': selectedPath === entry.path }"
+                        :class="{
+                          'repo-panel__file-main--selected': isHighlightedAllFilesPath(entry.path),
+                          'repo-panel__file-main--focused': focusedAllFilesPath === entry.path,
+                        }"
+                        :data-all-files-path="entry.path"
                         type="button"
+                        @focus="setFocusedAllFilesPath(entry.path)"
                         @click="selectAllFilesPath(entry.path)"
                       >
                         <span class="repo-panel__file-meta">
@@ -2924,13 +3629,11 @@ onBeforeUnmount(() => {
                     </li>
                   </ul>
 
-                  <div v-else-if="isAllFilesSearchMode" class="repo-panel__clean">
-                    No files match the current filter.
-                  </div>
-
-                  <div v-else-if="allFilesRootError" class="repo-panel__error">
-                    {{ allFilesRootError }}
-                  </div>
+                  <CopyableErrorNotice
+                    v-else-if="allFilesRootError"
+                    class="repo-panel__error"
+                    :message="allFilesRootError"
+                  />
 
                   <ul v-else-if="allFilesTreeRows.length" class="repo-panel__tree">
                     <li
@@ -2941,9 +3644,12 @@ onBeforeUnmount(() => {
                       <button
                         v-if="row.type === 'directory'"
                         class="repo-panel__tree-directory repo-panel__tree-directory--button"
+                        :class="{ 'repo-panel__tree-directory--focused': focusedAllFilesPath === row.path }"
+                        :data-all-files-path="row.path"
                         :style="treeRowStyle(row.depth)"
                         type="button"
-                        @click="toggleAllFilesDirectory(row.path)"
+                        @focus="setFocusedAllFilesPath(row.path)"
+                        @click="handleAllFilesDirectoryClick(row.path)"
                       >
                         <span class="repo-panel__tree-caret" aria-hidden="true">{{ row.isExpanded ? '▾' : '▸' }}</span>
                         <span class="repo-panel__tree-label">{{ row.name }}</span>
@@ -2972,9 +3678,14 @@ onBeforeUnmount(() => {
                       <button
                         v-else-if="canInteractWithAllFilesPath(row.path)"
                         class="repo-panel__tree-file"
-                        :class="{ 'repo-panel__tree-file--selected': selectedPath === row.path }"
+                        :class="{
+                          'repo-panel__tree-file--selected': isHighlightedAllFilesPath(row.path),
+                          'repo-panel__tree-file--focused': focusedAllFilesPath === row.path,
+                        }"
+                        :data-all-files-path="row.path"
                         type="button"
                         :style="treeRowStyle(row.depth)"
+                        @focus="setFocusedAllFilesPath(row.path)"
                         @click="selectAllFilesPath(row.path)"
                       >
                         <span class="repo-panel__tree-label">{{ row.name }}</span>
@@ -2995,6 +3706,10 @@ onBeforeUnmount(() => {
                       </div>
                     </li>
                   </ul>
+
+                  <div v-else-if="isAllFilesSearchMode" class="repo-panel__clean">
+                    No files match the current filter.
+                  </div>
 
                   <div v-else class="repo-panel__clean">
                     No files found.
@@ -4714,6 +5429,11 @@ onBeforeUnmount(() => {
   background: var(--repo-panel-surface-active-bg);
 }
 
+.repo-panel__file-main--focused {
+  border-color: rgba(111, 224, 165, 0.36);
+  box-shadow: inset 0 0 0 1px rgba(111, 224, 165, 0.2);
+}
+
 .repo-panel__file-meta {
   min-width: 0;
   flex: 1 1 auto;
@@ -4818,6 +5538,12 @@ onBeforeUnmount(() => {
   padding-inline-end: 0.48rem;
 }
 
+.repo-panel__tree-directory--focused {
+  border-color: rgba(111, 224, 165, 0.32);
+  background: rgba(111, 224, 165, 0.08);
+  color: var(--text-primary);
+}
+
 .repo-panel__tree-file {
   display: flex;
   align-items: center;
@@ -4842,6 +5568,11 @@ onBeforeUnmount(() => {
 .repo-panel__tree-file--selected {
   border-color: rgba(110, 197, 255, 0.3);
   background: var(--repo-panel-surface-active-bg);
+}
+
+.repo-panel__tree-file--focused {
+  border-color: rgba(111, 224, 165, 0.36);
+  box-shadow: inset 0 0 0 1px rgba(111, 224, 165, 0.2);
 }
 
 .repo-panel__tree-message {

@@ -72,6 +72,7 @@ const emit = defineEmits<{
   'focus-previous-tab': [];
   'open-file': [];
   'open-navigation-target': [target: CodeNavigationTarget];
+  'reveal-in-all-files': [];
   'reload-from-disk': [];
   'save-file': [];
   'save-file-as': [];
@@ -89,7 +90,7 @@ const referencesSearchBusy = ref(false);
 const referencesSearchError = ref<string | null>(null);
 const PATH_LABEL_MAX_LENGTH = 54;
 const FILE_PATH_MENU_WIDTH = 220;
-const FILE_PATH_MENU_HEIGHT = 132;
+const FILE_PATH_MENU_HEIGHT = 168;
 
 const editableCompartment = new Compartment();
 const languageCompartment = new Compartment();
@@ -446,6 +447,11 @@ async function handleCopyProjectRelativePathMenuClick() {
   await copyProjectRelativePath();
 }
 
+function handleRevealInAllFilesMenuClick() {
+  closeFilePathMenu();
+  emit('reveal-in-all-files');
+}
+
 function buildTargetFromOffset(filePath: string, content: string, offset: number): CodeNavigationTarget {
   const clampedOffset = Math.max(0, Math.min(offset, content.length));
   const before = content.slice(0, clampedOffset);
@@ -510,7 +516,7 @@ async function findReferencesForSymbol(
   referencesSearchBusy.value = true;
 
   try {
-    const matches = await window.bridgegit.git.searchText(props.projectRoot, symbol.name, 200, true);
+    const matches = await window.bridgegit.git.searchText(props.projectRoot, symbol.name, 200, { wholeWord: true });
 
     if (requestToken !== referencesSearchToken) {
       return;
@@ -1125,6 +1131,14 @@ onBeforeUnmount(() => {
         @click="handleCopyProjectRelativePathMenuClick"
       >
         Copy path from project root
+      </button>
+      <button
+        class="code-tab__path-menu-item"
+        type="button"
+        role="menuitem"
+        @click="handleRevealInAllFilesMenuClick"
+      >
+        Reveal in All files
       </button>
       <button
         class="code-tab__path-menu-item"

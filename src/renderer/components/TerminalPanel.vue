@@ -1,9 +1,20 @@
 <script setup lang="ts">
-import { computed, defineAsyncComponent, nextTick, onBeforeUnmount, onMounted, ref, watch, type ComponentPublicInstance } from 'vue';
+import {
+  computed,
+  defineAsyncComponent,
+  nextTick,
+  onBeforeUnmount,
+  onMounted,
+  ref,
+  watch,
+  type ComponentPublicInstance,
+  type Ref,
+} from 'vue';
 import type {
   AppAppearance,
   CodeNavigationRequest,
   CodeNavigationTarget,
+  GitTextSearchMatch,
   NoteFileHandle,
   NoteFileStat,
   ResolvedEditorTheme,
@@ -20,6 +31,7 @@ import type {
 } from '../../shared/bridgegit';
 import {
   cloneWorkspaceEditorPaneLayout,
+  normalizeNoteFontSize,
   resolveWorkspaceFileTabType,
 } from '../../shared/bridgegit';
 import { SHORTCUTS, formatCommandSlotShortcut } from '../shortcuts';
@@ -72,6 +84,7 @@ const emit = defineEmits<{
   'update:active-tab-id': [activeTabId: string | null];
   'update:recent-activity': [payload: { workspaceId: string; recentActivity: Record<string, boolean> }];
   'update:attention': [payload: { workspaceId: string; attention: Record<string, boolean> }];
+  'reveal-in-all-files': [filePath: string];
   'toggle-collapse': [];
   activity: [];
 }>();
@@ -86,15 +99,37 @@ const editingTabId = ref<string | null>(null);
 const draftTitle = ref('');
 const editingInput = ref<HTMLInputElement | null>(null);
 const allTabsSearchInput = ref<HTMLInputElement | null>(null);
+const quickOpenSearchInput = ref<HTMLInputElement | null>(null);
+const findInFilesSearchInput = ref<HTMLInputElement | null>(null);
 const reconnectTokens = ref<Record<string, number>>({});
 const tabMenu = ref<{ tabId: string; x: number; y: number } | null>(null);
 const creationMenu = ref<{ x: number; y: number } | null>(null);
 const commandMenuOpen = ref(false);
 const allTabsDialogOpen = ref(false);
+const quickOpenDialogOpen = ref(false);
+const findInFilesDialogOpen = ref(false);
 const allTabsSearchQuery = ref('');
 const allTabsSelectedTabId = ref<string | null>(null);
 const allTabsTypeFilter = ref<AllTabsTypeFilterValue>('all');
 const allTabsFilterMenuOpen = ref(false);
+const quickOpenSearchQuery = ref('');
+const quickOpenResults = ref<string[]>([]);
+const quickOpenTotalResultCount = ref(0);
+const quickOpenSelectedPath = ref<string | null>(null);
+const quickOpenError = ref<string | null>(null);
+const isSearchingQuickOpen = ref(false);
+const findInFilesSearchQuery = ref('');
+const findInFilesFileFilter = ref('');
+const findInFilesIncludeUntracked = ref(false);
+const findInFilesResults = ref<GitTextSearchMatch[]>([]);
+const findInFilesSelectedMatchKey = ref<string | null>(null);
+const findInFilesError = ref<string | null>(null);
+const isSearchingFindInFiles = ref(false);
+const findInFilesPreviewPath = ref<string | null>(null);
+const findInFilesPreviewMatchLine = ref<number | null>(null);
+const findInFilesPreviewLines = ref<Array<{ lineNumber: number; text: string; isMatchLine: boolean }>>([]);
+const findInFilesPreviewError = ref<string | null>(null);
+const isLoadingFindInFilesPreview = ref(false);
 const noteBusyByTabId = ref<Record<string, boolean>>({});
 const codeNavigationRequestByPaneId = ref<Record<string, CodeNavigationRequest>>({});
 const externalFileChangeByTabId = ref<Record<string, WorkspaceExternalFileChangeState>>({});
@@ -109,14 +144,20 @@ const interactedShellTabs = ref<Record<string, boolean>>({});
 const startedShellTabs = ref<Record<string, boolean>>({});
 const draggedTabId = ref<string | null>(null);
 const dropTargetTabId = ref<string | null>(null);
-const pendingCloseDialog = ref<{
+type PendingCloseDialogState = {
+  mode: 'single' | 'bulk';
   kind: 'note' | 'code' | 'shell';
-  tabId: string;
+  tabIds: string[];
   title: string;
   hasSavedFile: boolean;
   hasActivity: boolean;
   hasAttention: boolean;
-} | null>(null);
+  keepTabId: string | null;
+  dirtyCount: number;
+  shellAttentionCount: number;
+  shellActivityCount: number;
+};
+const pendingCloseDialog = ref<PendingCloseDialogState | null>(null);
 const creationButtonRef = ref<HTMLElement | null>(null);
 const allTabsFilterButtonRef = ref<HTMLElement | null>(null);
 const creationMenuActiveActionId = ref<CreationMenuActionId>('shell');
@@ -125,20 +166,45 @@ const ACTIVE_SHELL_IDLE_THRESHOLD_MS = 1200;
 const ACTIVE_SHELL_TYPING_WINDOW_MS = 500;
 const EXTERNAL_FILE_POLL_INTERVAL_MS = 2500;
 const MISSING_FILE_SIGNATURE = '__missing__';
+const QUICK_OPEN_FILE_CACHE_TTL_MS = 30_000;
+const QUICK_OPEN_VISIBLE_RESULT_LIMIT = 50;
+const QUICK_OPEN_RECENT_FILES_LIMIT = 16;
+const QUICK_OPEN_RECENT_QUERIES_LIMIT = 12;
+const FIND_IN_FILES_VISIBLE_RESULT_LIMIT = 200;
+const FIND_IN_FILES_SEARCH_RESULT_LIMIT = 500;
+const FIND_IN_FILES_IDENTIFIER_PART_PATTERN = /[A-Za-z0-9_$]/;
 const tabActivityTimers = new Map<string, number>();
 const sessionViewRefs = new Map<string, TerminalSessionViewExpose>();
 const tabRefs = new Map<string, HTMLElement>();
 const creationMenuItemRefs = new Map<CreationMenuActionId, HTMLButtonElement>();
-const allTabsItemRefs = new Map<string, HTMLButtonElement>();
+const allTabsItemRefs = new Map<string, HTMLElement>();
+const quickOpenItemRefs = new Map<string, HTMLButtonElement>();
+const findInFilesItemRefs = new Map<string, HTMLButtonElement>();
+const quickOpenFileListRequests = new Map<string, Promise<string[]>>();
+const findInFilesPreviewCache = new Map<string, NoteFileHandle>();
 let externalFilePollTimer: number | null = null;
 let externalFilePollInFlight = false;
 let nextCodeNavigationToken = 1;
 let isRestoringWorkspaceIndicators = false;
+let quickOpenSearchToken = 0;
+let findInFilesSearchToken = 0;
+let findInFilesPreviewToken = 0;
+let quickOpenSearchDebounceTimer: number | null = null;
+let findInFilesSearchDebounceTimer: number | null = null;
+let quickOpenFileListPrewarmTimer: number | null = null;
+const quickOpenLastQueryByProjectRoot = ref<Record<string, string>>({});
+const quickOpenRecentFilesByProjectRoot = ref<Record<string, string[]>>({});
+const quickOpenRecentQueriesByProjectRoot = ref<Record<string, string[]>>({});
+const quickOpenFileListCacheByProjectRoot = ref<Record<string, { files: string[]; loadedAt: number }>>({});
+const quickOpenFileListLoadingByProjectRoot = ref<Record<string, boolean>>({});
 
 const sortedTabCount = computed(() => tabs.value.length);
 const menuTab = computed(() => (
   tabs.value.find((tab) => tab.id === tabMenu.value?.tabId) ?? null
 ));
+const findInFilesDialogStyle = computed(() => ({
+  '--terminal-panel-find-result-font-size-px': String(normalizeNoteFontSize(props.workspaceTabDefaults.noteFontSize)),
+}));
 const sortedPresets = computed(() => (
   [...props.presets].sort((left, right) => {
     const leftSlot = left.shortcutSlot ?? Number.MAX_SAFE_INTEGER;
@@ -238,6 +304,281 @@ const allTabsResults = computed(() => {
 const activeAllTabsTypeFilterLabel = computed(() => (
   ALL_TABS_TYPE_FILTER_OPTIONS.find((option) => option.value === allTabsTypeFilter.value)?.label ?? 'All'
 ));
+const pendingCloseDialogEyebrow = computed(() => {
+  const dialog = pendingCloseDialog.value;
+
+  if (!dialog) {
+    return '';
+  }
+
+  if (dialog.mode === 'bulk') {
+    if (dialog.dirtyCount > 0) {
+      return 'Unsaved changes';
+    }
+
+    return dialog.shellAttentionCount > 0 ? 'Shell attention' : 'Shell activity';
+  }
+
+  return dialog.kind === 'shell'
+    ? 'Shell activity'
+    : (dialog.kind === 'code' ? 'Unsaved file' : 'Unsaved note');
+});
+const pendingCloseDialogTitle = computed(() => {
+  const dialog = pendingCloseDialog.value;
+
+  if (!dialog) {
+    return '';
+  }
+
+  return dialog.mode === 'bulk'
+    ? dialog.title
+    : `Close ${dialog.title}?`;
+});
+const pendingCloseDialogCopy = computed(() => {
+  const dialog = pendingCloseDialog.value;
+
+  if (!dialog) {
+    return '';
+  }
+
+  if (dialog.mode === 'single') {
+    return dialog.kind === 'note'
+      ? (dialog.hasSavedFile
+        ? 'This note has unsaved changes. Save it before closing, save a copy under a new file name, or discard the changes.'
+        : 'This scratch note has unsaved changes. Save it before closing or discard the changes.')
+      : dialog.kind === 'code'
+        ? 'This file has unsaved changes. Save it before closing, save a copy under a new file name, or discard the changes.'
+        : (dialog.hasAttention
+          ? 'This shell tab still needs attention. Close it anyway?'
+          : 'This shell tab still shows recent activity. Close it anyway?');
+  }
+
+  const warnings: string[] = [];
+
+  if (dialog.dirtyCount > 0) {
+    warnings.push(
+      dialog.dirtyCount === 1
+        ? '1 tab has unsaved changes'
+        : `${dialog.dirtyCount} tabs have unsaved changes`,
+    );
+  }
+
+  if (dialog.shellAttentionCount > 0) {
+    warnings.push(
+      dialog.shellAttentionCount === 1
+        ? '1 shell tab still needs attention'
+        : `${dialog.shellAttentionCount} shell tabs still need attention`,
+    );
+  }
+
+  if (dialog.shellActivityCount > 0) {
+    warnings.push(
+      dialog.shellActivityCount === 1
+        ? '1 shell tab still shows recent activity'
+        : `${dialog.shellActivityCount} shell tabs still show recent activity`,
+    );
+  }
+
+  if (!warnings.length) {
+    return 'Close selected tabs?';
+  }
+
+  return `${warnings.join(' and ')}. Close them anyway?`;
+});
+const pendingCloseDialogCanSave = computed(() => {
+  const dialog = pendingCloseDialog.value;
+  return Boolean(dialog && (
+    (dialog.mode === 'single' && dialog.kind !== 'shell')
+    || (dialog.mode === 'bulk' && dialog.dirtyCount > 0)
+  ));
+});
+const pendingCloseDialogCanSaveAs = computed(() => {
+  const dialog = pendingCloseDialog.value;
+  return Boolean(dialog && dialog.mode === 'single' && dialog.kind !== 'shell' && dialog.hasSavedFile);
+});
+const pendingCloseDialogSaveLabel = computed(() => (
+  pendingCloseDialog.value?.mode === 'bulk' ? 'Save all' : 'Save'
+));
+const pendingCloseDialogDiscardLabel = computed(() => {
+  const dialog = pendingCloseDialog.value;
+
+  if (!dialog) {
+    return 'Discard';
+  }
+
+  return dialog.mode === 'bulk' || dialog.kind === 'shell' ? 'Close anyway' : 'Discard';
+});
+const quickOpenProjectKey = computed(() => getQuickOpenProjectKey());
+const quickOpenRecentQueries = computed(() => {
+  const projectKey = quickOpenProjectKey.value;
+  return projectKey ? quickOpenRecentQueriesByProjectRoot.value[projectKey] ?? [] : [];
+});
+const quickOpenRecentFilePaths = computed(() => {
+  const projectKey = quickOpenProjectKey.value;
+
+  if (!projectKey) {
+    return [];
+  }
+
+  const recentPaths = quickOpenRecentFilesByProjectRoot.value[projectKey] ?? [];
+  const cachedFiles = quickOpenFileListCacheByProjectRoot.value[projectKey]?.files ?? null;
+
+  if (!cachedFiles) {
+    return recentPaths;
+  }
+
+  const cachedPathSet = new Set(cachedFiles.map((pathValue) => normalizeFileLookup(pathValue)));
+  return recentPaths.filter((pathValue) => cachedPathSet.has(normalizeFileLookup(pathValue)));
+});
+const quickOpenVisiblePaths = computed(() => (
+  quickOpenSearchQuery.value.trim()
+    ? quickOpenResults.value
+    : quickOpenRecentFilePaths.value
+));
+const quickOpenResultEntries = computed(() => (
+  quickOpenVisiblePaths.value.map((path) => buildQuickOpenFileEntry(path))
+));
+const isQuickOpenFileListLoading = computed(() => {
+  const projectKey = quickOpenProjectKey.value;
+  return projectKey ? Boolean(quickOpenFileListLoadingByProjectRoot.value[projectKey]) : false;
+});
+const quickOpenMeta = computed(() => {
+  if (!props.projectRoot) {
+    return 'Open a repository to search files.';
+  }
+
+  if (!quickOpenSearchQuery.value.trim()) {
+    if (isQuickOpenFileListLoading.value && !quickOpenRecentFilePaths.value.length) {
+      return 'Indexing repository files for quick open…';
+    }
+
+    if (quickOpenRecentFilePaths.value.length || quickOpenRecentQueries.value.length) {
+      return 'Recent files and searches for the current repository.';
+    }
+
+    return 'Search file paths in the current repository.';
+  }
+
+  if (isSearchingQuickOpen.value && !quickOpenResults.value.length) {
+    return isQuickOpenFileListLoading.value ? 'Indexing files…' : 'Searching…';
+  }
+
+  if (quickOpenTotalResultCount.value > quickOpenResults.value.length) {
+    return `${quickOpenTotalResultCount.value.toLocaleString()} matches, showing first ${quickOpenResults.value.length.toLocaleString()}`;
+  }
+
+  return `${quickOpenTotalResultCount.value.toLocaleString()} matches`;
+});
+const quickOpenEmptyState = computed(() => {
+  if (quickOpenError.value) {
+    return quickOpenError.value;
+  }
+
+  if (!props.projectRoot) {
+    return quickOpenMeta.value;
+  }
+
+  if (quickOpenSearchQuery.value.trim()) {
+    return 'No files match the current search.';
+  }
+
+  if (isQuickOpenFileListLoading.value) {
+    return 'Indexing repository files for quick open…';
+  }
+
+  if (quickOpenRecentQueries.value.length) {
+    return 'Use a recent search or start typing to search repository files.';
+  }
+
+  return quickOpenMeta.value;
+});
+const findInFilesSortedResults = computed(() => {
+  const normalizedQuery = findInFilesSearchQuery.value.trim().toLocaleLowerCase();
+
+  if (!normalizedQuery) {
+    return findInFilesResults.value;
+  }
+
+  return [...findInFilesResults.value].sort((left, right) => compareFindInFilesMatches(left, right, normalizedQuery));
+});
+const findInFilesVisibleResults = computed(() => (
+  findInFilesSortedResults.value.slice(0, FIND_IN_FILES_VISIBLE_RESULT_LIMIT)
+));
+const findInFilesVisibleItems = computed(() => {
+  const fileMatchCounts = new Map<string, number>();
+
+  for (const match of findInFilesResults.value) {
+    fileMatchCounts.set(match.path, (fileMatchCounts.get(match.path) ?? 0) + 1);
+  }
+
+  return findInFilesVisibleResults.value.map((match) => ({
+    ...match,
+    matchKey: buildFindInFilesMatchKey(match),
+    fileMatchCount: fileMatchCounts.get(match.path) ?? 1,
+  }));
+});
+const findInFilesMeta = computed(() => {
+  if (!props.projectRoot) {
+    return 'Open a repository to search text across files.';
+  }
+
+  if (!findInFilesSearchQuery.value.trim()) {
+    return 'Search text in the current repository.';
+  }
+
+  if (isSearchingFindInFiles.value && !findInFilesResults.value.length) {
+    return 'Searching repository files…';
+  }
+
+  const fileCount = new Set(findInFilesResults.value.map((match) => match.path)).size;
+
+  if (findInFilesResults.value.length > findInFilesVisibleResults.value.length) {
+    return `${findInFilesResults.value.length.toLocaleString()} matches in ${fileCount.toLocaleString()} files, showing first ${findInFilesVisibleResults.value.length.toLocaleString()}`;
+  }
+
+  return `${findInFilesResults.value.length.toLocaleString()} matches in ${fileCount.toLocaleString()} files`;
+});
+const findInFilesScopeLabel = computed(() => (
+  findInFilesIncludeUntracked.value ? 'With untracked' : 'Tracked only'
+));
+const findInFilesEmptyState = computed(() => {
+  if (findInFilesError.value) {
+    return findInFilesError.value;
+  }
+
+  if (!props.projectRoot) {
+    return findInFilesMeta.value;
+  }
+
+  if (findInFilesSearchQuery.value.trim()) {
+    if (isSearchingFindInFiles.value) {
+      return 'Searching repository files…';
+    }
+
+    return 'No matches found for the current search.';
+  }
+
+  return findInFilesMeta.value;
+});
+const selectedFindInFilesMatch = computed(() => (
+  findInFilesResults.value.find((match) => buildFindInFilesMatchKey(match) === findInFilesSelectedMatchKey.value) ?? null
+));
+
+const findInFilesPreviewMeta = computed(() => {
+  if (findInFilesPreviewError.value) {
+    return findInFilesPreviewError.value;
+  }
+
+  if (isLoadingFindInFilesPreview.value) {
+    return 'Loading preview…';
+  }
+
+  if (!selectedFindInFilesMatch.value) {
+    return 'Select a result to preview matching lines.';
+  }
+
+  return `${findInFilesPreviewPath.value ?? selectedFindInFilesMatch.value.path} • line ${selectedFindInFilesMatch.value.line}`;
+});
 
 function isShellTab(tab: WorkspaceTabState): tab is WorkspaceShellTabState {
   return tab.type === 'shell';
@@ -268,11 +609,488 @@ function getPathLeafName(pathValue: string) {
   return parts.at(-1) ?? pathValue;
 }
 
+function getFileDirectory(pathValue: string) {
+  const parts = pathValue.split(/[\\/]/).filter(Boolean);
+  return parts.length > 1 ? parts.slice(0, -1).join('/') : 'root';
+}
+
+function resolveProjectFilePath(relativePath: string) {
+  if (!props.projectRoot) {
+    return relativePath;
+  }
+
+  const separator = window.bridgegit?.platform === 'win32' ? '\\' : '/';
+  const normalizedRoot = props.projectRoot.replace(/[\\/]+$/, '');
+  const normalizedRelativePath = relativePath.replace(/[\\/]/g, separator);
+  return `${normalizedRoot}${separator}${normalizedRelativePath}`;
+}
+
 function normalizeFileLookup(pathValue: string) {
   const normalizedPath = pathValue.replace(/\\/g, '/');
   return window.bridgegit?.platform === 'win32'
     ? normalizedPath.toLowerCase()
     : normalizedPath;
+}
+
+function getQuickOpenProjectKey(projectRoot = props.projectRoot) {
+  return projectRoot ? normalizeFileLookup(projectRoot) : null;
+}
+
+function updateQuickOpenProjectRecord<T>(
+  recordRef: Ref<Record<string, T>>,
+  projectKey: string,
+  value: T | null,
+) {
+  const nextRecord = { ...recordRef.value };
+
+  if (value === null) {
+    delete nextRecord[projectKey];
+  } else {
+    nextRecord[projectKey] = value;
+  }
+
+  recordRef.value = nextRecord;
+}
+
+function getQuickOpenLastQuery(projectRoot = props.projectRoot) {
+  const projectKey = getQuickOpenProjectKey(projectRoot);
+  return projectKey ? quickOpenLastQueryByProjectRoot.value[projectKey] ?? '' : '';
+}
+
+function setQuickOpenLastQuery(projectRoot: string | null, query: string) {
+  const projectKey = getQuickOpenProjectKey(projectRoot);
+
+  if (!projectKey) {
+    return;
+  }
+
+  updateQuickOpenProjectRecord(quickOpenLastQueryByProjectRoot, projectKey, query);
+}
+
+function pushQuickOpenHistoryValue(
+  recordRef: Ref<Record<string, string[]>>,
+  projectRoot: string | null,
+  value: string,
+  limit: number,
+) {
+  const projectKey = getQuickOpenProjectKey(projectRoot);
+  const trimmedValue = value.trim();
+
+  if (!projectKey || !trimmedValue) {
+    return;
+  }
+
+  const previousValues = recordRef.value[projectKey] ?? [];
+  const normalizedValue = normalizeFileLookup(trimmedValue);
+  const nextValues = [
+    trimmedValue,
+    ...previousValues.filter((entry) => normalizeFileLookup(entry) !== normalizedValue),
+  ].slice(0, limit);
+
+  updateQuickOpenProjectRecord(recordRef, projectKey, nextValues);
+}
+
+function rememberQuickOpenRecentFile(relativePath: string, projectRoot = props.projectRoot) {
+  if (resolveWorkspaceFileTabType(relativePath) === 'unsupported') {
+    return;
+  }
+
+  pushQuickOpenHistoryValue(
+    quickOpenRecentFilesByProjectRoot,
+    projectRoot,
+    relativePath,
+    QUICK_OPEN_RECENT_FILES_LIMIT,
+  );
+}
+
+function rememberQuickOpenRecentQuery(query: string, projectRoot = props.projectRoot) {
+  pushQuickOpenHistoryValue(
+    quickOpenRecentQueriesByProjectRoot,
+    projectRoot,
+    query,
+    QUICK_OPEN_RECENT_QUERIES_LIMIT,
+  );
+}
+
+function resolveProjectRelativePath(filePath: string, projectRoot = props.projectRoot) {
+  if (!projectRoot) {
+    return null;
+  }
+
+  const normalizedProjectRoot = projectRoot.replace(/\\/g, '/').replace(/\/+$/, '');
+  const normalizedFilePath = filePath.replace(/\\/g, '/');
+
+  if (normalizedFilePath === normalizedProjectRoot || !normalizedFilePath.startsWith(`${normalizedProjectRoot}/`)) {
+    return null;
+  }
+
+  return normalizedFilePath.slice(normalizedProjectRoot.length + 1);
+}
+
+function rememberQuickOpenRecentFileByAbsolutePath(filePath: string) {
+  const relativePath = resolveProjectRelativePath(filePath);
+
+  if (!relativePath) {
+    return;
+  }
+
+  rememberQuickOpenRecentFile(relativePath);
+}
+
+function setQuickOpenFileListLoading(projectRoot: string | null, isLoading: boolean) {
+  const projectKey = getQuickOpenProjectKey(projectRoot);
+
+  if (!projectKey) {
+    return;
+  }
+
+  updateQuickOpenProjectRecord(
+    quickOpenFileListLoadingByProjectRoot,
+    projectKey,
+    isLoading ? true : null,
+  );
+}
+
+function hasFreshQuickOpenFileList(projectRoot: string | null) {
+  const projectKey = getQuickOpenProjectKey(projectRoot);
+
+  if (!projectKey) {
+    return false;
+  }
+
+  const cachedEntry = quickOpenFileListCacheByProjectRoot.value[projectKey];
+  return Boolean(cachedEntry && Date.now() - cachedEntry.loadedAt < QUICK_OPEN_FILE_CACHE_TTL_MS);
+}
+
+function cancelQuickOpenFileListPrewarm() {
+  if (quickOpenFileListPrewarmTimer !== null) {
+    window.clearTimeout(quickOpenFileListPrewarmTimer);
+    quickOpenFileListPrewarmTimer = null;
+  }
+}
+
+function scheduleQuickOpenFileListPrewarm(projectRoot = props.projectRoot, delayMs = 1800) {
+  cancelQuickOpenFileListPrewarm();
+
+  const projectKey = getQuickOpenProjectKey(projectRoot);
+
+  if (!projectRoot || !projectKey || hasFreshQuickOpenFileList(projectRoot) || quickOpenFileListRequests.has(projectKey)) {
+    return;
+  }
+
+  quickOpenFileListPrewarmTimer = window.setTimeout(() => {
+    quickOpenFileListPrewarmTimer = null;
+    void ensureQuickOpenFileList(projectRoot).catch(() => undefined);
+  }, delayMs);
+}
+
+function getQuickOpenSearchRank(pathValue: string, query: string) {
+  const normalizedPath = pathValue.toLocaleLowerCase();
+  const fileName = normalizedPath.split('/').at(-1) ?? normalizedPath;
+  const pathSegments = normalizedPath.split('/');
+  const querySegments = query.split('/').filter(Boolean);
+
+  if (fileName === query) {
+    return 0;
+  }
+
+  if (fileName.startsWith(query)) {
+    return 1;
+  }
+
+  if (fileName.includes(query)) {
+    return 2;
+  }
+
+  if (normalizedPath.startsWith(query)) {
+    return 3;
+  }
+
+  if (pathSegments.some((segment) => segment === query)) {
+    return 4;
+  }
+
+  if (pathSegments.some((segment) => segment.startsWith(query))) {
+    return 5;
+  }
+
+  if (querySegments.length > 1 && normalizedPath.includes(querySegments.join('/'))) {
+    return 6;
+  }
+
+  return 7;
+}
+
+function getQuickOpenRecentRank(pathValue: string, recentPaths: string[]) {
+  const normalizedPath = normalizeFileLookup(pathValue);
+  const recentIndex = recentPaths.findIndex((entry) => normalizeFileLookup(entry) === normalizedPath);
+  return recentIndex === -1 ? Number.MAX_SAFE_INTEGER : recentIndex;
+}
+
+function getQuickOpenQueryTokens(query: string) {
+  return query
+    .trim()
+    .toLocaleLowerCase()
+    .split(/[\s/\\._\-*?]+/)
+    .map((token) => token.trim())
+    .filter(Boolean);
+}
+
+function getQuickOpenPathTokens(pathValue: string) {
+  return pathValue
+    .toLocaleLowerCase()
+    .split(/[\/\\._-]+/)
+    .map((token) => token.trim())
+    .filter(Boolean);
+}
+
+function buildQuickOpenHighlightedFragments(text: string, query: string) {
+  const normalizedText = text.toLocaleLowerCase();
+  const tokens = [...new Set(getQuickOpenQueryTokens(query))].sort((left, right) => right.length - left.length);
+
+  if (!text || !tokens.length) {
+    return [{ text, highlighted: false }];
+  }
+
+  const ranges: Array<{ start: number; end: number }> = [];
+
+  for (const token of tokens) {
+    let searchIndex = 0;
+
+    while (searchIndex < normalizedText.length) {
+      const matchIndex = normalizedText.indexOf(token, searchIndex);
+
+      if (matchIndex === -1) {
+        break;
+      }
+
+      ranges.push({ start: matchIndex, end: matchIndex + token.length });
+      searchIndex = matchIndex + token.length;
+    }
+  }
+
+  if (!ranges.length) {
+    return [{ text, highlighted: false }];
+  }
+
+  ranges.sort((left, right) => left.start - right.start || left.end - right.end);
+
+  const mergedRanges: Array<{ start: number; end: number }> = [];
+
+  for (const range of ranges) {
+    const previousRange = mergedRanges.at(-1);
+
+    if (!previousRange || range.start > previousRange.end) {
+      mergedRanges.push({ ...range });
+      continue;
+    }
+
+    previousRange.end = Math.max(previousRange.end, range.end);
+  }
+
+  const fragments: Array<{ text: string; highlighted: boolean }> = [];
+  let cursor = 0;
+
+  for (const range of mergedRanges) {
+    if (range.start > cursor) {
+      fragments.push({
+        text: text.slice(cursor, range.start),
+        highlighted: false,
+      });
+    }
+
+    fragments.push({
+      text: text.slice(range.start, range.end),
+      highlighted: true,
+    });
+    cursor = range.end;
+  }
+
+  if (cursor < text.length) {
+    fragments.push({
+      text: text.slice(cursor),
+      highlighted: false,
+    });
+  }
+
+  return fragments.filter((fragment) => fragment.text.length > 0);
+}
+
+function buildFindInFilesMatchKey(match: GitTextSearchMatch) {
+  return `${match.filePath}:${match.line}:${match.column}`;
+}
+
+function isFindInFilesIdentifierPart(character: string) {
+  return FIND_IN_FILES_IDENTIFIER_PART_PATTERN.test(character);
+}
+
+function getFindInFilesMatchQuality(match: GitTextSearchMatch, normalizedQuery: string) {
+  const lineText = match.text.toLocaleLowerCase();
+  const queryStartIndex = Math.max(0, match.column - 1);
+  const previousCharacter = lineText[queryStartIndex - 1] ?? '';
+  const nextCharacter = lineText[queryStartIndex + normalizedQuery.length] ?? '';
+  const startsAtIdentifierBoundary = !isFindInFilesIdentifierPart(previousCharacter);
+  const endsAtIdentifierBoundary = !isFindInFilesIdentifierPart(nextCharacter);
+
+  let category = 3;
+
+  if (startsAtIdentifierBoundary && endsAtIdentifierBoundary) {
+    category = 0;
+  } else if (startsAtIdentifierBoundary) {
+    category = 1;
+  } else if (lineText.startsWith(normalizedQuery, queryStartIndex)) {
+    category = 2;
+  }
+
+  return {
+    category,
+    queryStartIndex,
+    lineLength: match.text.length,
+  };
+}
+
+function compareFindInFilesMatches(left: GitTextSearchMatch, right: GitTextSearchMatch, normalizedQuery: string) {
+  const leftQuality = getFindInFilesMatchQuality(left, normalizedQuery);
+  const rightQuality = getFindInFilesMatchQuality(right, normalizedQuery);
+
+  if (leftQuality.category !== rightQuality.category) {
+    return leftQuality.category - rightQuality.category;
+  }
+
+  if (leftQuality.queryStartIndex !== rightQuality.queryStartIndex) {
+    return leftQuality.queryStartIndex - rightQuality.queryStartIndex;
+  }
+
+  if (leftQuality.lineLength !== rightQuality.lineLength) {
+    return leftQuality.lineLength - rightQuality.lineLength;
+  }
+
+  if (left.path !== right.path) {
+    return left.path.localeCompare(right.path, undefined, { numeric: true, sensitivity: 'base' });
+  }
+
+  if (left.line !== right.line) {
+    return left.line - right.line;
+  }
+
+  return left.column - right.column;
+}
+
+function buildFindInFilesPreviewLines(content: string, match: GitTextSearchMatch) {
+  const sourceLines = content.split(/\r?\n/);
+  const targetIndex = Math.max(0, match.line - 1);
+  const previewWindow = 5;
+  let startIndex = Math.max(0, targetIndex - 2);
+  let endIndex = Math.min(sourceLines.length, startIndex + previewWindow);
+
+  if (endIndex - startIndex < previewWindow) {
+    startIndex = Math.max(0, endIndex - previewWindow);
+  }
+
+  return sourceLines
+    .slice(startIndex, endIndex)
+    .map((text, offset) => {
+      const lineNumber = startIndex + offset + 1;
+
+      return {
+        lineNumber,
+        text,
+        isMatchLine: lineNumber === match.line,
+      };
+    });
+}
+
+function hasQuickOpenGlobPattern(query: string) {
+  return /[*?]/.test(query);
+}
+
+function buildQuickOpenGlobPattern(query: string) {
+  return query
+    .trim()
+    .toLocaleLowerCase()
+    .replace(/[|\\{}()[\]^$+?.]/g, '\\$&')
+    .replace(/\*/g, '.*')
+    .replace(/\?/g, '.');
+}
+
+function searchQuickOpenPaths(paths: string[], query: string, recentPaths: string[]) {
+  const normalizedQuery = query.trim().toLocaleLowerCase();
+  const queryTokens = getQuickOpenQueryTokens(query);
+  const usesGlobPattern = hasQuickOpenGlobPattern(query);
+  const globPattern = usesGlobPattern ? new RegExp(buildQuickOpenGlobPattern(query)) : null;
+
+  if (!normalizedQuery || (!queryTokens.length && !usesGlobPattern)) {
+    return {
+      paths: [],
+      totalCount: 0,
+    };
+  }
+
+  const filteredPaths = paths
+    .filter((pathValue) => {
+      const normalizedPath = pathValue.toLocaleLowerCase();
+
+      if (globPattern) {
+        return globPattern.test(normalizedPath);
+      }
+
+      const pathTokens = getQuickOpenPathTokens(pathValue);
+
+      return queryTokens.every((token) => (
+        normalizedPath.includes(token)
+        || pathTokens.some((pathToken) => pathToken.includes(token))
+      ));
+    })
+    .sort((left, right) => {
+      const matchRankDifference = globPattern
+        ? left.localeCompare(right, undefined, { numeric: true, sensitivity: 'base' })
+        : getQuickOpenSearchRank(left, normalizedQuery) - getQuickOpenSearchRank(right, normalizedQuery);
+
+      if (matchRankDifference !== 0) {
+        return matchRankDifference;
+      }
+
+      const recentRankDifference = getQuickOpenRecentRank(left, recentPaths) - getQuickOpenRecentRank(right, recentPaths);
+
+      if (recentRankDifference !== 0) {
+        return recentRankDifference;
+      }
+
+      return left.localeCompare(right, undefined, { numeric: true, sensitivity: 'base' });
+    });
+
+  return {
+    paths: filteredPaths.slice(0, QUICK_OPEN_VISIBLE_RESULT_LIMIT),
+    totalCount: filteredPaths.length,
+  };
+}
+
+function buildQuickOpenFileEntry(path: string) {
+  const absolutePath = resolveProjectFilePath(path);
+  const normalizedAbsolutePath = normalizeFileLookup(absolutePath);
+  const openTabs = tabs.value.filter((tab) => (
+    isEditableTab(tab)
+    && Boolean(getEditableTabFilePath(tab))
+    && normalizeFileLookup(getEditableTabFilePath(tab) ?? '') === normalizedAbsolutePath
+  ));
+  const activeFilePath = activeWorkspaceTab.value ? getEditableTabFilePath(activeWorkspaceTab.value) : null;
+  const tabType = resolveWorkspaceFileTabType(path);
+  const fileName = getPathLeafName(path);
+  const directory = getFileDirectory(path);
+
+  return {
+    path,
+    absolutePath,
+    fileName,
+    fileNameFragments: buildQuickOpenHighlightedFragments(fileName, quickOpenSearchQuery.value),
+    directory,
+    directoryFragments: buildQuickOpenHighlightedFragments(directory, quickOpenSearchQuery.value),
+    tabType,
+    isOpen: openTabs.length > 0,
+    openPaneCount: openTabs.length,
+    isDirty: openTabs.some((tab) => isEditableTabDirty(tab)),
+    isActive: Boolean(activeFilePath && normalizeFileLookup(activeFilePath) === normalizedAbsolutePath),
+  };
 }
 
 function buildTrackedFileSignature(fileStat: Pick<NoteFileStat, 'lastModifiedMs' | 'size'> | null) {
@@ -293,6 +1111,23 @@ function getEditableTabFilePath(tab: WorkspaceTabState) {
   }
 
   return null;
+}
+
+function revealWorkspaceFileInAllFiles(filePath: string | null) {
+  if (!filePath) {
+    return false;
+  }
+
+  emit('reveal-in-all-files', filePath);
+  return true;
+}
+
+function revealWorkspaceTabInAllFiles(tab: WorkspaceTabState) {
+  return revealWorkspaceFileInAllFiles(getEditableTabFilePath(tab));
+}
+
+function revealActiveFileInAllFiles() {
+  return activeWorkspaceTab.value ? revealWorkspaceTabInAllFiles(activeWorkspaceTab.value) : false;
 }
 
 function sanitizeNoteFileName(title: string) {
@@ -386,6 +1221,18 @@ function buildNoteTab(): WorkspaceNoteTabState {
     viewMode: 'split',
     fontSize: props.workspaceTabDefaults.noteFontSize,
   };
+}
+
+function openFindInFilesDialog() {
+  closeAllTabsDialog();
+  closeQuickOpenDialog();
+  closeTabMenu();
+  closeCreationMenu();
+  closeCommandMenu();
+  findInFilesDialogOpen.value = true;
+  findInFilesError.value = null;
+  isSearchingFindInFiles.value = false;
+  focusFindInFilesSearch();
 }
 
 function ensureTab() {
@@ -1030,25 +1877,44 @@ function updateShellTabState(tabId: string, patch: Partial<WorkspaceShellTabStat
   syncState(nextTabs, activeTabId.value);
 }
 
-function findNoteTabByFilePath(filePath: string, excludeTabId?: string | null) {
+function findNoteTabByFilePath(filePath: string, excludeTabId?: string | null): WorkspaceNoteTabState | null {
   const lookupPath = normalizeFileLookup(filePath);
 
-  return tabs.value.find((tab) => (
+  return tabs.value.find((tab): tab is WorkspaceNoteTabState => (
     isNoteTab(tab)
     && tab.id !== excludeTabId
-    && tab.filePath
-    && normalizeFileLookup(tab.filePath) === lookupPath
+    && Boolean(tab.filePath)
+    && normalizeFileLookup(tab.filePath ?? '') === lookupPath
   )) ?? null;
 }
 
-function findCodeTabByFilePath(filePath: string, excludeTabId?: string | null) {
+function findCodeTabByFilePath(filePath: string, excludeTabId?: string | null): WorkspaceCodeTabState | null {
   const lookupPath = normalizeFileLookup(filePath);
 
-  return tabs.value.find((tab) => (
+  return tabs.value.find((tab): tab is WorkspaceCodeTabState => (
     isCodeTab(tab)
     && tab.id !== excludeTabId
     && normalizeFileLookup(tab.filePath) === lookupPath
   )) ?? null;
+}
+
+function findEditorPaneByTabId(tabId: string, sourceLayout = editorPaneLayout.value): WorkspaceEditorPaneState | null {
+  return sourceLayout.panes.find((pane) => pane.tabId === tabId) ?? null;
+}
+
+function activateExistingWorkspaceFileTab<T extends WorkspaceNoteTabState | WorkspaceCodeTabState>(tab: T): T {
+  if (isCodeTab(tab)) {
+    const normalizedLayout = normalizeEditorPaneLayout(editorPaneLayout.value, tabs.value, tab.id);
+    const pane = findEditorPaneByTabId(tab.id, normalizedLayout);
+
+    if (pane) {
+      setActiveEditorPane(pane.id);
+      return tab;
+    }
+  }
+
+  setActiveTab(tab.id);
+  return tab;
 }
 
 function buildFileBackedNoteTab(filePath: string, content: string): WorkspaceNoteTabState {
@@ -1558,6 +2424,16 @@ function handleTabActivity(tabId: string) {
   emit('activity');
 }
 
+function handleTabAttention(tabId: string) {
+  markShellTabAsInteracted(tabId);
+  clearTabActivityTimer(tabId);
+  clearTabActivity(tabId);
+  tabAttention.value = {
+    ...tabAttention.value,
+    [tabId]: true,
+  };
+}
+
 function isTabActive(tabId: string) {
   if (!interactedShellTabs.value[tabId]) {
     return false;
@@ -1670,14 +2546,24 @@ function openResolvedWorkspaceFile(
     return null;
   }
 
+  rememberQuickOpenRecentFileByAbsolutePath(openedFile.path);
+
   const targetTab = targetTabId ? getTabById(targetTabId) : null;
 
+  if (
+    targetTab
+    && isEditableTab(targetTab)
+    && targetTab.filePath
+    && normalizeFileLookup(targetTab.filePath) === normalizeFileLookup(openedFile.path)
+  ) {
+    return activateExistingWorkspaceFileTab(targetTab);
+  }
+
   if (tabType === 'note') {
-    const existingNoteTab = findNoteTabByFilePath(openedFile.path, targetTabId);
+    const existingNoteTab = findNoteTabByFilePath(openedFile.path);
 
     if (existingNoteTab) {
-      setActiveTab(existingNoteTab.id);
-      return existingNoteTab;
+      return activateExistingWorkspaceFileTab(existingNoteTab);
     }
 
     if (targetTab && isNoteTab(targetTab) && !targetTab.filePath && !targetTab.content.trim()) {
@@ -1698,11 +2584,10 @@ function openResolvedWorkspaceFile(
     return nextNoteTab;
   }
 
-  const existingCodeTab = findCodeTabByFilePath(openedFile.path, targetTabId);
+  const existingCodeTab = findCodeTabByFilePath(openedFile.path);
 
   if (existingCodeTab) {
-    setActiveTab(existingCodeTab.id);
-    return existingCodeTab;
+    return activateExistingWorkspaceFileTab(existingCodeTab);
   }
 
   const nextCodeTab = buildFileBackedCodeTab(openedFile.path, openedFile.content);
@@ -1975,6 +2860,14 @@ function setAllTabsSearchInput(element: Element | ComponentPublicInstance | null
   allTabsSearchInput.value = element as HTMLInputElement | null;
 }
 
+function setQuickOpenSearchInput(element: Element | ComponentPublicInstance | null) {
+  quickOpenSearchInput.value = element as HTMLInputElement | null;
+}
+
+function setFindInFilesSearchInput(element: Element | ComponentPublicInstance | null) {
+  findInFilesSearchInput.value = element as HTMLInputElement | null;
+}
+
 function setAllTabsFilterButtonRef(element: Element | ComponentPublicInstance | null) {
   allTabsFilterButtonRef.value = element as HTMLElement | null;
 }
@@ -2001,14 +2894,42 @@ function setAllTabsItemRef(
   tabId: string,
   element: Element | ComponentPublicInstance | null,
 ) {
-  const button = element as HTMLButtonElement | null;
+  const item = element as HTMLElement | null;
 
-  if (!button) {
+  if (!item) {
     allTabsItemRefs.delete(tabId);
     return;
   }
 
-  allTabsItemRefs.set(tabId, button);
+  allTabsItemRefs.set(tabId, item);
+}
+
+function setQuickOpenItemRef(
+  path: string,
+  element: Element | ComponentPublicInstance | null,
+) {
+  const button = element as HTMLButtonElement | null;
+
+  if (!button) {
+    quickOpenItemRefs.delete(path);
+    return;
+  }
+
+  quickOpenItemRefs.set(path, button);
+}
+
+function setFindInFilesItemRef(
+  matchKey: string,
+  element: Element | ComponentPublicInstance | null,
+) {
+  const button = element as HTMLButtonElement | null;
+
+  if (!button) {
+    findInFilesItemRefs.delete(matchKey);
+    return;
+  }
+
+  findInFilesItemRefs.set(matchKey, button);
 }
 
 function focusCreationMenuAction(actionId: CreationMenuActionId) {
@@ -2035,6 +2956,20 @@ function focusAllTabsSearch() {
   });
 }
 
+function focusQuickOpenSearch() {
+  void nextTick(() => {
+    quickOpenSearchInput.value?.focus();
+    quickOpenSearchInput.value?.select();
+  });
+}
+
+function focusFindInFilesSearch() {
+  void nextTick(() => {
+    findInFilesSearchInput.value?.focus();
+    findInFilesSearchInput.value?.select();
+  });
+}
+
 function scrollSelectedAllTabsItemIntoView() {
   if (!allTabsSelectedTabId.value) {
     return;
@@ -2048,10 +2983,38 @@ function scrollSelectedAllTabsItemIntoView() {
   });
 }
 
+function scrollSelectedQuickOpenItemIntoView() {
+  if (!quickOpenSelectedPath.value) {
+    return;
+  }
+
+  void nextTick(() => {
+    quickOpenItemRefs.get(quickOpenSelectedPath.value ?? '')?.scrollIntoView({
+      block: 'nearest',
+      inline: 'nearest',
+    });
+  });
+}
+
+function scrollSelectedFindInFilesItemIntoView() {
+  if (!findInFilesSelectedMatchKey.value) {
+    return;
+  }
+
+  void nextTick(() => {
+    findInFilesItemRefs.get(findInFilesSelectedMatchKey.value ?? '')?.scrollIntoView({
+      block: 'nearest',
+      inline: 'nearest',
+    });
+  });
+}
+
 function openAllTabsDialog() {
   tabMenu.value = null;
   creationMenu.value = null;
   commandMenuOpen.value = false;
+  closeQuickOpenDialog();
+  closeFindInFilesDialog();
   allTabsDialogOpen.value = true;
   allTabsSearchQuery.value = '';
   allTabsTypeFilter.value = 'all';
@@ -2067,6 +3030,357 @@ function closeAllTabsDialog() {
   allTabsTypeFilter.value = 'all';
   allTabsFilterMenuOpen.value = false;
   allTabsSelectedTabId.value = null;
+}
+
+async function ensureQuickOpenFileList(projectRoot: string) {
+  if (!window.bridgegit?.git) {
+    return [];
+  }
+
+  const projectKey = getQuickOpenProjectKey(projectRoot);
+
+  if (!projectKey) {
+    return [];
+  }
+
+  const cachedEntry = quickOpenFileListCacheByProjectRoot.value[projectKey];
+
+  if (cachedEntry && Date.now() - cachedEntry.loadedAt < QUICK_OPEN_FILE_CACHE_TTL_MS) {
+    return cachedEntry.files;
+  }
+
+  const inFlightRequest = quickOpenFileListRequests.get(projectKey);
+
+  if (inFlightRequest) {
+    return inFlightRequest;
+  }
+
+  setQuickOpenFileListLoading(projectRoot, true);
+
+  const request = window.bridgegit.git.listFiles(projectRoot)
+    .then((paths) => {
+      const nextFiles = paths.filter((pathValue) => resolveWorkspaceFileTabType(pathValue) !== 'unsupported');
+      updateQuickOpenProjectRecord(
+        quickOpenFileListCacheByProjectRoot,
+        projectKey,
+        {
+          files: nextFiles,
+          loadedAt: Date.now(),
+        },
+      );
+      return nextFiles;
+    })
+    .finally(() => {
+      if (quickOpenFileListRequests.get(projectKey) === request) {
+        quickOpenFileListRequests.delete(projectKey);
+      }
+
+      setQuickOpenFileListLoading(projectRoot, false);
+    });
+
+  quickOpenFileListRequests.set(projectKey, request);
+  return request;
+}
+
+async function runQuickOpenSearch(query: string) {
+  if (!props.projectRoot) {
+    quickOpenResults.value = [];
+    quickOpenTotalResultCount.value = 0;
+    quickOpenError.value = null;
+    isSearchingQuickOpen.value = false;
+    return;
+  }
+
+  const expectedProjectRoot = props.projectRoot;
+  const requestToken = ++quickOpenSearchToken;
+  isSearchingQuickOpen.value = true;
+  quickOpenError.value = null;
+
+  try {
+    const files = await ensureQuickOpenFileList(expectedProjectRoot);
+
+    if (props.projectRoot !== expectedProjectRoot || requestToken !== quickOpenSearchToken) {
+      return;
+    }
+
+    const recentPaths = quickOpenRecentFilesByProjectRoot.value[getQuickOpenProjectKey(expectedProjectRoot) ?? ''] ?? [];
+    const { paths, totalCount } = searchQuickOpenPaths(files, query, recentPaths);
+    quickOpenResults.value = paths;
+    quickOpenTotalResultCount.value = totalCount;
+  } catch (error) {
+    if (props.projectRoot !== expectedProjectRoot || requestToken !== quickOpenSearchToken) {
+      return;
+    }
+
+    quickOpenResults.value = [];
+    quickOpenTotalResultCount.value = 0;
+    quickOpenError.value = error instanceof Error ? error.message : 'Failed to search files.';
+  } finally {
+    if (props.projectRoot === expectedProjectRoot && requestToken === quickOpenSearchToken) {
+      isSearchingQuickOpen.value = false;
+    }
+  }
+}
+
+function openQuickOpenDialog() {
+  tabMenu.value = null;
+  creationMenu.value = null;
+  commandMenuOpen.value = false;
+  closeAllTabsDialog();
+  closeFindInFilesDialog();
+  quickOpenSearchQuery.value = getQuickOpenLastQuery();
+  quickOpenDialogOpen.value = true;
+  quickOpenError.value = null;
+  quickOpenTotalResultCount.value = 0;
+  isSearchingQuickOpen.value = false;
+  cancelQuickOpenFileListPrewarm();
+  void (props.projectRoot ? ensureQuickOpenFileList(props.projectRoot).catch(() => undefined) : Promise.resolve());
+  focusQuickOpenSearch();
+}
+
+function closeQuickOpenDialog() {
+  rememberQuickOpenRecentQuery(quickOpenSearchQuery.value);
+  quickOpenDialogOpen.value = false;
+  quickOpenError.value = null;
+  quickOpenTotalResultCount.value = 0;
+  quickOpenSelectedPath.value = null;
+  isSearchingQuickOpen.value = false;
+  quickOpenSearchToken += 1;
+
+  if (quickOpenSearchDebounceTimer !== null) {
+    window.clearTimeout(quickOpenSearchDebounceTimer);
+    quickOpenSearchDebounceTimer = null;
+  }
+
+  scheduleQuickOpenFileListPrewarm();
+}
+
+async function runFindInFilesSearch(query: string) {
+  if (!props.projectRoot || !window.bridgegit?.git) {
+    findInFilesResults.value = [];
+    findInFilesError.value = null;
+    isSearchingFindInFiles.value = false;
+    return;
+  }
+
+  const normalizedQuery = query.trim();
+
+  if (!normalizedQuery) {
+    findInFilesResults.value = [];
+    findInFilesError.value = null;
+    isSearchingFindInFiles.value = false;
+    findInFilesSelectedMatchKey.value = null;
+    return;
+  }
+
+  const expectedProjectRoot = props.projectRoot;
+  const requestToken = ++findInFilesSearchToken;
+  isSearchingFindInFiles.value = true;
+  findInFilesError.value = null;
+
+  try {
+    const matches = await window.bridgegit.git.searchText(
+      expectedProjectRoot,
+      normalizedQuery,
+      FIND_IN_FILES_SEARCH_RESULT_LIMIT,
+      {
+        fileGlob: findInFilesFileFilter.value.trim() || null,
+        includeUntracked: findInFilesIncludeUntracked.value,
+      },
+    );
+
+    if (props.projectRoot !== expectedProjectRoot || requestToken !== findInFilesSearchToken) {
+      return;
+    }
+
+    findInFilesResults.value = matches;
+    findInFilesSelectedMatchKey.value = null;
+  } catch (error) {
+    if (props.projectRoot !== expectedProjectRoot || requestToken !== findInFilesSearchToken) {
+      return;
+    }
+
+    findInFilesResults.value = [];
+    findInFilesSelectedMatchKey.value = null;
+    findInFilesError.value = error instanceof Error ? error.message : 'Failed to search files.';
+  } finally {
+    if (props.projectRoot === expectedProjectRoot && requestToken === findInFilesSearchToken) {
+      isSearchingFindInFiles.value = false;
+    }
+  }
+}
+
+function closeFindInFilesDialog() {
+  findInFilesDialogOpen.value = false;
+  findInFilesError.value = null;
+  findInFilesSelectedMatchKey.value = null;
+  isSearchingFindInFiles.value = false;
+  findInFilesPreviewPath.value = null;
+  findInFilesPreviewMatchLine.value = null;
+  findInFilesPreviewLines.value = [];
+  findInFilesPreviewError.value = null;
+  isLoadingFindInFilesPreview.value = false;
+  findInFilesSearchToken += 1;
+  findInFilesPreviewToken += 1;
+
+  if (findInFilesSearchDebounceTimer !== null) {
+    window.clearTimeout(findInFilesSearchDebounceTimer);
+    findInFilesSearchDebounceTimer = null;
+  }
+}
+
+function toggleFindInFilesIncludeUntracked() {
+  findInFilesIncludeUntracked.value = !findInFilesIncludeUntracked.value;
+}
+
+function selectFindInFilesItem(matchKey: string | null) {
+  findInFilesSelectedMatchKey.value = matchKey;
+  scrollSelectedFindInFilesItemIntoView();
+}
+
+function moveFindInFilesSelection(direction: -1 | 1) {
+  if (!findInFilesVisibleItems.value.length) {
+    return;
+  }
+
+  const currentIndex = findInFilesVisibleItems.value.findIndex((match) => match.matchKey === findInFilesSelectedMatchKey.value);
+  const safeCurrentIndex = currentIndex >= 0 ? currentIndex : 0;
+  const nextIndex = (safeCurrentIndex + direction + findInFilesVisibleItems.value.length)
+    % findInFilesVisibleItems.value.length;
+  const nextMatch = findInFilesVisibleItems.value[nextIndex] ?? null;
+
+  if (nextMatch) {
+    selectFindInFilesItem(nextMatch.matchKey);
+  }
+}
+
+async function activateFindInFilesMatch(matchKey: string) {
+  const match = findInFilesVisibleItems.value.find((candidate) => candidate.matchKey === matchKey);
+
+  if (!match) {
+    return;
+  }
+
+  await openCodeNavigationTarget({
+    filePath: match.filePath,
+    line: match.line,
+    column: match.column,
+  });
+  closeFindInFilesDialog();
+}
+
+async function activateSelectedFindInFilesItem() {
+  const targetMatch = findInFilesSelectedMatchKey.value
+    ?? findInFilesVisibleItems.value[0]?.matchKey
+    ?? null;
+
+  if (!targetMatch) {
+    return false;
+  }
+
+  await activateFindInFilesMatch(targetMatch);
+  return true;
+}
+
+async function loadFindInFilesPreview(matchKey: string | null) {
+  const match = matchKey
+    ? (findInFilesResults.value.find((entry) => buildFindInFilesMatchKey(entry) === matchKey) ?? null)
+    : null;
+
+  if (!match || !window.bridgegit?.notes) {
+    findInFilesPreviewPath.value = null;
+    findInFilesPreviewMatchLine.value = null;
+    findInFilesPreviewLines.value = [];
+    findInFilesPreviewError.value = null;
+    isLoadingFindInFilesPreview.value = false;
+    return;
+  }
+
+  const token = ++findInFilesPreviewToken;
+  isLoadingFindInFilesPreview.value = true;
+  findInFilesPreviewError.value = null;
+  findInFilesPreviewPath.value = match.path;
+  findInFilesPreviewMatchLine.value = match.line;
+
+  try {
+    const fileHandle = findInFilesPreviewCache.get(match.filePath)
+      ?? await window.bridgegit.notes.readFile(match.filePath);
+
+    if (!findInFilesPreviewCache.has(match.filePath)) {
+      findInFilesPreviewCache.set(match.filePath, fileHandle);
+    }
+
+    if (token !== findInFilesPreviewToken) {
+      return;
+    }
+
+    findInFilesPreviewLines.value = buildFindInFilesPreviewLines(fileHandle.content, match);
+  } catch (error) {
+    if (token !== findInFilesPreviewToken) {
+      return;
+    }
+
+    findInFilesPreviewLines.value = [];
+    findInFilesPreviewError.value = error instanceof Error ? error.message : 'Failed to load preview.';
+  } finally {
+    if (token === findInFilesPreviewToken) {
+      isLoadingFindInFilesPreview.value = false;
+    }
+  }
+}
+
+function selectQuickOpenItem(path: string | null) {
+  quickOpenSelectedPath.value = path;
+  scrollSelectedQuickOpenItemIntoView();
+}
+
+function moveQuickOpenSelection(direction: -1 | 1) {
+  if (!quickOpenResultEntries.value.length) {
+    return;
+  }
+
+  const currentIndex = quickOpenResultEntries.value.findIndex((entry) => entry.path === quickOpenSelectedPath.value);
+  const safeCurrentIndex = currentIndex >= 0 ? currentIndex : 0;
+  const nextIndex = (safeCurrentIndex + direction + quickOpenResultEntries.value.length) % quickOpenResultEntries.value.length;
+  const nextPath = quickOpenResultEntries.value[nextIndex]?.path ?? null;
+
+  if (nextPath) {
+    selectQuickOpenItem(nextPath);
+  }
+}
+
+async function activateQuickOpenPath(path: string) {
+  const entry = quickOpenResultEntries.value.find((candidate) => candidate.path === path);
+
+  if (!entry) {
+    return;
+  }
+
+  const openedTab = await openWorkspaceFilePath(entry.absolutePath);
+
+  if (!openedTab) {
+    return;
+  }
+
+  rememberQuickOpenRecentFile(entry.path);
+  rememberQuickOpenRecentQuery(quickOpenSearchQuery.value);
+  closeQuickOpenDialog();
+}
+
+async function activateSelectedQuickOpenItem() {
+  const targetPath = quickOpenSelectedPath.value ?? quickOpenResultEntries.value[0]?.path ?? null;
+
+  if (!targetPath) {
+    return false;
+  }
+
+  await activateQuickOpenPath(targetPath);
+  return true;
+}
+
+function applyQuickOpenRecentQuery(query: string) {
+  quickOpenSearchQuery.value = query;
+  focusQuickOpenSearch();
 }
 
 function toggleAllTabsFilterMenu() {
@@ -2244,88 +3558,245 @@ function handleAllTabsDialogKeydown(event: KeyboardEvent) {
   return false;
 }
 
-function performCloseTab(tabId: string) {
-  const currentIndex = tabs.value.findIndex((tab) => tab.id === tabId);
+function handleQuickOpenDialogKeydown(event: KeyboardEvent) {
+  if (!quickOpenDialogOpen.value) {
+    return false;
+  }
 
-  if (currentIndex === -1) {
+  if (event.key === 'ArrowDown' || (event.key === 'Tab' && !event.shiftKey)) {
+    event.preventDefault();
+    moveQuickOpenSelection(1);
+    return true;
+  }
+
+  if (event.key === 'ArrowUp' || (event.key === 'Tab' && event.shiftKey)) {
+    event.preventDefault();
+    moveQuickOpenSelection(-1);
+    return true;
+  }
+
+  if (event.key === 'Home') {
+    event.preventDefault();
+    selectQuickOpenItem(quickOpenResultEntries.value[0]?.path ?? null);
+    return true;
+  }
+
+  if (event.key === 'End') {
+    event.preventDefault();
+    selectQuickOpenItem(quickOpenResultEntries.value.at(-1)?.path ?? null);
+    return true;
+  }
+
+  if (event.key === 'Enter') {
+    event.preventDefault();
+    void activateSelectedQuickOpenItem();
+    return true;
+  }
+
+  if (event.key === 'Escape' && document.activeElement === quickOpenSearchInput.value && quickOpenSearchQuery.value) {
+    event.preventDefault();
+    quickOpenSearchQuery.value = '';
+    return true;
+  }
+
+  if ((event.ctrlKey || event.metaKey) && event.key.toLocaleLowerCase() === 'p') {
+    event.preventDefault();
+    focusQuickOpenSearch();
+    return true;
+  }
+
+  return false;
+}
+
+function handleFindInFilesDialogKeydown(event: KeyboardEvent) {
+  if (!findInFilesDialogOpen.value) {
+    return false;
+  }
+
+  if (event.key === 'ArrowDown' || (event.key === 'Tab' && !event.shiftKey)) {
+    event.preventDefault();
+    moveFindInFilesSelection(1);
+    return true;
+  }
+
+  if (event.key === 'ArrowUp' || (event.key === 'Tab' && event.shiftKey)) {
+    event.preventDefault();
+    moveFindInFilesSelection(-1);
+    return true;
+  }
+
+  if (event.key === 'Home') {
+    event.preventDefault();
+    selectFindInFilesItem(findInFilesVisibleItems.value[0]?.matchKey ?? null);
+    return true;
+  }
+
+  if (event.key === 'End') {
+    event.preventDefault();
+    const lastMatch = findInFilesVisibleItems.value.at(-1) ?? null;
+    selectFindInFilesItem(lastMatch?.matchKey ?? null);
+    return true;
+  }
+
+  if (event.key === 'Enter') {
+    event.preventDefault();
+    void activateSelectedFindInFilesItem();
+    return true;
+  }
+
+  if (event.key === 'Escape' && document.activeElement === findInFilesSearchInput.value && findInFilesSearchQuery.value) {
+    event.preventDefault();
+    findInFilesSearchQuery.value = '';
+    return true;
+  }
+
+  if ((event.ctrlKey || event.metaKey) && event.key.toLocaleLowerCase() === 'f') {
+    event.preventDefault();
+    focusFindInFilesSearch();
+    return true;
+  }
+
+  return false;
+}
+
+function collapseEditorPanesForTabs(
+  nextTabs: WorkspaceTabState[],
+  nextActiveTabId: string | null,
+  sourceLayout = editorPaneLayout.value,
+) {
+  if (getCodeTabs(nextTabs).length <= 1) {
+    return buildEmptyEditorPaneLayout();
+  }
+
+  return normalizeEditorPaneLayout(sourceLayout, nextTabs, nextActiveTabId);
+}
+
+function performCloseTabs(tabIds: string[], preferredActiveTabId: string | null = activeTabId.value) {
+  const closingIds = Array.from(new Set(tabIds)).filter((tabId) => Boolean(getTabById(tabId)));
+
+  if (!closingIds.length) {
     return;
   }
 
-  const wasActive = activeTabId.value === tabId;
-  const nextTabs = tabs.value.filter((tab) => tab.id !== tabId);
+  const closingSet = new Set(closingIds);
+  const firstClosedIndex = tabs.value.findIndex((tab) => closingSet.has(tab.id));
+  const nextTabs = tabs.value.filter((tab) => !closingSet.has(tab.id));
 
-  editingTabId.value = editingTabId.value === tabId ? null : editingTabId.value;
-  tabMenu.value = tabMenu.value?.tabId === tabId ? null : tabMenu.value;
-
-  if (tabId in reconnectTokens.value) {
-    const { [tabId]: _removedToken, ...nextTokens } = reconnectTokens.value;
-    reconnectTokens.value = nextTokens;
+  if (editingTabId.value && closingSet.has(editingTabId.value)) {
+    editingTabId.value = null;
   }
 
-  clearTabActivity(tabId);
-  clearTabAttention(tabId);
-  clearTabLastInput(tabId);
-  clearTabLastTyping(tabId);
-  clearTabLastSubmit(tabId);
-  setNoteBusy(tabId, false);
+  if (tabMenu.value?.tabId && closingSet.has(tabMenu.value.tabId)) {
+    tabMenu.value = null;
+  }
+
+  if (allTabsSelectedTabId.value && closingSet.has(allTabsSelectedTabId.value)) {
+    allTabsSelectedTabId.value = null;
+  }
+
+  const nextReconnectTokens = { ...reconnectTokens.value };
+
+  for (const tabId of closingIds) {
+    delete nextReconnectTokens[tabId];
+    clearTabActivity(tabId);
+    clearTabAttention(tabId);
+    clearTabLastInput(tabId);
+    clearTabLastTyping(tabId);
+    clearTabLastSubmit(tabId);
+    setNoteBusy(tabId, false);
+  }
+
+  reconnectTokens.value = nextReconnectTokens;
 
   if (!nextTabs.length) {
     const fallbackTab = buildShellTab(props.cwd);
-    syncState([fallbackTab], fallbackTab.id);
+    syncState([fallbackTab], fallbackTab.id, buildEmptyEditorPaneLayout());
     return;
   }
 
-  if (wasActive) {
-    const fallbackIndex = Math.min(currentIndex, nextTabs.length - 1);
-    syncState(nextTabs, nextTabs[fallbackIndex]?.id ?? nextTabs[0]?.id ?? null);
-    return;
+  let nextActiveTabId = preferredActiveTabId;
+
+  if (!nextActiveTabId || closingSet.has(nextActiveTabId) || !nextTabs.some((tab) => tab.id === nextActiveTabId)) {
+    const fallbackIndex = Math.min(firstClosedIndex >= 0 ? firstClosedIndex : 0, nextTabs.length - 1);
+    nextActiveTabId = nextTabs[fallbackIndex]?.id ?? nextTabs[0]?.id ?? null;
   }
 
-  syncState(nextTabs, activeTabId.value);
+  const nextEditorPaneLayout = collapseEditorPanesForTabs(nextTabs, nextActiveTabId);
+  syncState(nextTabs, nextActiveTabId, nextEditorPaneLayout);
+}
+
+function performCloseTab(tabId: string) {
+  performCloseTabs([tabId], activeTabId.value);
 }
 
 function closePendingCloseDialog() {
   pendingCloseDialog.value = null;
 }
 
+function requestCloseTabs(
+  tabIds: string[],
+  options: {
+    keepTabId?: string | null;
+    title?: string;
+  } = {},
+) {
+  const closingTabs = Array.from(new Set(tabIds))
+    .map((tabId) => getTabById(tabId))
+    .filter((tab): tab is WorkspaceTabState => Boolean(tab));
+
+  if (!closingTabs.length) {
+    return;
+  }
+
+  const dirtyTabs = closingTabs.filter((tab) => isEditableTab(tab) && isEditableTabDirty(tab));
+  const shellAttentionCount = closingTabs.filter((tab) => isShellTab(tab) && hasAttention(tab.id)).length;
+  const shellActivityCount = closingTabs.filter((tab) => (
+    isShellTab(tab) && shellNeedsCloseConfirmation(tab.id) && !hasAttention(tab.id)
+  )).length;
+  const keepTabId = options.keepTabId ?? null;
+
+  tabMenu.value = null;
+  creationMenu.value = null;
+  commandMenuOpen.value = false;
+
+  if (dirtyTabs.length > 0 || shellAttentionCount > 0 || shellActivityCount > 0) {
+    const singleTab = closingTabs.length === 1 ? closingTabs[0] : null;
+    pendingCloseDialog.value = {
+      mode: singleTab ? 'single' : 'bulk',
+      kind: singleTab?.type ?? 'shell',
+      tabIds: closingTabs.map((tab) => tab.id),
+      title: options.title ?? (singleTab ? singleTab.title : `Close ${closingTabs.length} tabs?`),
+      hasSavedFile: Boolean(singleTab && isEditableTab(singleTab) && singleTab.filePath),
+      hasActivity: Boolean(singleTab && isShellTab(singleTab) && isTabActive(singleTab.id)),
+      hasAttention: Boolean(singleTab && isShellTab(singleTab) && hasAttention(singleTab.id)),
+      keepTabId,
+      dirtyCount: dirtyTabs.length,
+      shellAttentionCount,
+      shellActivityCount,
+    };
+    return;
+  }
+
+  performCloseTabs(closingTabs.map((tab) => tab.id), keepTabId);
+}
+
 async function requestCloseTab(tabId: string) {
-  const tab = getTabById(tabId);
+  requestCloseTabs([tabId]);
+}
 
-  if (!tab) {
+function requestCloseOtherTabs(tabId: string) {
+  const tabIdsToClose = tabs.value
+    .filter((tab) => tab.id !== tabId)
+    .map((tab) => tab.id);
+
+  if (!tabIdsToClose.length) {
     return;
   }
 
-  if (isEditableTab(tab) && isEditableTabDirty(tab)) {
-    pendingCloseDialog.value = {
-      kind: tab.type,
-      tabId,
-      title: tab.title,
-      hasSavedFile: Boolean(tab.filePath),
-      hasActivity: false,
-      hasAttention: false,
-    };
-    tabMenu.value = null;
-    creationMenu.value = null;
-    commandMenuOpen.value = false;
-    return;
-  }
-
-  if (isShellTab(tab) && shellNeedsCloseConfirmation(tabId)) {
-    pendingCloseDialog.value = {
-      kind: 'shell',
-      tabId,
-      title: tab.title,
-      hasSavedFile: false,
-      hasActivity: isTabActive(tabId),
-      hasAttention: hasAttention(tabId),
-    };
-    tabMenu.value = null;
-    creationMenu.value = null;
-    commandMenuOpen.value = false;
-    return;
-  }
-
-  performCloseTab(tabId);
+  requestCloseTabs(tabIdsToClose, {
+    keepTabId: tabId,
+    title: 'Close other tabs?',
+  });
 }
 
 function updateNoteContent(tabId: string, content: string) {
@@ -2482,12 +3953,56 @@ async function saveCodeFileAs(tabId: string) {
   }
 }
 
+async function saveDirtyTabsForClose(tabIds: string[]) {
+  for (const tabId of tabIds) {
+    const tab = getTabById(tabId);
+
+    if (!tab || !isEditableTab(tab) || !isEditableTabDirty(tab)) {
+      continue;
+    }
+
+    const savedPath = isCodeTab(tab)
+      ? await saveCodeFile(tabId)
+      : await saveNoteFile(tabId);
+
+    if (!savedPath) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
 async function handlePendingCloseSave() {
-  if (!pendingCloseDialog.value || pendingCloseDialog.value.kind === 'shell') {
+  const dialog = pendingCloseDialog.value;
+
+  if (!dialog || !pendingCloseDialogCanSave.value) {
     return;
   }
 
-  const { kind, tabId } = pendingCloseDialog.value;
+  if (dialog.mode === 'bulk') {
+    const savedAllTabs = await saveDirtyTabsForClose(dialog.tabIds);
+
+    if (!savedAllTabs) {
+      return;
+    }
+
+    closePendingCloseDialog();
+    performCloseTabs(dialog.tabIds, dialog.keepTabId);
+    return;
+  }
+
+  if (dialog.kind === 'shell') {
+    return;
+  }
+
+  const { kind, tabIds } = dialog;
+  const tabId = tabIds[0];
+
+  if (!tabId) {
+    return;
+  }
+
   const savedPath = kind === 'code' ? await saveCodeFile(tabId) : await saveNoteFile(tabId);
 
   if (!savedPath) {
@@ -2495,15 +4010,21 @@ async function handlePendingCloseSave() {
   }
 
   closePendingCloseDialog();
-  performCloseTab(tabId);
+  performCloseTabs([tabId], activeTabId.value);
 }
 
 async function handlePendingCloseSaveAs() {
-  if (!pendingCloseDialog.value || pendingCloseDialog.value.kind === 'shell') {
+  if (!pendingCloseDialog.value || pendingCloseDialog.value.mode !== 'single' || pendingCloseDialog.value.kind === 'shell') {
     return;
   }
 
-  const { kind, tabId } = pendingCloseDialog.value;
+  const { kind, tabIds } = pendingCloseDialog.value;
+  const tabId = tabIds[0];
+
+  if (!tabId) {
+    return;
+  }
+
   const savedPath = kind === 'code' ? await saveCodeFileAs(tabId) : await saveNoteFileAs(tabId);
 
   if (!savedPath) {
@@ -2511,17 +4032,18 @@ async function handlePendingCloseSaveAs() {
   }
 
   closePendingCloseDialog();
-  performCloseTab(tabId);
+  performCloseTabs([tabId], activeTabId.value);
 }
 
 function handlePendingCloseDiscard() {
-  if (!pendingCloseDialog.value) {
+  const dialog = pendingCloseDialog.value;
+
+  if (!dialog) {
     return;
   }
 
-  const { tabId } = pendingCloseDialog.value;
   closePendingCloseDialog();
-  performCloseTab(tabId);
+  performCloseTabs(dialog.tabIds, dialog.keepTabId);
 }
 
 async function startEditing(tab: WorkspaceTabState) {
@@ -2543,6 +4065,8 @@ function openTabMenu(event: MouseEvent, tab: WorkspaceTabState) {
   event.preventDefault();
   creationMenu.value = null;
   closeAllTabsDialog();
+  closeQuickOpenDialog();
+  closeFindInFilesDialog();
   tabMenu.value = {
     tabId: tab.id,
     x: event.clientX,
@@ -2555,6 +4079,8 @@ function openCreationMenu(event?: MouseEvent) {
   tabMenu.value = null;
   commandMenuOpen.value = false;
   closeAllTabsDialog();
+  closeQuickOpenDialog();
+  closeFindInFilesDialog();
 
   const fallbackRect = creationButtonRef.value?.getBoundingClientRect();
   const fallbackX = fallbackRect ? Math.round(fallbackRect.left + fallbackRect.width / 2) : 24;
@@ -2580,6 +4106,8 @@ function toggleCommandMenu() {
   tabMenu.value = null;
   creationMenu.value = null;
   closeAllTabsDialog();
+  closeQuickOpenDialog();
+  closeFindInFilesDialog();
 }
 
 function closeCommandMenu() {
@@ -2611,6 +4139,14 @@ function handleDocumentPointerDown(event: PointerEvent) {
 }
 
 function handleDocumentKeydown(event: KeyboardEvent) {
+  if (handleFindInFilesDialogKeydown(event)) {
+    return;
+  }
+
+  if (handleQuickOpenDialogKeydown(event)) {
+    return;
+  }
+
   if (handleAllTabsDialogKeydown(event)) {
     return;
   }
@@ -2620,6 +4156,8 @@ function handleDocumentKeydown(event: KeyboardEvent) {
   }
 
   if (event.key === 'Escape') {
+    closeFindInFilesDialog();
+    closeQuickOpenDialog();
     closeAllTabsDialog();
     closePendingCloseDialog();
     closeTabMenu();
@@ -2740,6 +4278,189 @@ watch(
 );
 
 watch(
+  quickOpenSearchQuery,
+  (nextQuery) => {
+    setQuickOpenLastQuery(props.projectRoot, nextQuery);
+  },
+);
+
+watch(
+  () => props.projectRoot,
+  (nextProjectRoot, previousProjectRoot) => {
+    setQuickOpenLastQuery(previousProjectRoot, quickOpenSearchQuery.value);
+    scheduleQuickOpenFileListPrewarm(nextProjectRoot);
+
+    if (!quickOpenDialogOpen.value) {
+      return;
+    }
+
+    quickOpenSearchQuery.value = getQuickOpenLastQuery(nextProjectRoot);
+    quickOpenResults.value = [];
+    quickOpenTotalResultCount.value = 0;
+    quickOpenError.value = null;
+    isSearchingQuickOpen.value = false;
+    quickOpenSelectedPath.value = null;
+
+    if (nextProjectRoot) {
+      void ensureQuickOpenFileList(nextProjectRoot).catch((error) => {
+        if (quickOpenDialogOpen.value && props.projectRoot === nextProjectRoot) {
+          quickOpenError.value = error instanceof Error ? error.message : 'Failed to load repository files.';
+        }
+      });
+    }
+  },
+);
+
+watch(
+  [quickOpenDialogOpen, () => props.projectRoot, quickOpenSearchQuery],
+  ([isOpen, projectRoot, query]) => {
+    if (quickOpenSearchDebounceTimer !== null) {
+      window.clearTimeout(quickOpenSearchDebounceTimer);
+      quickOpenSearchDebounceTimer = null;
+    }
+
+    quickOpenSearchToken += 1;
+
+    if (!isOpen || !projectRoot) {
+      quickOpenResults.value = [];
+      quickOpenTotalResultCount.value = 0;
+      quickOpenError.value = null;
+      isSearchingQuickOpen.value = false;
+      quickOpenSelectedPath.value = null;
+      return;
+    }
+
+    const normalizedQuery = query.trim();
+
+    if (!normalizedQuery) {
+      quickOpenResults.value = [];
+      quickOpenTotalResultCount.value = 0;
+      quickOpenError.value = null;
+      isSearchingQuickOpen.value = false;
+      void ensureQuickOpenFileList(projectRoot).catch((error) => {
+        if (quickOpenDialogOpen.value && props.projectRoot === projectRoot) {
+          quickOpenError.value = error instanceof Error ? error.message : 'Failed to load repository files.';
+        }
+      });
+      return;
+    }
+
+    quickOpenResults.value = [];
+    quickOpenTotalResultCount.value = 0;
+    quickOpenError.value = null;
+    isSearchingQuickOpen.value = true;
+
+    quickOpenSearchDebounceTimer = window.setTimeout(() => {
+      void runQuickOpenSearch(normalizedQuery);
+    }, 120);
+  },
+  { immediate: true },
+);
+
+watch(
+  quickOpenResultEntries,
+  (nextResults) => {
+    if (!quickOpenDialogOpen.value) {
+      return;
+    }
+
+    const hasSelectedPath = nextResults.some((entry) => entry.path === quickOpenSelectedPath.value);
+
+    if (hasSelectedPath) {
+      scrollSelectedQuickOpenItemIntoView();
+      return;
+    }
+
+    quickOpenSelectedPath.value = nextResults[0]?.path ?? null;
+    scrollSelectedQuickOpenItemIntoView();
+  },
+  { deep: true },
+);
+
+watch(
+  () => props.projectRoot,
+  () => {
+    if (!findInFilesDialogOpen.value) {
+      return;
+    }
+
+    findInFilesResults.value = [];
+    findInFilesError.value = null;
+    isSearchingFindInFiles.value = false;
+    findInFilesSelectedMatchKey.value = null;
+  },
+);
+
+watch(
+  [findInFilesDialogOpen, () => props.projectRoot, findInFilesSearchQuery, findInFilesFileFilter, findInFilesIncludeUntracked],
+  ([isOpen, projectRoot, query]) => {
+    if (findInFilesSearchDebounceTimer !== null) {
+      window.clearTimeout(findInFilesSearchDebounceTimer);
+      findInFilesSearchDebounceTimer = null;
+    }
+
+    findInFilesSearchToken += 1;
+
+    if (!isOpen || !projectRoot) {
+      findInFilesResults.value = [];
+      findInFilesError.value = null;
+      isSearchingFindInFiles.value = false;
+      findInFilesSelectedMatchKey.value = null;
+      return;
+    }
+
+    const normalizedQuery = query.trim();
+
+    if (!normalizedQuery) {
+      findInFilesResults.value = [];
+      findInFilesError.value = null;
+      isSearchingFindInFiles.value = false;
+      findInFilesSelectedMatchKey.value = null;
+      return;
+    }
+
+    findInFilesResults.value = [];
+    findInFilesError.value = null;
+    isSearchingFindInFiles.value = true;
+    findInFilesSearchDebounceTimer = window.setTimeout(() => {
+      void runFindInFilesSearch(normalizedQuery);
+    }, 120);
+  },
+  { immediate: true },
+);
+
+watch(
+  findInFilesVisibleItems,
+  (nextResults) => {
+    if (!findInFilesDialogOpen.value) {
+      return;
+    }
+
+    const hasSelectedMatch = nextResults.some((match) => match.matchKey === findInFilesSelectedMatchKey.value);
+
+    if (hasSelectedMatch) {
+      scrollSelectedFindInFilesItemIntoView();
+      return;
+    }
+
+    findInFilesSelectedMatchKey.value = nextResults[0]?.matchKey ?? null;
+    scrollSelectedFindInFilesItemIntoView();
+  },
+  { deep: true },
+);
+
+watch(
+  findInFilesSelectedMatchKey,
+  (nextMatchKey) => {
+    if (!findInFilesDialogOpen.value) {
+      return;
+    }
+
+    void loadFindInFilesPreview(nextMatchKey);
+  },
+);
+
+watch(
   () => props.tabs,
   (nextTabs) => {
     tabs.value = cloneTabs(nextTabs);
@@ -2842,6 +4563,7 @@ onMounted(async () => {
   document.addEventListener('keydown', handleDocumentKeydown);
   startExternalFilePolling();
   void pollExternalFileChanges();
+  scheduleQuickOpenFileListPrewarm();
 
   await nextTick();
 });
@@ -2850,6 +4572,11 @@ onBeforeUnmount(() => {
   document.removeEventListener('pointerdown', handleDocumentPointerDown);
   document.removeEventListener('keydown', handleDocumentKeydown);
   stopExternalFilePolling();
+  cancelQuickOpenFileListPrewarm();
+  if (quickOpenSearchDebounceTimer !== null) {
+    window.clearTimeout(quickOpenSearchDebounceTimer);
+    quickOpenSearchDebounceTimer = null;
+  }
   clearTabDragState();
   emit('update:recent-activity', {
     workspaceId: props.workspaceId,
@@ -2877,11 +4604,14 @@ defineExpose({
   focusNextTab: () => selectAdjacentTab(1),
   executePresetBySlot,
   openAllTabsDialog,
+  openQuickOpenDialog,
+  openFindInFilesDialog,
   openCreationMenu: () => openCreationMenu(),
   openFile: () => openWorkspaceFile(),
   openNoteFilePath: (filePath: string) => openNoteFilePath(filePath),
   openWorkspaceFilePath: (filePath: string) => openWorkspaceFilePath(filePath),
   openNavigationTarget: (target: CodeNavigationTarget) => openCodeNavigationTarget(target),
+  revealActiveFileInAllFiles,
   splitEditorPane: (direction: 'left' | 'right' | 'up' | 'down') => splitEditorPane(direction),
 });
 </script>
@@ -2922,7 +4652,7 @@ defineExpose({
           />
 
           <input
-            v-if="editingTabId === tab.id"
+            v-if="editingTabId === tab.id && !allTabsDialogOpen"
             v-model="draftTitle"
             :ref="setEditingInput"
             class="terminal-panel__tab-input"
@@ -3059,6 +4789,7 @@ defineExpose({
           :class="{ 'terminal-panel__view--active': tab.id === activeTabId }"
           :session-key="buildWorkspaceTabRuntimeKey(props.workspaceId, tab.id)"
           :cwd="tab.cwd"
+          :project-root="props.projectRoot"
           :font-size="tab.fontSize"
           :appearance-theme="props.appearanceTheme"
           :appearance-theme-variant="props.appearanceThemeVariant"
@@ -3066,7 +4797,9 @@ defineExpose({
           :reconnect-token="reconnectTokens[tab.id] ?? 0"
           @activate="handleTerminalViewActivate(tab.id)"
           @activity="handleTabActivity(tab.id)"
+          @attention="handleTabAttention(tab.id)"
           @input="handleTabInput(tab.id, $event)"
+          @open-navigation-target="openCodeNavigationTarget($event)"
           @update:font-size="updateShellFontSize(tab.id, $event)"
         />
 
@@ -3090,6 +4823,7 @@ defineExpose({
           @focus-next-tab="selectAdjacentTab(1)"
           @open-file="openWorkspaceFile(tab.id)"
           @open-note-link="openNoteFilePath($event, tab.id)"
+          @reveal-in-all-files="revealWorkspaceFileInAllFiles(tab.filePath)"
           @reload-from-disk="reloadEditableTabFromDisk(tab.id)"
           @save-file="saveNoteFile(tab.id)"
           @save-file-as="saveNoteFileAs(tab.id)"
@@ -3119,6 +4853,7 @@ defineExpose({
           @focus-next-tab="selectAdjacentTab(1)"
           @open-file="openWorkspaceFile(tab.id)"
           @open-navigation-target="openCodeNavigationTarget($event)"
+          @reveal-in-all-files="revealWorkspaceFileInAllFiles(tab.filePath)"
           @reload-from-disk="reloadEditableTabFromDisk(tab.id)"
           @save-file="saveCodeFile(tab.id)"
           @save-file-as="saveCodeFileAs(tab.id)"
@@ -3217,6 +4952,7 @@ defineExpose({
             @focus-next-tab="selectAdjacentTab(1)"
             @open-file="openWorkspaceFile(entry.tab.id)"
             @open-navigation-target="openCodeNavigationTarget($event)"
+            @reveal-in-all-files="revealWorkspaceFileInAllFiles(entry.tab.filePath)"
             @reload-from-disk="reloadEditableTabFromDisk(entry.tab.id)"
             @save-file="saveCodeFile(entry.tab.id)"
             @save-file-as="saveCodeFileAs(entry.tab.id)"
@@ -3319,56 +5055,399 @@ defineExpose({
             role="listbox"
             aria-label="Open workspace tabs"
           >
-            <button
+            <div
               v-for="entry in allTabsResults"
               :key="entry.tab.id"
               :ref="(element) => setAllTabsItemRef(entry.tab.id, element)"
-              class="terminal-panel__switcher-item"
+              class="terminal-panel__switcher-item terminal-panel__switcher-item--tabs"
               :class="{
                 'terminal-panel__switcher-item--selected': entry.tab.id === allTabsSelectedTabId,
                 'terminal-panel__switcher-item--active': entry.tab.id === activeTabId,
               }"
-              type="button"
               role="option"
               :aria-selected="entry.tab.id === allTabsSelectedTabId"
               @mouseenter="selectAllTabsItem(entry.tab.id)"
-              @click="activateAllTabsItem(entry.tab.id)"
             >
-              <span
-                class="terminal-panel__switcher-dot"
-                :class="{
-                  'terminal-panel__switcher-dot--dirty': isEditableTabDirty(entry.tab),
-                  'terminal-panel__switcher-dot--attention': hasAttention(entry.tab.id),
-                  'terminal-panel__switcher-dot--active': entry.tab.id === activeTabId,
-                }"
-                aria-hidden="true"
-              />
+              <button
+                class="terminal-panel__switcher-item-main"
+                type="button"
+                :title="tabTitleTooltip(entry.tab)"
+                @click="activateAllTabsItem(entry.tab.id)"
+              >
+                <span
+                  class="terminal-panel__switcher-dot"
+                  :class="{
+                    'terminal-panel__switcher-dot--dirty': isEditableTabDirty(entry.tab),
+                    'terminal-panel__switcher-dot--attention': hasAttention(entry.tab.id),
+                    'terminal-panel__switcher-dot--active': entry.tab.id === activeTabId,
+                  }"
+                  aria-hidden="true"
+                />
 
-              <span class="terminal-panel__switcher-copy">
-                <span class="terminal-panel__switcher-row">
-                  <span class="terminal-panel__switcher-name">{{ entry.tab.title }}</span>
-                  <span class="terminal-panel__switcher-badges">
-                    <span class="terminal-panel__switcher-badge terminal-panel__switcher-badge--type">
-                      {{ entry.typeLabel }}
-                    </span>
-                    <span v-if="entry.paneCount > 1" class="terminal-panel__switcher-badge">
-                      {{ entry.paneCount }} panes
-                    </span>
-                    <span
-                      v-if="isEditableTabDirty(entry.tab)"
-                      class="terminal-panel__switcher-badge terminal-panel__switcher-badge--dirty"
-                    >
-                      Dirty
-                    </span>
+                <span class="terminal-panel__switcher-copy">
+                  <span class="terminal-panel__switcher-row">
+                    <span class="terminal-panel__switcher-name">{{ entry.tab.title }}</span>
+                  </span>
+                  <span v-if="entry.secondaryMeta" class="terminal-panel__switcher-path">{{ entry.secondaryMeta }}</span>
+                </span>
+              </button>
+
+              <div class="terminal-panel__switcher-item-actions">
+                <span class="terminal-panel__switcher-badges">
+                  <span class="terminal-panel__switcher-badge terminal-panel__switcher-badge--type">
+                    {{ entry.typeLabel }}
+                  </span>
+                  <span v-if="entry.paneCount > 1" class="terminal-panel__switcher-badge">
+                    {{ entry.paneCount }} panes
+                  </span>
+                  <span
+                    v-if="isEditableTabDirty(entry.tab)"
+                    class="terminal-panel__switcher-badge terminal-panel__switcher-badge--dirty"
+                  >
+                    Dirty
                   </span>
                 </span>
-                <span v-if="entry.secondaryMeta" class="terminal-panel__switcher-path">{{ entry.secondaryMeta }}</span>
-              </span>
-            </button>
+
+                <button
+                  v-if="sortedTabCount > 1"
+                  class="terminal-panel__switcher-item-close"
+                  type="button"
+                  :title="`Close ${entry.tab.title}`"
+                  :aria-label="`Close ${entry.tab.title}`"
+                  @click.stop="requestCloseTab(entry.tab.id)"
+                  @keydown.enter.stop
+                  @keydown.space.stop
+                >
+                  <svg viewBox="0 0 16 16" aria-hidden="true">
+                    <path d="M4 4l8 8" />
+                    <path d="M12 4 4 12" />
+                  </svg>
+                </button>
+              </div>
+            </div>
           </div>
 
           <div v-else class="terminal-panel__switcher-empty">
             No tabs match the current search.
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <div
+      v-if="quickOpenDialogOpen"
+      class="terminal-panel__switcher-backdrop"
+      @click.self="closeQuickOpenDialog"
+    >
+      <section
+        class="terminal-panel__switcher"
+        role="dialog"
+        aria-modal="true"
+        aria-label="Quick open file"
+        @click.stop
+      >
+        <header class="terminal-panel__switcher-header">
+          <div class="terminal-panel__switcher-heading">
+            <span class="terminal-panel__switcher-eyebrow">Workspace</span>
+            <h3 class="terminal-panel__switcher-title">Quick Open</h3>
+            <p class="terminal-panel__switcher-meta">
+              {{ quickOpenMeta }}
+            </p>
+          </div>
+
+          <button
+            class="terminal-panel__switcher-close"
+            type="button"
+            aria-label="Close quick open"
+            @click="closeQuickOpenDialog"
+          >
+            ×
+          </button>
+        </header>
+
+        <div class="terminal-panel__switcher-toolbar">
+          <label class="terminal-panel__switcher-search">
+            <span class="terminal-panel__switcher-search-label">File path</span>
+            <input
+              :ref="setQuickOpenSearchInput"
+              v-model="quickOpenSearchQuery"
+              class="terminal-panel__switcher-search-input"
+              type="text"
+              placeholder="Search files in current repo"
+              autocomplete="off"
+              spellcheck="false"
+              @keydown="handleQuickOpenDialogKeydown"
+            >
+          </label>
+        </div>
+
+        <div class="terminal-panel__switcher-body">
+          <section
+            v-if="!quickOpenSearchQuery.trim() && quickOpenRecentQueries.length"
+            class="terminal-panel__switcher-section"
+          >
+            <div class="terminal-panel__switcher-section-header">
+              <span class="terminal-panel__switcher-section-title">Recent searches</span>
+            </div>
+
+            <div class="terminal-panel__switcher-chip-row">
+              <button
+                v-for="query in quickOpenRecentQueries"
+                :key="query"
+                class="terminal-panel__switcher-chip"
+                type="button"
+                @click="applyQuickOpenRecentQuery(query)"
+              >
+                {{ query }}
+              </button>
+            </div>
+          </section>
+
+          <div
+            v-if="quickOpenResultEntries.length"
+            class="terminal-panel__switcher-section"
+          >
+            <div v-if="!quickOpenSearchQuery.trim()" class="terminal-panel__switcher-section-header">
+              <span class="terminal-panel__switcher-section-title">Recent files</span>
+            </div>
+
+            <div
+              class="terminal-panel__switcher-list"
+              role="listbox"
+              aria-label="Open repository files"
+            >
+              <button
+                v-for="entry in quickOpenResultEntries"
+                :key="entry.path"
+                :ref="(element) => setQuickOpenItemRef(entry.path, element)"
+                class="terminal-panel__switcher-item"
+                :class="{
+                  'terminal-panel__switcher-item--selected': entry.path === quickOpenSelectedPath,
+                  'terminal-panel__switcher-item--active': entry.isActive,
+                }"
+                type="button"
+                role="option"
+                :aria-selected="entry.path === quickOpenSelectedPath"
+                @mouseenter="selectQuickOpenItem(entry.path)"
+                @click="activateQuickOpenPath(entry.path)"
+              >
+                <span
+                  class="terminal-panel__switcher-dot"
+                  :class="{
+                    'terminal-panel__switcher-dot--active': entry.isActive,
+                    'terminal-panel__switcher-dot--dirty': entry.isOpen && !entry.isActive,
+                  }"
+                  aria-hidden="true"
+                />
+
+                <span class="terminal-panel__switcher-copy">
+                  <span class="terminal-panel__switcher-row">
+                    <span class="terminal-panel__switcher-name">
+                      <template v-for="(fragment, fragmentIndex) in entry.fileNameFragments" :key="`${entry.path}:name:${fragmentIndex}`">
+                        <mark v-if="fragment.highlighted" class="terminal-panel__switcher-highlight">{{ fragment.text }}</mark>
+                        <template v-else>{{ fragment.text }}</template>
+                      </template>
+                    </span>
+                    <span class="terminal-panel__switcher-badges">
+                      <span class="terminal-panel__switcher-badge terminal-panel__switcher-badge--type">
+                        {{ entry.tabType === 'note' ? 'Notes' : 'Code' }}
+                      </span>
+                      <span v-if="entry.openPaneCount > 0" class="terminal-panel__switcher-badge">
+                        {{ entry.openPaneCount > 1 ? `${entry.openPaneCount} tabs` : 'Open' }}
+                      </span>
+                      <span
+                        v-if="entry.isDirty"
+                        class="terminal-panel__switcher-badge terminal-panel__switcher-badge--warning"
+                      >
+                        Dirty
+                      </span>
+                      <span
+                        v-if="entry.isActive"
+                        class="terminal-panel__switcher-badge terminal-panel__switcher-badge--dirty"
+                      >
+                        Current
+                      </span>
+                    </span>
+                  </span>
+                  <span class="terminal-panel__switcher-path">
+                    <template v-for="(fragment, fragmentIndex) in entry.directoryFragments" :key="`${entry.path}:directory:${fragmentIndex}`">
+                      <mark v-if="fragment.highlighted" class="terminal-panel__switcher-highlight">{{ fragment.text }}</mark>
+                      <template v-else>{{ fragment.text }}</template>
+                    </template>
+                  </span>
+                </span>
+              </button>
+            </div>
+          </div>
+
+          <div
+            v-else-if="!quickOpenSearchQuery.trim() && quickOpenRecentQueries.length"
+            class="terminal-panel__switcher-empty terminal-panel__switcher-empty--compact"
+          >
+            {{ quickOpenEmptyState }}
+          </div>
+
+          <div v-else class="terminal-panel__switcher-empty">
+            {{ quickOpenEmptyState }}
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <div
+      v-if="findInFilesDialogOpen"
+      class="terminal-panel__switcher-backdrop"
+      @click.self="closeFindInFilesDialog"
+    >
+      <section
+        class="terminal-panel__switcher terminal-panel__switcher--find"
+        :style="findInFilesDialogStyle"
+        role="dialog"
+        aria-modal="true"
+        aria-label="Find in files"
+        @click.stop
+      >
+        <header class="terminal-panel__switcher-header">
+          <div class="terminal-panel__switcher-heading">
+            <span class="terminal-panel__switcher-eyebrow">Workspace</span>
+            <h3 class="terminal-panel__switcher-title">Find in Files</h3>
+          </div>
+
+          <button
+            class="terminal-panel__switcher-close"
+            type="button"
+            aria-label="Close find in files"
+            @click="closeFindInFilesDialog"
+          >
+            ×
+          </button>
+        </header>
+
+        <div class="terminal-panel__switcher-toolbar terminal-panel__switcher-toolbar--find">
+          <label class="terminal-panel__switcher-search">
+            <span class="terminal-panel__switcher-search-meta">{{ findInFilesMeta }}</span>
+            <input
+              :ref="setFindInFilesSearchInput"
+              v-model="findInFilesSearchQuery"
+              class="terminal-panel__switcher-search-input"
+              type="text"
+              aria-label="Search text in current repo"
+              placeholder="Search text in current repo"
+              autocomplete="off"
+              spellcheck="false"
+            >
+          </label>
+
+          <label class="terminal-panel__switcher-search terminal-panel__switcher-search--compact">
+            <input
+              v-model="findInFilesFileFilter"
+              class="terminal-panel__switcher-search-input"
+              type="text"
+              aria-label="Filter matching files"
+              placeholder="Filter files (*.php)"
+              autocomplete="off"
+              spellcheck="false"
+            >
+          </label>
+
+          <div class="terminal-panel__switcher-filter terminal-panel__switcher-filter--compact">
+            <button
+              class="terminal-panel__switcher-filter-button"
+              type="button"
+              :aria-pressed="findInFilesIncludeUntracked"
+              aria-label="Toggle untracked files in find in files"
+              @click="toggleFindInFilesIncludeUntracked"
+            >
+              <span>{{ findInFilesScopeLabel }}</span>
+            </button>
+          </div>
+        </div>
+
+        <div class="terminal-panel__switcher-body terminal-panel__switcher-body--find">
+          <div
+            v-if="findInFilesVisibleItems.length"
+            class="terminal-panel__switcher-section terminal-panel__switcher-section--scroll"
+          >
+            <div
+              class="terminal-panel__switcher-list"
+              role="listbox"
+              aria-label="Text search matches"
+            >
+              <button
+                v-for="match in findInFilesVisibleItems"
+                :key="match.matchKey"
+                :ref="(element) => setFindInFilesItemRef(match.matchKey, element)"
+                class="terminal-panel__switcher-item terminal-panel__find-result"
+                :class="{ 'terminal-panel__switcher-item--selected': match.matchKey === findInFilesSelectedMatchKey }"
+                type="button"
+                role="option"
+                :aria-selected="match.matchKey === findInFilesSelectedMatchKey"
+                @click="selectFindInFilesItem(match.matchKey)"
+                @dblclick="activateFindInFilesMatch(match.matchKey)"
+              >
+                <span
+                  class="terminal-panel__switcher-dot"
+                  :class="{ 'terminal-panel__switcher-dot--active': match.matchKey === findInFilesSelectedMatchKey }"
+                  aria-hidden="true"
+                />
+
+                <span class="terminal-panel__switcher-copy">
+                  <span class="terminal-panel__find-result-primary">
+                    <span class="terminal-panel__switcher-name">
+                      <template v-for="(fragment, fragmentIndex) in buildQuickOpenHighlightedFragments(match.text, findInFilesSearchQuery)" :key="`${match.matchKey}:text:${fragmentIndex}`">
+                        <mark v-if="fragment.highlighted" class="terminal-panel__switcher-highlight">{{ fragment.text }}</mark>
+                        <template v-else>{{ fragment.text }}</template>
+                      </template>
+                    </span>
+                  </span>
+                  <span class="terminal-panel__find-result-secondary">
+                    <span class="terminal-panel__find-result-path">{{ match.path }}:{{ match.line }}</span>
+                    <span v-if="match.fileMatchCount > 1" class="terminal-panel__switcher-badge terminal-panel__find-result-count">
+                      {{ match.fileMatchCount.toLocaleString() }} in file
+                    </span>
+                  </span>
+                </span>
+              </button>
+            </div>
+          </div>
+
+          <div v-else class="terminal-panel__switcher-empty">
+            {{ findInFilesEmptyState }}
+          </div>
+
+          <div class="terminal-panel__switcher-preview">
+            <div class="terminal-panel__switcher-section-header">
+              <span class="terminal-panel__switcher-section-title terminal-panel__switcher-section-title--normal">
+                Preview
+              </span>
+              <span class="terminal-panel__switcher-path">{{ findInFilesPreviewMeta }}</span>
+            </div>
+
+            <div
+              v-if="findInFilesPreviewLines.length"
+              class="terminal-panel__switcher-preview-editor"
+            >
+              <div class="terminal-panel__switcher-preview-code">
+                <div
+                  v-for="previewLine in findInFilesPreviewLines"
+                  :key="`${findInFilesPreviewPath}:${previewLine.lineNumber}`"
+                  class="terminal-panel__switcher-preview-code-line"
+                  :class="{ 'terminal-panel__switcher-preview-code-line--match': previewLine.isMatchLine }"
+                >
+                  <span class="terminal-panel__switcher-preview-line-number">{{ previewLine.lineNumber }}</span>
+                  <span class="terminal-panel__switcher-preview-line-text">
+                    <template v-for="(fragment, fragmentIndex) in buildQuickOpenHighlightedFragments(previewLine.text, findInFilesSearchQuery)" :key="`${findInFilesPreviewPath}:${previewLine.lineNumber}:${fragmentIndex}`">
+                      <mark v-if="fragment.highlighted" class="terminal-panel__switcher-highlight">{{ fragment.text }}</mark>
+                      <template v-else>{{ fragment.text || ' ' }}</template>
+                    </template>
+                  </span>
+                </div>
+              </div>
+            </div>
+
+            <div v-else class="terminal-panel__switcher-empty terminal-panel__switcher-empty--compact">
+              {{ findInFilesPreviewMeta }}
+            </div>
           </div>
         </div>
       </section>
@@ -3389,6 +5468,15 @@ defineExpose({
       </button>
 
       <button
+        v-if="isEditableTab(menuTab) && getEditableTabFilePath(menuTab)"
+        class="terminal-panel__menu-item"
+        type="button"
+        @click="revealWorkspaceTabInAllFiles(menuTab) && closeTabMenu()"
+      >
+        Reveal in All files
+      </button>
+
+      <button
         v-if="menuTab.type === 'shell'"
         class="terminal-panel__menu-item"
         type="button"
@@ -3405,6 +5493,15 @@ defineExpose({
       >
         Close tab
       </button>
+
+      <button
+        v-if="sortedTabCount > 1"
+        class="terminal-panel__menu-item terminal-panel__menu-item--danger"
+        type="button"
+        @click="requestCloseOtherTabs(menuTab.id)"
+      >
+        Close other tabs
+      </button>
     </div>
 
     <div
@@ -3420,36 +5517,26 @@ defineExpose({
         @click.stop
       >
         <span class="terminal-panel__dialog-eyebrow">
-          {{ pendingCloseDialog.kind === 'shell'
-            ? 'Shell activity'
-            : (pendingCloseDialog.kind === 'code' ? 'Unsaved file' : 'Unsaved note') }}
+          {{ pendingCloseDialogEyebrow }}
         </span>
         <h3 class="terminal-panel__dialog-title">
-          Close {{ pendingCloseDialog.title }}?
+          {{ pendingCloseDialogTitle }}
         </h3>
         <p class="terminal-panel__dialog-copy">
-          {{ pendingCloseDialog.kind === 'note'
-            ? (pendingCloseDialog.hasSavedFile
-              ? 'This note has unsaved changes. Save it before closing, save a copy under a new file name, or discard the changes.'
-              : 'This scratch note has unsaved changes. Save it before closing or discard the changes.')
-            : pendingCloseDialog.kind === 'code'
-              ? 'This file has unsaved changes. Save it before closing, save a copy under a new file name, or discard the changes.'
-              : (pendingCloseDialog.hasAttention
-                ? 'This shell tab still needs attention. Close it anyway?'
-                : 'This shell tab still shows recent activity. Close it anyway?') }}
+          {{ pendingCloseDialogCopy }}
         </p>
 
         <div class="terminal-panel__dialog-actions">
-          <template v-if="pendingCloseDialog.kind !== 'shell'">
+          <template v-if="pendingCloseDialogCanSave">
             <button
               class="terminal-panel__dialog-button terminal-panel__dialog-button--primary"
               type="button"
               @click="handlePendingCloseSave"
             >
-              Save
+              {{ pendingCloseDialogSaveLabel }}
             </button>
             <button
-              v-if="pendingCloseDialog.hasSavedFile"
+              v-if="pendingCloseDialogCanSaveAs"
               class="terminal-panel__dialog-button"
               type="button"
               @click="handlePendingCloseSaveAs"
@@ -3463,7 +5550,7 @@ defineExpose({
             type="button"
             @click="handlePendingCloseDiscard"
           >
-            {{ pendingCloseDialog.kind === 'shell' ? 'Close anyway' : 'Discard' }}
+            {{ pendingCloseDialogDiscardLabel }}
           </button>
           <button
             class="terminal-panel__dialog-button"
@@ -4168,7 +6255,7 @@ defineExpose({
 }
 
 .terminal-panel__switcher-backdrop {
-  position: absolute;
+  position: fixed;
   inset: 0;
   z-index: 18;
   display: grid;
@@ -4193,6 +6280,12 @@ defineExpose({
     var(--terminal-panel-menu-bg);
   color-scheme: dark;
   box-shadow: 0 24px 54px rgba(0, 0, 0, 0.42);
+}
+
+.terminal-panel__switcher--find {
+  width: min(860px, calc(100vw - 48px));
+  height: min(760px, calc(100vh - 48px));
+  max-height: min(760px, calc(100vh - 48px));
 }
 
 .terminal-panel[data-appearance-theme='bridgegit-light'] .terminal-panel__switcher,
@@ -4253,16 +6346,30 @@ defineExpose({
   align-items: end;
 }
 
+.terminal-panel__switcher-toolbar--find {
+  grid-template-columns: minmax(0, 1fr) minmax(200px, 240px) auto;
+}
+
 .terminal-panel__switcher-search,
 .terminal-panel__switcher-filter {
   display: grid;
   gap: 6px;
 }
 
+.terminal-panel__switcher-search--compact {
+  align-self: end;
+}
+
 .terminal-panel__switcher-search-label {
   color: var(--text-dim);
   font-size: 0.74rem;
   font-weight: 600;
+}
+
+.terminal-panel__switcher-search-meta {
+  color: var(--text-dim);
+  font-size: 0.76rem;
+  line-height: 1.35;
 }
 
 .terminal-panel__switcher-search-input,
@@ -4282,6 +6389,10 @@ defineExpose({
   position: relative;
   width: 156px;
   flex: 0 0 auto;
+}
+
+.terminal-panel__switcher-filter--compact {
+  width: auto;
 }
 
 .terminal-panel__switcher-filter-button {
@@ -4321,11 +6432,81 @@ defineExpose({
 }
 
 .terminal-panel__switcher-body {
+  display: grid;
+  gap: 12px;
   min-height: 0;
+}
+
+.terminal-panel__switcher-body--find {
+  grid-template-rows: minmax(0, 1fr) auto;
+}
+
+.terminal-panel__switcher-section {
+  display: grid;
+  gap: 8px;
+  min-height: 0;
+}
+
+.terminal-panel__switcher-section--scroll {
+  overflow: auto;
+  padding-right: 2px;
+}
+
+.terminal-panel__switcher-section--scroll .terminal-panel__switcher-list {
+  max-height: none;
+  overflow: visible;
+}
+
+.terminal-panel__switcher-section-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.terminal-panel__switcher-section-title {
+  color: var(--text-dim);
+  font-size: 0.74rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.terminal-panel__switcher-section-title--normal {
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.terminal-panel__switcher-chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.terminal-panel__switcher-chip {
+  display: inline-flex;
+  align-items: center;
+  max-width: 100%;
+  padding: 0.44rem 0.68rem;
+  border: 1px solid rgba(108, 124, 148, 0.16);
+  border-radius: 999px;
+  background: rgba(17, 23, 31, 0.72);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 0.76rem;
+  line-height: 1.2;
+}
+
+.terminal-panel__switcher-chip:hover,
+.terminal-panel__switcher-chip:focus {
+  outline: none;
+  border-color: rgba(110, 197, 255, 0.3);
+  background: rgba(24, 33, 43, 0.92);
 }
 
 .terminal-panel__switcher-list {
   display: grid;
+  align-content: start;
   gap: 8px;
   max-height: 100%;
   min-height: 0;
@@ -4347,13 +6528,82 @@ defineExpose({
 }
 
 .terminal-panel__switcher-item:hover,
-.terminal-panel__switcher-item--selected {
+.terminal-panel__switcher-item--selected,
+.terminal-panel__switcher-item:focus-within {
   border-color: rgba(110, 197, 255, 0.28);
   background: rgba(24, 33, 43, 0.92);
 }
 
 .terminal-panel__switcher-item--active {
   box-shadow: inset 0 0 0 1px rgba(110, 197, 255, 0.12);
+}
+
+.terminal-panel__switcher-item--tabs {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 8px;
+}
+
+.terminal-panel__switcher-item-main {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: 12px;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  font: inherit;
+}
+
+.terminal-panel__switcher-item-main:focus-visible,
+.terminal-panel__switcher-item-close:focus-visible {
+  outline: none;
+}
+
+.terminal-panel__switcher-item-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  align-self: start;
+  margin-top: 0.02rem;
+}
+
+.terminal-panel__switcher-item-actions .terminal-panel__switcher-badges {
+  margin-left: 0;
+  justify-content: flex-end;
+}
+
+.terminal-panel__switcher-item-close {
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 1px solid rgba(108, 124, 148, 0.14);
+  border-radius: 10px;
+  background: rgba(8, 12, 17, 0.38);
+  color: var(--text-dim);
+  cursor: pointer;
+  transition: border-color 120ms ease, background 120ms ease, color 120ms ease;
+}
+
+.terminal-panel__switcher-item-close:hover,
+.terminal-panel__switcher-item-close:focus-visible {
+  border-color: rgba(110, 197, 255, 0.26);
+  background: rgba(34, 46, 59, 0.92);
+  color: var(--text-primary);
+}
+
+.terminal-panel__switcher-item-close svg {
+  width: 14px;
+  height: 14px;
+  margin: 6px;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.7;
 }
 
 .terminal-panel__switcher-dot {
@@ -4384,11 +6634,65 @@ defineExpose({
   min-width: 0;
 }
 
+.terminal-panel__find-result {
+  align-items: center;
+  gap: 10px;
+  padding: 0.52rem 0.68rem;
+  border-radius: 10px;
+}
+
+.terminal-panel__switcher--find .terminal-panel__switcher-list {
+  gap: 6px;
+}
+
+.terminal-panel__find-result .terminal-panel__switcher-copy {
+  gap: 2px;
+}
+
+.terminal-panel__find-result-primary,
+.terminal-panel__find-result-secondary {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.terminal-panel__find-result-secondary {
+  justify-content: space-between;
+}
+
+.terminal-panel__find-result .terminal-panel__switcher-name {
+  font-family: var(--font-mono);
+  font-size: calc(var(--terminal-panel-find-result-font-size-px, 14) * 1px);
+  font-weight: 500;
+  line-height: 1.35;
+}
+
+.terminal-panel__find-result-path {
+  min-width: 0;
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: 0.73rem;
+  line-height: 1.45;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.terminal-panel__find-result-count {
+  margin-left: auto;
+  flex: 0 0 auto;
+}
+
 .terminal-panel__switcher-row {
   display: flex;
   align-items: center;
   gap: 10px;
   min-width: 0;
+}
+
+.terminal-panel__switcher-row--meta {
+  align-items: flex-start;
 }
 
 .terminal-panel__switcher-name {
@@ -4397,6 +6701,13 @@ defineExpose({
   text-overflow: ellipsis;
   white-space: nowrap;
   overflow: hidden;
+}
+
+.terminal-panel__switcher-highlight {
+  padding: 0;
+  border-radius: 3px;
+  background: rgba(110, 197, 255, 0.22);
+  color: inherit;
 }
 
 .terminal-panel__switcher-badges {
@@ -4434,12 +6745,69 @@ defineExpose({
   color: #ffcd93;
 }
 
+.terminal-panel__switcher-badge--warning {
+  border-color: rgba(255, 176, 102, 0.24);
+  background: rgba(255, 176, 102, 0.12);
+  color: #ffcd93;
+}
+
 .terminal-panel__switcher-path {
   color: var(--text-dim);
   font-family: var(--font-mono);
   font-size: 0.73rem;
   line-height: 1.45;
   word-break: break-word;
+}
+
+.terminal-panel__switcher-preview {
+  display: grid;
+  gap: 8px;
+}
+
+.terminal-panel__switcher-preview-editor {
+  min-height: 196px;
+  max-height: 196px;
+  height: 196px;
+  border: 1px solid rgba(108, 124, 148, 0.14);
+  border-radius: 14px;
+  background: rgba(11, 15, 21, 0.9);
+  overflow: auto;
+}
+
+.terminal-panel__switcher-preview-code {
+  min-width: max-content;
+  padding: 10px 0;
+}
+
+.terminal-panel__switcher-preview-code-line {
+  display: grid;
+  grid-template-columns: 52px minmax(0, 1fr);
+  align-items: start;
+  gap: 12px;
+  min-height: 28px;
+  padding: 2px 14px;
+}
+
+.terminal-panel__switcher-preview-code-line--match {
+  background: rgba(69, 151, 250, 0.12);
+}
+
+.terminal-panel__switcher-preview-line-number {
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  line-height: 1.9;
+  text-align: right;
+  user-select: none;
+}
+
+.terminal-panel__switcher-preview-line-text {
+  min-width: 0;
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 0.76rem;
+  line-height: 1.9;
+  white-space: pre;
 }
 
 .terminal-panel__switcher-empty {
@@ -4451,6 +6819,11 @@ defineExpose({
   border-radius: 16px;
   color: var(--text-dim);
   text-align: center;
+}
+
+.terminal-panel__switcher-empty--compact {
+  min-height: 196px;
+  padding: 14px;
 }
 
 .terminal-panel__view {
@@ -4481,7 +6854,22 @@ defineExpose({
     max-height: 100%;
   }
 
+  .terminal-panel__switcher--find {
+    height: calc(100vh - 48px);
+    max-height: calc(100vh - 48px);
+  }
+
   .terminal-panel__switcher-row {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .terminal-panel__switcher-toolbar--find {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .terminal-panel__find-result-secondary {
     align-items: flex-start;
     flex-direction: column;
     gap: 6px;

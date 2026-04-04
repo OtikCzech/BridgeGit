@@ -2,13 +2,13 @@
 
 This note is the default place for release updates and small product messages inside BridgeGit.
 
-## New in 0.4.0
+## New in 0.5.0
 
-- syntax-highlighted diffs with direct open-in-editor flow
-- split code panes up to a `2x2` grid for side-by-side editing
-- `All Tabs` switcher with search, type filter and `Ctrl+E`
-- pane toolbar actions for split and close without relying only on shortcuts
-- quieter Linux launch logs when starting the app locally
+- rebuilt repository history browser with stronger preview flow
+- `Quick Open` and `Find in files` for faster workspace navigation
+- better `All files` browsing with reveal-active-file, type-to-select and persistent tree state
+- safer shell tab close behavior with clearer attention cues
+- improved session restore and Windows packaging polish
 
 ## Quick Start
 

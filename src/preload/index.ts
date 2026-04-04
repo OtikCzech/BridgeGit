@@ -5,11 +5,15 @@ import type {
   CreateBranchResult,
   DeleteBranchResult,
   GitChange,
+  GitCommitDetail,
   GitDiffMode,
+  GitLogRequest,
+  GitLogScope,
   GitLogResult,
   GitStatusRequestOptions,
   GitStatusSummary,
   GitTextSearchMatch,
+  GitTextSearchOptions,
   GitWorktreeSummary,
   MergeWorktreeIntoPrimaryBranchResult,
   NoteFileHandle,
@@ -72,18 +76,24 @@ const bridgegitApi = {
       ipcRenderer.invoke('git:branches', repoPath) as Promise<BranchSummary>,
     listDirectory: (repoPath: string, relativePath?: string) =>
       ipcRenderer.invoke('git:listDirectory', repoPath, relativePath) as Promise<RepoDirectoryEntry[]>,
+    listFiles: (repoPath: string) =>
+      ipcRenderer.invoke('git:listFiles', repoPath) as Promise<string[]>,
     searchFiles: (repoPath: string, query: string, limit?: number) =>
       ipcRenderer.invoke('git:searchFiles', repoPath, query, limit) as Promise<string[]>,
-    searchText: (repoPath: string, query: string, limit?: number, wholeWord?: boolean) =>
-      ipcRenderer.invoke('git:searchText', repoPath, query, limit, wholeWord) as Promise<GitTextSearchMatch[]>,
+    searchText: (repoPath: string, query: string, limit?: number, options?: GitTextSearchOptions) =>
+      ipcRenderer.invoke('git:searchText', repoPath, query, limit, options) as Promise<GitTextSearchMatch[]>,
     worktrees: (repoPath: string) =>
       ipcRenderer.invoke('git:worktrees', repoPath) as Promise<GitWorktreeSummary[]>,
     diff: (repoPath: string, filePath?: string, mode?: GitDiffMode) =>
       ipcRenderer.invoke('git:diff', repoPath, filePath, mode) as Promise<string>,
-    commitDiff: (repoPath: string, commitHash: string, parentHash?: string | null) =>
-      ipcRenderer.invoke('git:commitDiff', repoPath, commitHash, parentHash) as Promise<string>,
-    log: (repoPath: string, limit?: number) =>
-      ipcRenderer.invoke('git:log', repoPath, limit) as Promise<GitLogResult>,
+    commitDiff: (repoPath: string, commitHash: string, parentHash?: string | null, filePath?: string | null) =>
+      ipcRenderer.invoke('git:commitDiff', repoPath, commitHash, parentHash, filePath) as Promise<string>,
+    log: (repoPath: string, request?: GitLogRequest) =>
+      ipcRenderer.invoke('git:log', repoPath, request) as Promise<GitLogResult>,
+    commitDetail: (repoPath: string, commitHash: string) =>
+      ipcRenderer.invoke('git:commitDetail', repoPath, commitHash) as Promise<GitCommitDetail>,
+    updateCommitMessage: (repoPath: string, commitHash: string, message: string) =>
+      ipcRenderer.invoke('git:updateCommitMessage', repoPath, commitHash, message) as Promise<GitCommitDetail>,
     stage: (repoPath: string, files: string[]) =>
       ipcRenderer.invoke('git:stage', repoPath, files) as Promise<GitStatusSummary>,
     unstage: (repoPath: string, files: string[]) =>

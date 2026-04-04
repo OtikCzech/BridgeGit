@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.5.0 - 2026-04-04
+
+Workspace navigation and history release focused on moving through larger repos faster while keeping shell workflows smoother.
+
+- Rebuilt repository history browser with stronger commit browsing and preview flow
+- Workspace `Quick Open` and `Find in files` workflows for faster file and text navigation
+- `All files` tree upgrades including reveal-active-file, type-to-select and persistent tree state
+- Better shell tab handling with safer close actions, missing file-link toasts and clearer attention indicators
+- Session and Windows polish, including terminal cwd restore per workspace and preserved taskbar pinning on upgrade
+
 ## v0.4.0 - 2026-03-27
 
 Workspace ergonomics release focused on reading diffs faster and managing larger editing sessions with less friction.

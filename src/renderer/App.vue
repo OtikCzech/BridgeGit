@@ -31,6 +31,7 @@ import {
   type GitDiffMode,
   type GitChange,
   type GitLogEntry,
+  type GitLogScope,
   type GitStatusSummary,
   type GitWorktreeSummary,
   type PanelLayout,
@@ -82,11 +83,14 @@ const terminalPanelRef = ref<{
   focusNextTab: () => void;
   executePresetBySlot: (slot: number) => Promise<boolean>;
   openAllTabsDialog: () => void;
+  openQuickOpenDialog: () => void;
+  openFindInFilesDialog: () => void;
   openCreationMenu: () => void;
   openFile: () => Promise<unknown>;
   openNoteFilePath: (filePath: string) => Promise<unknown>;
   openWorkspaceFilePath: (filePath: string) => Promise<unknown>;
   openNavigationTarget: (target: CodeNavigationTarget) => Promise<unknown>;
+  revealActiveFileInAllFiles: () => boolean;
   splitEditorPane: (direction: 'left' | 'right' | 'up' | 'down') => boolean;
 } | null>(null);
 const sidebarWidth = ref(DEFAULT_PANEL_LAYOUT.sidebarWidth);
@@ -153,6 +157,8 @@ const isSwitchingWorkspaceContext = ref(false);
 const isCheckingWorktrees = ref(false);
 const repoToolbarBusyAction = ref<'pull' | 'push' | 'refresh' | null>(null);
 const repoOperationStatus = ref<string | null>(null);
+const revealInAllFilesPath = ref<string | null>(null);
+const revealInAllFilesToken = ref(0);
 
 const runtimeInfo = window.bridgegit ?? {
   platform: 'unknown',
@@ -169,23 +175,43 @@ const {
   status,
   branches,
   log,
+  historyScope,
+  historyQuery,
+  hasMoreHistoryCommits,
+  selectedHistoryCommitHash,
+  commitDetail,
   selectedPath,
   selectedDiffMode,
   selectedCommit,
+  selectedCommitDiffPath,
+  historyPreviewCommitHash,
+  historyPreviewDiffPath,
   diff,
   commitDiff,
+  historyPreviewDiff,
   isLoading,
   isLoadingLog,
+  isUpdatingCommitMessage,
+  isLoadingCommitDetail,
   isLoadingCommitDiff,
+  isLoadingHistoryPreviewDiff,
+  isLoadingMoreHistoryCommits,
   error,
   errorDetail,
+  commitDetailError,
   commitDiffError,
+  historyPreviewDiffError,
   refresh: refreshRepoStatus,
   loadLog,
+  loadMoreLog,
+  selectHistoryCommit,
+  updateCommitMessage,
   setRepoPath,
   ensureFullStatus,
   selectFile,
   openCommitDiff,
+  previewHistoryCommitDiff,
+  clearHistoryPreviewDiffState,
   stageFiles,
   unstageFiles,
   discardFile,
@@ -828,7 +854,7 @@ const diffViewerMode = computed(() => (
 ));
 const diffViewerTitle = computed(() => (
   isCommitDiffMode.value
-    ? selectedCommit.value?.message ?? 'Commit diff'
+    ? selectedCommitDiffPath.value ?? selectedCommit.value?.message ?? 'Commit diff'
     : selectedPath.value ?? 'No file selected'
 ));
 const diffViewerTitleMeta = computed(() => {
@@ -861,11 +887,23 @@ const infoMessage = computed(() => (
   ?? (selectedCommit.value ? selectedCommit.value.shortHash : selectedPath.value)
   ?? 'Ready'
 ));
-const terminalCwd = computed(() => (
-  repoPath.value
-  ?? session.value.terminalCwd
-  ?? (runtimeInfo.platform === 'win32' ? 'C:\\' : '/')
-));
+
+function resolveWorkspaceDefaultTerminalCwd(
+  nextWorkspaceId: string | null | undefined = activeWorkspaceId.value,
+  fallbackRepoPath: string | null = repoPath.value,
+) {
+  const workspaceDescriptor = getWorkspaceDescriptorById(nextWorkspaceId ?? GLOBAL_WORKSPACE_ID);
+
+  if (workspaceDescriptor?.kind === 'project' && workspaceDescriptor.repoPath) {
+    return workspaceDescriptor.repoPath;
+  }
+
+  return session.value.terminalCwd
+    ?? fallbackRepoPath
+    ?? (runtimeInfo.platform === 'win32' ? 'C:\\' : '/');
+}
+
+const terminalCwd = computed(() => resolveWorkspaceDefaultTerminalCwd());
 const diffPathQueue = computed(() => buildDiffPathQueue(status.value));
 const currentDiffIndex = computed(() => {
   if (!selectedPath.value) {
@@ -1040,6 +1078,7 @@ function buildDefaultWorkspaceRepoPanelState(): WorkspaceRepoPanelState {
       viewMode: 'list',
       showAll: false,
       collapsedSections: buildDefaultRepoPanelSectionState(),
+      expandedDirectories: [],
     },
   };
 }
@@ -1196,17 +1235,19 @@ function buildSessionSavePayload(
   } = {},
 ) {
   const hasExplicitLastRepoPath = Object.prototype.hasOwnProperty.call(options, 'lastRepoPath');
+  const resolvedLastRepoPath = resolvePersistedLastRepoPath(
+    hasExplicitLastRepoPath ? options.lastRepoPath ?? null : repoPath.value,
+  );
+  const resolvedActiveWorkspaceId = options.activeWorkspaceId ?? activeWorkspaceId.value;
 
   return {
-    lastRepoPath: resolvePersistedLastRepoPath(
-      hasExplicitLastRepoPath ? options.lastRepoPath ?? null : repoPath.value,
-    ),
-    activeWorkspaceId: options.activeWorkspaceId ?? activeWorkspaceId.value,
+    lastRepoPath: resolvedLastRepoPath,
+    activeWorkspaceId: resolvedActiveWorkspaceId,
     recentRepos: recentRepos.value,
     workspaceDescriptors: workspaceDescriptors.value,
     workspaceOrder: workspaceOrder.value,
     repoPanelFontSize: repoPanelFontSize.value,
-    terminalCwd: terminalCwd.value,
+    terminalCwd: resolveWorkspaceDefaultTerminalCwd(resolvedActiveWorkspaceId, resolvedLastRepoPath),
     projectTitle: '',
     projectTitleMode: 'auto' as const,
     projectTitlesByContext: projectTitlesByContext.value,
@@ -1284,6 +1325,27 @@ function shouldLoadDetailedGitStatus(repoPanelState: WorkspaceRepoPanelState): b
   return repoPanelState.workspaceDetailExpanded
     && repoPanelState.files.expanded
     && Object.values(repoPanelState.files.collapsedSections).some((isCollapsed) => !isCollapsed);
+}
+
+async function restoreCommitHistoryState(
+  repoPanelState: WorkspaceRepoPanelState,
+  options: { isGitRepository: boolean },
+) {
+  if (!repoPanelState.historyOpen) {
+    return;
+  }
+
+  if (!repoPath.value || !options.isGitRepository) {
+    isCommitHistoryOpen.value = false;
+    await updateCurrentWorkspaceRepoPanelState({
+      ...repoPanelState,
+      historyOpen: false,
+    });
+    return;
+  }
+
+  await ensureFullStatus();
+  await loadLog();
 }
 
 async function updateCurrentWorkspaceRepoPanelState(nextRepoPanelState: WorkspaceRepoPanelState) {
@@ -2017,6 +2079,10 @@ async function activateWorkspace(nextWorkspaceId: string | null) {
     if (nextRepoPath && nextRepoIsGitRepository && shouldLoadDetailedGitStatus(nextRepoPanelStateForActivation)) {
       void ensureFullStatus();
     }
+
+    await restoreCommitHistoryState(nextRepoPanelStateForActivation, {
+      isGitRepository: nextRepoIsGitRepository,
+    });
   } finally {
     isSwitchingWorkspaceContext.value = false;
   }
@@ -2109,6 +2175,7 @@ async function handleRemoveWorkspace(workspaceId: string) {
   const nextActiveWorkspaceId = nextWorkspaceOrder[currentWorkspaceIndex] ?? nextWorkspaceOrder[currentWorkspaceIndex - 1] ?? GLOBAL_WORKSPACE_ID;
   const nextActiveWorkspaceDescriptor = nextWorkspaceDescriptors[nextActiveWorkspaceId] ?? null;
   const nextRepoPath = nextActiveWorkspaceDescriptor?.kind === 'project' ? nextActiveWorkspaceDescriptor.repoPath : null;
+  const nextRepoIsGitRepository = nextRepoPath ? await isGitRepositoryPath(nextRepoPath) : false;
 
   isSwitchingWorkspaceContext.value = true;
 
@@ -2143,7 +2210,11 @@ async function handleRemoveWorkspace(workspaceId: string) {
     workspaceRepoPanelStates.value = cloneWorkspaceRepoPanelStates(savedSession.workspaceRepoPanelStates);
     projectTitlesByContext.value = cloneProjectTitlesByContext(savedSession.projectTitlesByContext);
     await setRepoPath(nextRepoPath, {
-      loadMode: (nextRepoPath && await isGitRepositoryPath(nextRepoPath)) ? 'branches' : 'none',
+      loadMode: nextRepoIsGitRepository ? 'branches' : 'none',
+    });
+
+    await restoreCommitHistoryState(getWorkspaceRepoPanelStateValue(nextActiveWorkspaceId), {
+      isGitRepository: nextRepoIsGitRepository,
     });
 
     if (nextActiveWorkspaceId !== GLOBAL_WORKSPACE_ID && nextRepoPath) {
@@ -2449,6 +2520,45 @@ async function handleOpenCommitDiff(commit: GitLogEntry) {
   await openCommitDiff(commit);
 }
 
+async function handlePreviewCommitFileDiff(payload: { commit: GitLogEntry; filePath: string }) {
+  await previewHistoryCommitDiff(payload.commit, payload.filePath);
+}
+
+async function handleOpenHistoryPreviewDiff(payload: { commit: GitLogEntry; filePath: string }) {
+  isCommitHistoryOpen.value = false;
+  void updateCurrentWorkspaceRepoPanelState({
+    ...currentWorkspaceRepoPanelStateValue(),
+    historyOpen: false,
+  });
+
+  if (diffCollapsed.value) {
+    diffCollapsed.value = false;
+    scheduleSessionSave();
+  }
+
+  await openCommitDiff(payload.commit, payload.filePath);
+}
+
+async function handleSelectHistoryCommit(commitHash: string) {
+  await selectHistoryCommit(commitHash);
+}
+
+async function handleSelectHistoryScope(scope: GitLogScope) {
+  await loadLog({ scope });
+}
+
+async function handleHistorySearchQueryChange(query: string) {
+  await loadLog({ query });
+}
+
+async function handleLoadMoreHistoryCommits() {
+  await loadMoreLog();
+}
+
+async function handleUpdateHistoryCommitMessage(payload: { commitHash: string; message: string }) {
+  await updateCommitMessage(payload.commitHash, payload.message);
+}
+
 function handleGlobalKeydown(event: KeyboardEvent) {
   if (event.key === 'Escape') {
     if (isCommitHistoryOpen.value) {
@@ -2474,7 +2584,7 @@ function handleGlobalKeydown(event: KeyboardEvent) {
     return;
   }
 
-  if (matchesShortcut(event, SHORTCUTS.historySearch) && repoPath.value) {
+  if (matchesShortcut(event, SHORTCUTS.historySearch) && repoPath.value && isCommitHistoryOpen.value) {
     event.preventDefault();
     void focusCommitHistorySearch();
     return;
@@ -2519,6 +2629,48 @@ function handleGlobalKeydown(event: KeyboardEvent) {
     event.preventDefault();
     terminalPanelRef.value?.openAllTabsDialog();
     return;
+  }
+
+  if (
+    matchesShortcut(event, SHORTCUTS.workspaceQuickOpen)
+    && sessionReady.value
+    && !isSettingsOpen.value
+    && !isCommitHistoryOpen.value
+  ) {
+    event.preventDefault();
+    terminalPanelRef.value?.openQuickOpenDialog();
+    return;
+  }
+
+  if (
+    matchesShortcut(event, SHORTCUTS.workspaceFindInFiles)
+    && sessionReady.value
+    && !isSettingsOpen.value
+    && !isCommitHistoryOpen.value
+  ) {
+    event.preventDefault();
+
+    if (terminalCollapsed.value) {
+      terminalCollapsed.value = false;
+      scheduleSessionSave();
+    }
+
+    terminalPanelRef.value?.openFindInFilesDialog();
+    return;
+  }
+
+  if (
+    matchesShortcut(event, SHORTCUTS.workspaceRevealInAllFiles)
+    && sessionReady.value
+    && !isSettingsOpen.value
+    && !isCommitHistoryOpen.value
+  ) {
+    const handled = terminalPanelRef.value?.revealActiveFileInAllFiles();
+
+    if (handled) {
+      event.preventDefault();
+      return;
+    }
   }
 
   if (
@@ -2574,6 +2726,12 @@ function handleGlobalKeydown(event: KeyboardEvent) {
     }
   }
 
+  if (matchesShortcut(event, SHORTCUTS.terminalCloseTab) && sessionReady.value) {
+    event.preventDefault();
+    terminalPanelRef.value?.closeActiveTab();
+    return;
+  }
+
   if (isEditableTarget(event.target) || isSettingsOpen.value || isCommitHistoryOpen.value) {
     return;
   }
@@ -2600,12 +2758,6 @@ function handleGlobalKeydown(event: KeyboardEvent) {
       void terminalPanelRef.value?.executePresetBySlot(slot);
       return;
     }
-  }
-
-  if (matchesShortcut(event, SHORTCUTS.terminalCloseTab) && sessionReady.value) {
-    event.preventDefault();
-    terminalPanelRef.value?.closeActiveTab();
-    return;
   }
 
   if (isCommitDiffMode.value || diffCollapsed.value) {
@@ -2641,6 +2793,44 @@ function resolveRepoFilePath(repoRoot: string, relativePath: string) {
   return `${repoRoot}${separator}${normalizedRelativePath}`;
 }
 
+function normalizeComparableFilePath(pathValue: string) {
+  return pathValue.replace(/\\/g, '/').replace(/\/+$/, '');
+}
+
+function resolveRelativeRepoFilePath(filePath: string) {
+  if (!repoPath.value) {
+    return null;
+  }
+
+  const normalizedRepoRoot = normalizeComparableFilePath(repoPath.value);
+  const normalizedFilePath = normalizeComparableFilePath(filePath);
+  const repoPrefix = `${normalizedRepoRoot}/`;
+
+  if (!normalizedFilePath.startsWith(repoPrefix)) {
+    return null;
+  }
+
+  return normalizedFilePath.slice(repoPrefix.length);
+}
+
+function requestRevealInAllFiles(filePath: string) {
+  const relativePath = resolveRelativeRepoFilePath(filePath);
+
+  if (!relativePath) {
+    return false;
+  }
+
+  revealInAllFilesPath.value = relativePath;
+  revealInAllFilesToken.value += 1;
+
+  if (sidebarCollapsed.value) {
+    sidebarCollapsed.value = false;
+    scheduleSessionSave();
+  }
+
+  return true;
+}
+
 async function handleOpenWorkspaceFile(relativePath: string) {
   if (!repoPath.value || !sessionReady.value) {
     return;
@@ -2655,8 +2845,21 @@ async function handleOpenWorkspaceFile(relativePath: string) {
   await terminalPanelRef.value?.openWorkspaceFilePath(filePath);
 }
 
+function handleRevealInAllFiles(filePath: string) {
+  requestRevealInAllFiles(filePath);
+}
+
+watch(
+  () => repoPath.value,
+  () => {
+    revealInAllFilesPath.value = null;
+  },
+);
+
 async function handleOpenCurrentDiffInWorkspace(targetLine?: number) {
-  if (!selectedPath.value || !repoPath.value || !sessionReady.value) {
+  const notesApi = window.bridgegit?.notes;
+
+  if (!selectedPath.value || !repoPath.value || !sessionReady.value || !notesApi) {
     return;
   }
 
@@ -2666,16 +2869,70 @@ async function handleOpenCurrentDiffInWorkspace(targetLine?: number) {
   }
 
   const filePath = resolveRepoFilePath(repoPath.value, selectedPath.value);
+  const inspectedFile = await notesApi.inspectFile(filePath);
+
+  if (!inspectedFile) {
+    showProjectTitleSavedToast(`File not found in current workspace: ${selectedPath.value}`);
+    return;
+  }
 
   if (targetLine) {
     await terminalPanelRef.value?.openNavigationTarget({
-      filePath,
+      filePath: inspectedFile.path,
       line: targetLine,
     });
     return;
   }
 
-  await terminalPanelRef.value?.openWorkspaceFilePath(filePath);
+  await terminalPanelRef.value?.openWorkspaceFilePath(inspectedFile.path);
+}
+
+async function openDiffTargetInWorkspace(target: { filePath: string; line?: number }) {
+  const notesApi = window.bridgegit?.notes;
+
+  if (!repoPath.value || !sessionReady.value || !notesApi) {
+    return;
+  }
+
+  if (terminalCollapsed.value) {
+    terminalCollapsed.value = false;
+    scheduleSessionSave();
+  }
+
+  const isAbsolutePath = /^[A-Za-z]:[\\/]/.test(target.filePath) || target.filePath.startsWith('/');
+  const filePath = isAbsolutePath
+    ? target.filePath
+    : resolveRepoFilePath(repoPath.value, target.filePath);
+  const inspectedFile = await notesApi.inspectFile(filePath);
+
+  if (!inspectedFile) {
+    showProjectTitleSavedToast(`File not found in current workspace: ${target.filePath}`);
+    return;
+  }
+
+  if (target.line) {
+    await terminalPanelRef.value?.openNavigationTarget({
+      filePath: inspectedFile.path,
+      line: target.line,
+    });
+    return;
+  }
+
+  await terminalPanelRef.value?.openWorkspaceFilePath(inspectedFile.path);
+}
+
+async function handleOpenDiffTargetInWorkspace(target: { filePath: string; line?: number }) {
+  await openDiffTargetInWorkspace(target);
+}
+
+async function handleOpenHistoryPreviewTarget(target: { filePath: string; line?: number }) {
+  isCommitHistoryOpen.value = false;
+  void updateCurrentWorkspaceRepoPanelState({
+    ...currentWorkspaceRepoPanelStateValue(),
+    historyOpen: false,
+  });
+
+  await openDiffTargetInWorkspace(target);
 }
 
 async function handleCommit() {
@@ -2985,8 +3242,15 @@ onMounted(async () => {
       if (initialRepoIsGitRepository && shouldLoadDetailedGitStatus(initialRepoPanelState)) {
         void ensureFullStatus();
       }
+
+      await restoreCommitHistoryState(initialRepoPanelState, {
+        isGitRepository: initialRepoIsGitRepository,
+      });
     } else {
       await setRepoPath(null);
+      await restoreCommitHistoryState(initialRepoPanelState, {
+        isGitRepository: false,
+      });
     }
 
   markInfoNoteAsSeenWhenActive();
@@ -3048,6 +3312,8 @@ onBeforeUnmount(() => {
           :log="log"
           :is-history-open="isCommitHistoryOpen"
           :selected-path="selectedPath"
+          :revealed-path="revealInAllFilesPath"
+          :reveal-path-token="revealInAllFilesToken"
           :is-loading="isLoading"
           :toolbar-busy-action="repoToolbarBusyAction"
           :error="error"
@@ -3129,6 +3395,7 @@ onBeforeUnmount(() => {
             @stage-current="handleStageCurrentAndAdvance"
             @discard-current="handleDiscardCurrentDiff"
             @open-current-file="handleOpenCurrentDiffInWorkspace"
+            @open-diff-target="handleOpenDiffTargetInWorkspace"
             @discard-hunk="handleDiscardHunk"
             @toggle-collapse="togglePanel('diff')"
           />
@@ -3170,6 +3437,7 @@ onBeforeUnmount(() => {
             @update:active-tab-id="activeWorkspaceTabId = $event"
             @update:recent-activity="handleWorkspaceRecentActivityUpdate($event.workspaceId, $event.recentActivity)"
             @update:attention="handleWorkspaceAttentionUpdate($event.workspaceId, $event.attention)"
+            @reveal-in-all-files="handleRevealInAllFiles"
             @toggle-collapse="togglePanel('terminal')"
           />
         </div>
@@ -3222,12 +3490,39 @@ onBeforeUnmount(() => {
 
     <CommitHistoryDialog
       v-model="isCommitHistoryOpen"
+      :sidebar-side="sidebarSide"
+      :sidebar-width="sidebarWidth"
+      :workspace-panel-font-size="repoPanelFontSize"
+      :branches="branches"
       :commits="log?.items ?? []"
+      :selected-commit-hash="selectedHistoryCommitHash"
+      :history-scope="historyScope"
+      :history-query="historyQuery"
       :current-branch="branch"
       :repo-path="repoPath"
       :is-loading="isLoadingLog"
+      :has-more-commits="hasMoreHistoryCommits"
+      :is-loading-more-commits="isLoadingMoreHistoryCommits"
+      :commit-detail="commitDetail"
+      :is-updating-commit-message="isUpdatingCommitMessage"
+      :is-loading-commit-detail="isLoadingCommitDetail"
+      :commit-detail-error="commitDetailError"
+      :preview-commit-hash="historyPreviewCommitHash"
+      :preview-diff-path="historyPreviewDiffPath"
+      :preview-diff="historyPreviewDiff"
+      :is-loading-preview-diff="isLoadingHistoryPreviewDiff"
+      :preview-diff-error="historyPreviewDiffError"
       :focus-search-token="commitHistorySearchToken"
+      @select-commit="handleSelectHistoryCommit"
+      @select-scope="handleSelectHistoryScope"
+      @search-query-change="handleHistorySearchQueryChange"
+      @load-more-commits="handleLoadMoreHistoryCommits"
+      @update-commit-message="handleUpdateHistoryCommitMessage"
       @open-diff="handleOpenCommitDiff"
+      @preview-diff-file="handlePreviewCommitFileDiff"
+      @open-diff-file="handleOpenHistoryPreviewDiff"
+      @open-preview-target="handleOpenHistoryPreviewTarget"
+      @close-preview-diff="clearHistoryPreviewDiffState"
     />
 
     <transition name="app-toast">

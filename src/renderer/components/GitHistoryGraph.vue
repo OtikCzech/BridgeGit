@@ -8,6 +8,7 @@ interface Props {
   selectedHash: string | null;
   matchedHashes?: string[];
   fill?: boolean;
+  simplifyGraph?: boolean;
 }
 
 interface LaneTransition {
@@ -48,9 +49,9 @@ const emit = defineEmits<{
 
 const listRef = ref<HTMLOListElement | null>(null);
 
-const ROW_HEIGHT = 42;
-const ROW_CENTER_Y = 21;
-const GRAPH_OVERFLOW_Y = 7;
+const ROW_HEIGHT = 34;
+const ROW_CENTER_Y = 17;
+const GRAPH_OVERFLOW_Y = 5;
 const GRAPH_TOP_Y = -GRAPH_OVERFLOW_Y;
 const GRAPH_BOTTOM_Y = ROW_HEIGHT + GRAPH_OVERFLOW_Y;
 const GRAPH_VIEWBOX_Y = GRAPH_TOP_Y;
@@ -272,7 +273,30 @@ function refKindLabel(ref: GitCommitRef): string {
   }
 }
 
-function buildGraphRows(commits: GitLogEntry[]): GraphRow[] {
+function buildGraphRows(commits: GitLogEntry[], simplifyGraph: boolean): GraphRow[] {
+  if (simplifyGraph) {
+    return commits.map((commit, index) => {
+      const laneColorKey = getCommitColorKey(commit) ?? `commit:${commit.hash}`;
+
+      return {
+        commit,
+        laneIndex: 0,
+        laneColorKey,
+        laneColor: getColorForKey(colorKeyMap.value, laneColorKey),
+        hasIncomingLine: index > 0,
+        parentConnections: index < commits.length - 1
+          ? [{
+            laneIndex: 0,
+            color: getColorForKey(colorKeyMap.value, laneColorKey),
+            colorKey: laneColorKey,
+          }]
+          : [],
+        passThroughTransitions: [],
+        visibleLaneCount: 1,
+      };
+    });
+  }
+
   const activeLanes: LaneState[] = [];
   const colorMap = colorKeyMap.value;
 
@@ -374,7 +398,7 @@ function buildGraphRows(commits: GitLogEntry[]): GraphRow[] {
 }
 
 const colorKeyMap = computed(() => createColorKeyMap(props.commits));
-const rows = computed(() => buildGraphRows(props.commits));
+const rows = computed(() => buildGraphRows(props.commits, props.simplifyGraph === true));
 const selectedColorKey = computed(() => (
   rows.value.find((row) => row.commit.hash === props.selectedHash)?.laneColorKey ?? null
 ));
@@ -413,6 +437,13 @@ watch(
     void scrollSelectedIntoView();
   },
   { immediate: true },
+);
+
+watch(
+  () => props.commits,
+  () => {
+    void scrollSelectedIntoView();
+  },
 );
 </script>
 
@@ -557,6 +588,7 @@ watch(
 
 <style scoped lang="scss">
 .git-history {
+  --git-history-scale: calc(var(--git-history-font-size-px, 14) / 14);
   display: grid;
   gap: 10px;
 }
@@ -569,7 +601,7 @@ watch(
 
 .git-history__header {
   display: grid;
-  gap: 6px;
+  gap: 4px;
 }
 
 .git-history__title-row,
@@ -582,7 +614,7 @@ watch(
 
 .git-history__title-row,
 .git-history__main {
-  gap: 10px;
+  gap: 8px;
 }
 
 .git-history__title-row {
@@ -597,17 +629,17 @@ watch(
 }
 
 .git-history__title-main {
-  gap: 10px;
+  gap: 8px;
   min-width: 0;
 }
 
 .git-history__title-actions {
-  gap: 10px;
+  gap: 8px;
   flex: 0 0 auto;
 }
 
 .git-history__selection-inline {
-  gap: 8px;
+  gap: 6px;
   min-width: 0;
 }
 
@@ -617,7 +649,7 @@ watch(
 
 .git-history__label {
   color: var(--text-dim);
-  font-size: 0.72rem;
+  font-size: calc(0.72rem * var(--git-history-scale));
   letter-spacing: 0.08em;
   text-transform: uppercase;
 }
@@ -627,11 +659,11 @@ watch(
 .git-history__hash {
   color: var(--text-muted);
   font-family: var(--font-mono);
-  font-size: 0.74rem;
+  font-size: calc(0.74rem * var(--git-history-scale));
 }
 
 .git-history__selection {
-  gap: 8px;
+  gap: 6px;
   min-width: 0;
 }
 
@@ -639,7 +671,7 @@ watch(
   min-width: 0;
   overflow: hidden;
   color: var(--text-primary);
-  font-size: 0.78rem;
+  font-size: calc(0.78rem * var(--git-history-scale));
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -648,24 +680,24 @@ watch(
   gap: 8px;
   min-width: 0;
   color: var(--text-muted);
-  font-size: 0.76rem;
+  font-size: calc(0.76rem * var(--git-history-scale));
 }
 
 .git-history__open-diff {
-  height: 28px;
-  padding: 0 0.72rem;
+  height: 26px;
+  padding: 0 0.62rem;
   border: 1px solid var(--border-subtle);
   border-radius: 9px;
   background: rgba(16, 22, 29, 0.92);
   color: var(--text-primary);
-  font-size: 0.74rem;
-  font-weight: 600;
-  letter-spacing: 0.01em;
+  font-size: calc(0.76rem * var(--git-history-scale));
+  font-weight: 400;
+  letter-spacing: 0;
 }
 
 .git-history__empty {
   color: var(--text-muted);
-  font-size: 0.8rem;
+  font-size: calc(0.8rem * var(--git-history-scale));
 }
 
 .git-history__list {
@@ -705,12 +737,12 @@ watch(
 .git-history__row {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr);
-  gap: 10px;
+  gap: 8px;
   box-sizing: border-box;
   width: 100%;
-  padding: 0.48rem 0.42rem;
+  padding: 0.28rem 0.34rem;
   border: 1px solid transparent;
-  border-radius: 12px;
+  border-radius: 10px;
   background: transparent;
   color: var(--text-primary);
   text-align: left;
@@ -728,7 +760,7 @@ watch(
 
 .git-history__graph {
   flex: 0 0 auto;
-  height: 42px;
+  height: 34px;
 }
 
 .git-history__line {
@@ -746,7 +778,7 @@ watch(
 .git-history__content {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
-  gap: 12px;
+  gap: 10px;
   overflow: hidden;
   min-width: 0;
   align-items: start;
@@ -754,7 +786,7 @@ watch(
 
 .git-history__primary {
   display: grid;
-  gap: 4px;
+  gap: 3px;
   min-width: 0;
 }
 
@@ -762,7 +794,7 @@ watch(
   min-width: 0;
   flex: 1 1 0;
   overflow: hidden;
-  font-size: 0.82rem;
+  font-size: calc(0.76rem * var(--git-history-scale));
   font-weight: 600;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -774,27 +806,27 @@ watch(
 
 .git-history__meta-column {
   display: grid;
-  gap: 2px;
-  min-width: 128px;
+  gap: 1px;
+  min-width: 116px;
   justify-items: end;
   color: var(--text-muted);
-  font-size: 0.74rem;
+  font-size: calc(0.74rem * var(--git-history-scale));
   line-height: 1.25;
   white-space: nowrap;
 }
 
 .git-history__refs {
   flex-wrap: wrap;
-  gap: 6px;
+  gap: 4px;
 }
 
 .git-history__ref {
   display: inline-flex;
   align-items: center;
-  padding: 0.2rem 0.45rem;
+  padding: 0.16rem 0.36rem;
   border: 1px solid transparent;
   border-radius: 999px;
-  font-size: 0.69rem;
+  font-size: calc(0.69rem * var(--git-history-scale));
   font-weight: 700;
   line-height: 1.2;
 }

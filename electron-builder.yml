@@ -29,7 +29,7 @@ win:
         - x64
 nsis:
   oneClick: false
-  allowToChangeInstallationDirectory: true
+  allowToChangeInstallationDirectory: false
   perMachine: false
   deleteAppDataOnUninstall: true
   createDesktopShortcut: true

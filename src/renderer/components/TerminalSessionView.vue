@@ -1,15 +1,24 @@
 <script setup lang="ts">
 import { FitAddon } from '@xterm/addon-fit';
 import { WebLinksAddon } from '@xterm/addon-web-links';
-import { Terminal } from '@xterm/xterm';
+import { Terminal, type ILink, type ILinkProvider } from '@xterm/xterm';
 import { nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
-import { normalizeShellFontSize, type AppAppearance, type TerminalCommandPreset, type ThemeVariant } from '../../shared/bridgegit';
+import {
+  normalizeShellFontSize,
+  resolveWorkspaceFileTabType,
+  type AppAppearance,
+  type CodeNavigationTarget,
+  type TerminalCommandPreset,
+  type ThemeVariant,
+} from '../../shared/bridgegit';
+import CopyableErrorNotice from './CopyableErrorNotice.vue';
 import { SHORTCUTS, matchesCommandSlotShortcut, matchesShortcut } from '../shortcuts';
 import { useTerminal } from '../composables/useTerminal';
 
 interface Props {
   sessionKey: string;
   cwd: string;
+  projectRoot?: string | null;
   fontSize: number;
   appearanceTheme: AppAppearance;
   appearanceThemeVariant: ThemeVariant;
@@ -20,13 +29,15 @@ interface Props {
 const props = defineProps<Props>();
 const emit = defineEmits<{
   activity: [];
+  attention: [];
   activate: [];
   input: [data: string];
+  'open-navigation-target': [target: CodeNavigationTarget];
   'update:font-size': [fontSize: number];
 }>();
 
 const terminalRoot = ref<HTMLElement | null>(null);
-const copyToast = ref<string | null>(null);
+const toastMessage = ref<string | null>(null);
 const {
   sessionInfo,
   isStarting,
@@ -55,8 +66,9 @@ interface PromptWaiter {
 let terminal: Terminal | null = null;
 let fitAddon: FitAddon | null = null;
 let resizeObserver: ResizeObserver | null = null;
+let terminalFileLinkProviderDisposable: { dispose(): void } | null = null;
 let copySelectionTimer: number | null = null;
-let copyToastTimer: number | null = null;
+let toastTimer: number | null = null;
 let lastCopiedSelection: string | null = null;
 let copyInterruptGuardActive = false;
 let suppressActivityUntilInput = true;
@@ -64,6 +76,7 @@ let plainTextBuffer = '';
 let plainTextBufferOffset = 0;
 let activePresetExecutionId = 0;
 let nextPresetExecutionId = 1;
+let lastChoicePromptOffset = -1;
 const promptWaiters = new Set<PromptWaiter>();
 const terminalWheelListenerOptions = {
   passive: false,
@@ -83,6 +96,7 @@ const blockedTerminalShortcuts = [
   SHORTCUTS.terminalPreviousTab,
   SHORTCUTS.terminalNextTab,
 ];
+const TERMINAL_FILE_LINK_PATTERN = /(?:[A-Za-z]:[\\/]|~[\\/]|\/|\.{1,2}[\\/]|(?:[\w.-]+[\\/])+)[^\s"'`(){}<>|]+?(?:\.[A-Za-z0-9_-]+|\/[\w.-]+)(?::\d+(?::\d+)?)?/g;
 
 function getTerminalTheme(theme: AppAppearance) {
   if (theme === 'bridgegit-light') {
@@ -93,16 +107,16 @@ function getTerminalTheme(theme: AppAppearance) {
       cursorAccent: '#f7fbff',
       selectionBackground: 'rgba(45, 124, 216, 0.2)',
       black: '#1f2935',
-      red: '#c86464',
-      green: '#3f8a5d',
+      red: '#b87373',
+      green: '#5d8768',
       yellow: '#b98938',
       blue: '#2d7cd8',
       magenta: '#a25bc0',
       cyan: '#2f8ea0',
       white: '#d8e2ea',
       brightBlack: '#7b8a99',
-      brightRed: '#dc7c73',
-      brightGreen: '#69b986',
+      brightRed: '#cf8a83',
+      brightGreen: '#7fa88a',
       brightYellow: '#d7ae63',
       brightBlue: '#5ba2f5',
       brightMagenta: '#c78de1',
@@ -196,22 +210,225 @@ function getTerminalTheme(theme: AppAppearance) {
     cursorAccent: '#04070b',
     selectionBackground: 'rgba(105, 178, 255, 0.24)',
     black: '#0b0f14',
-    red: '#d16969',
-    green: '#4f9b67',
+    red: '#bd7c7c',
+    green: '#6f9878',
     yellow: '#d7ba7d',
     blue: '#69b2ff',
     magenta: '#c586c0',
     cyan: '#78c0ff',
     white: '#d4d4d4',
     brightBlack: '#6e7681',
-    brightRed: '#f48771',
-    brightGreen: '#8fdbab',
+    brightRed: '#d69886',
+    brightGreen: '#8db296',
     brightYellow: '#f2cc8f',
     brightBlue: '#9dcfff',
     brightMagenta: '#d8a5ff',
     brightCyan: '#b5d8ff',
     brightWhite: '#f5f7fa',
   };
+}
+
+function normalizeTerminalPath(value: string) {
+  return value.replace(/\\/g, '/');
+}
+
+function splitTerminalPath(value: string) {
+  return normalizeTerminalPath(value).split('/');
+}
+
+function inferTerminalHomePath() {
+  const candidates = [props.cwd, props.projectRoot];
+
+  for (const candidate of candidates) {
+    const normalizedCandidate = normalizeTerminalPath(candidate ?? '');
+    const unixMatch = normalizedCandidate.match(/^(\/home\/[^/]+|\/Users\/[^/]+)(?:\/|$)/);
+
+    if (unixMatch?.[1]) {
+      return unixMatch[1];
+    }
+
+    const windowsMatch = normalizedCandidate.match(/^([A-Za-z]:\/Users\/[^/]+)(?:\/|$)/);
+
+    if (windowsMatch?.[1]) {
+      return windowsMatch[1];
+    }
+  }
+
+  return null;
+}
+
+function resolveTerminalPath(basePath: string, relativePath: string) {
+  const normalizedBasePath = normalizeTerminalPath(basePath);
+  const normalizedRelativePath = normalizeTerminalPath(relativePath);
+  const isWindowsAbsolutePath = /^[A-Za-z]:\//.test(normalizedRelativePath);
+
+  if (isWindowsAbsolutePath || normalizedRelativePath.startsWith('/')) {
+    return normalizedRelativePath;
+  }
+
+  const baseSegments = splitTerminalPath(normalizedBasePath);
+  const relativeSegments = splitTerminalPath(normalizedRelativePath);
+  const resolvedSegments: string[] = [];
+
+  for (const segment of baseSegments) {
+    if (!segment || segment === '.') {
+      continue;
+    }
+
+    resolvedSegments.push(segment);
+  }
+
+  for (const segment of relativeSegments) {
+    if (!segment || segment === '.') {
+      continue;
+    }
+
+    if (segment === '..') {
+      if (resolvedSegments.length > 0 && resolvedSegments.at(-1) !== '..') {
+        resolvedSegments.pop();
+      }
+      continue;
+    }
+
+    resolvedSegments.push(segment);
+  }
+
+  if (/^[A-Za-z]:$/.test(resolvedSegments[0] ?? '')) {
+    return resolvedSegments.join('/');
+  }
+
+  return `/${resolvedSegments.join('/')}`;
+}
+
+function buildTerminalNavigationTargets(rawLinkText: string): CodeNavigationTarget[] {
+  const normalizedLinkText = rawLinkText.trim();
+
+  if (!normalizedLinkText) {
+    return [];
+  }
+
+  const match = normalizedLinkText.match(/^(.*?)(?::(\d+))?(?::(\d+))?$/);
+  const rawPath = match?.[1]?.trim() ?? normalizedLinkText;
+  const line = match?.[2] ? Number.parseInt(match[2], 10) : undefined;
+  const column = match?.[3] ? Number.parseInt(match[3], 10) : undefined;
+  const normalizedRawPath = normalizeTerminalPath(rawPath);
+  const expandedRawPath = normalizedRawPath.startsWith('~/')
+    ? `${inferTerminalHomePath() ?? '~'}${normalizedRawPath.slice(1)}`
+    : normalizedRawPath;
+
+  if (expandedRawPath.startsWith('~/')) {
+    return [];
+  }
+
+  const isAbsolutePath = /^[A-Za-z]:\//.test(expandedRawPath) || expandedRawPath.startsWith('/');
+  const candidateBasePaths = isAbsolutePath
+    ? [null]
+    : [props.cwd, props.projectRoot].filter((value, index, source): value is string => (
+      Boolean(value) && source.indexOf(value) === index
+    ));
+
+  const targets = candidateBasePaths
+    .map((basePath) => (
+      basePath
+        ? resolveTerminalPath(basePath, expandedRawPath)
+        : expandedRawPath
+    ))
+    .filter((filePath, index, source) => (
+      resolveWorkspaceFileTabType(filePath) !== 'unsupported'
+      && source.findIndex((candidate) => normalizeTerminalPath(candidate) === normalizeTerminalPath(filePath)) === index
+    ))
+    .map<CodeNavigationTarget>((filePath) => ({
+      filePath,
+      line,
+      column,
+    }));
+
+  return targets;
+}
+
+function parseTerminalNavigationTarget(rawLinkText: string): CodeNavigationTarget | null {
+  const targets = buildTerminalNavigationTargets(rawLinkText);
+  return targets[0] ?? null;
+}
+
+async function activateTerminalFileLink(rawLinkText: string) {
+  const targets = buildTerminalNavigationTargets(rawLinkText);
+
+  if (!targets.length || !window.bridgegit?.notes) {
+    return;
+  }
+
+  try {
+    for (const target of targets) {
+      const inspectedFile = await window.bridgegit.notes.inspectFile(target.filePath);
+
+      if (!inspectedFile) {
+        continue;
+      }
+
+      emit('open-navigation-target', target);
+      return;
+    }
+
+    showToast(`File not found: ${targets[0]?.filePath ?? rawLinkText}`);
+  } catch {
+    showToast('Unable to open file link.');
+  }
+}
+
+function registerTerminalFileLinkProvider() {
+  if (!terminal) {
+    return;
+  }
+
+  terminalFileLinkProviderDisposable?.dispose();
+  const terminalInstance = terminal;
+
+  const linkProvider: ILinkProvider = {
+    provideLinks(bufferLineNumber, callback) {
+      const line = terminalInstance.buffer.active.getLine(bufferLineNumber - 1);
+      const lineText = line?.translateToString(false) ?? '';
+
+      if (!lineText) {
+        callback(undefined);
+        return;
+      }
+
+      const links: ILink[] = [];
+      let match: RegExpExecArray | null;
+      const matcher = new RegExp(TERMINAL_FILE_LINK_PATTERN.source, TERMINAL_FILE_LINK_PATTERN.flags);
+
+      while ((match = matcher.exec(lineText)) !== null) {
+        const linkText = match[0] ?? '';
+        const target = parseTerminalNavigationTarget(linkText);
+
+        if (!target || match.index === undefined) {
+          continue;
+        }
+
+        links.push({
+          text: linkText,
+          range: {
+            start: {
+              x: match.index + 1,
+              y: bufferLineNumber,
+            },
+            end: {
+              x: match.index + linkText.length,
+              y: bufferLineNumber,
+            },
+          },
+          activate: () => {
+            void activateTerminalFileLink(linkText);
+          },
+        });
+      }
+
+      callback(links.length ? links : undefined);
+    },
+  };
+
+  terminalFileLinkProviderDisposable = terminal.registerLinkProvider(linkProvider);
 }
 
 function focusTerminal() {
@@ -240,6 +457,7 @@ function stripTerminalSequences(value: string) {
 function resetOutputTracking() {
   plainTextBuffer = '';
   plainTextBufferOffset = 0;
+  lastChoicePromptOffset = -1;
 }
 
 function getOutputSince(startOffset: number) {
@@ -270,8 +488,55 @@ function appendOutputToBuffer(data: string) {
   flushPromptWaiters();
 }
 
+function detectChoicePromptOffset() {
+  const absoluteEndOffset = getAbsoluteOutputOffset();
+  const windowStartOffset = Math.max(plainTextBufferOffset, absoluteEndOffset - 1600);
+  const recentOutput = getOutputSince(windowStartOffset);
+
+  if (!recentOutput) {
+    return null;
+  }
+
+  const patterns = [
+    /request_user_input[\s\S]{0,1200}(?:questions|options)/gi,
+    /(?:^|\n)[^\n?]{0,180}\?[\s\S]{0,800}\(Recommended\)/gi,
+    /(?:choose|select|pick|question|options?)[:\s\S]{0,800}\(Recommended\)/gi,
+  ];
+
+  let newestMatchOffset: number | null = null;
+
+  patterns.forEach((pattern) => {
+    let match: RegExpExecArray | null;
+
+    while ((match = pattern.exec(recentOutput)) !== null) {
+      if (match.index === undefined) {
+        continue;
+      }
+
+      const absoluteMatchOffset = windowStartOffset + match.index;
+      if (newestMatchOffset === null || absoluteMatchOffset > newestMatchOffset) {
+        newestMatchOffset = absoluteMatchOffset;
+      }
+    }
+  });
+
+  return newestMatchOffset;
+}
+
+function emitAttentionForChoicePrompt() {
+  const choicePromptOffset = detectChoicePromptOffset();
+
+  if (choicePromptOffset === null || choicePromptOffset <= lastChoicePromptOffset) {
+    return;
+  }
+
+  lastChoicePromptOffset = choicePromptOffset;
+  emit('attention');
+}
+
 function sendInput(data: string) {
   suppressActivityUntilInput = false;
+  lastChoicePromptOffset = getAbsoluteOutputOffset();
   emit('input', data);
   write(data);
 }
@@ -339,15 +604,15 @@ function writeStatusLine(message: string) {
   terminal?.writeln(`\r\n${message}\r\n`);
 }
 
-function showCopyToast(message: string) {
-  copyToast.value = message;
+function showToast(message: string) {
+  toastMessage.value = message;
 
-  if (copyToastTimer) {
-    window.clearTimeout(copyToastTimer);
+  if (toastTimer) {
+    window.clearTimeout(toastTimer);
   }
 
-  copyToastTimer = window.setTimeout(() => {
-    copyToast.value = null;
+  toastTimer = window.setTimeout(() => {
+    toastMessage.value = null;
   }, 1800);
 }
 
@@ -417,9 +682,9 @@ function scheduleSelectionCopy() {
     try {
       await writeClipboard(selection);
       lastCopiedSelection = selection;
-      showCopyToast('Copied');
+      showToast('Copied');
     } catch {
-      showCopyToast('Copy failed');
+      showToast('Copy failed');
     }
   }, 90);
 }
@@ -725,6 +990,7 @@ function initializeTerminal() {
   fitAddon = new FitAddon();
   terminal.loadAddon(fitAddon);
   terminal.loadAddon(new WebLinksAddon());
+  registerTerminalFileLinkProvider();
   terminal.attachCustomKeyEventHandler((event) => {
     if (isPasteShortcut(event)) {
       event.preventDefault();
@@ -736,7 +1002,7 @@ function initializeTerminal() {
     if (isCopyShortcut(event) && copyInterruptGuardActive) {
       event.preventDefault();
       event.stopPropagation();
-      showCopyToast('Ctrl+C blocked during mouse selection');
+      showToast('Ctrl+C blocked during mouse selection');
       return false;
     }
 
@@ -796,6 +1062,8 @@ onMounted(async () => {
       if (!suppressActivityUntilInput) {
         emit('activity');
       }
+
+      emitAttentionForChoicePrompt();
     },
     onExit: ({ exitCode: code }) => {
       rejectPromptWaiters(`Terminal session exited with code ${code}.`);
@@ -882,8 +1150,8 @@ onBeforeUnmount(() => {
     window.clearTimeout(copySelectionTimer);
   }
 
-  if (copyToastTimer) {
-    window.clearTimeout(copyToastTimer);
+  if (toastTimer) {
+    window.clearTimeout(toastTimer);
   }
 
   terminalRoot.value?.removeEventListener('pointerup', scheduleSelectionCopy);
@@ -893,6 +1161,8 @@ onBeforeUnmount(() => {
   terminalRoot.value?.removeEventListener('wheel', handleWheelZoom, terminalWheelListenerOptions);
   terminalRoot.value?.removeEventListener('paste', handleTerminalPaste);
   terminalRoot.value?.removeEventListener('contextmenu', handleContextMenuPaste);
+  terminalFileLinkProviderDisposable?.dispose();
+  terminalFileLinkProviderDisposable = null;
   resizeObserver?.disconnect();
   rejectPromptWaiters('Terminal session closed.');
   dispose();
@@ -902,9 +1172,11 @@ onBeforeUnmount(() => {
 
 <template>
   <section class="terminal-session" :data-appearance-theme="appearanceTheme">
-    <div v-if="error" class="terminal-session__notice terminal-session__notice--error">
-      {{ error }}
-    </div>
+    <CopyableErrorNotice
+      v-if="error"
+      class="terminal-session__notice terminal-session__notice--error"
+      :message="error"
+    />
 
     <div v-else-if="exitCode !== null" class="terminal-session__notice terminal-session__notice--info">
       Process exited with code {{ exitCode }}.
@@ -914,8 +1186,8 @@ onBeforeUnmount(() => {
       <div ref="terminalRoot" class="terminal-session__screen" />
 
       <transition name="terminal-session-toast">
-        <div v-if="copyToast" class="terminal-session__toast">
-          {{ copyToast }}
+        <div v-if="toastMessage" class="terminal-session__toast">
+          {{ toastMessage }}
         </div>
       </transition>
     </div>

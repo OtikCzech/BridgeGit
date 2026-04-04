@@ -33,6 +33,7 @@ const emit = defineEmits<{
   'focus-previous-tab': [];
   'open-file': [];
   'open-note-link': [filePath: string];
+  'reveal-in-all-files': [];
   'reload-from-disk': [];
   'save-file': [];
   'save-file-as': [];
@@ -54,13 +55,15 @@ const activePreviewMatchIndex = ref(0);
 const previewMatchCount = ref(0);
 const renderedMarkdown = ref('<p class="note-tab__preview-empty">Nothing to preview yet.</p>');
 let copyToastTimer: number | null = null;
+let copySelectionTimer: number | null = null;
+let lastCopiedSelection: string | null = null;
 let markdownRenderToken = 0;
 let mermaidInitialized = false;
 let mermaidThemeVariant: ThemeVariant | null = null;
 let nextMermaidDiagramId = 1;
 const NOTE_PATH_LABEL_MAX_LENGTH = 36;
 const FILE_PATH_MENU_WIDTH = 220;
-const FILE_PATH_MENU_HEIGHT = 132;
+const FILE_PATH_MENU_HEIGHT = 168;
 const NOTE_VIEW_MODES: WorkspaceNoteTabState['viewMode'][] = ['source', 'split', 'preview'];
 const NOTE_FILE_EXTENSIONS = new Set(['md', 'markdown', 'txt']);
 const CODE_LANGUAGE_ALIASES: Record<string, string> = {
@@ -600,6 +603,88 @@ async function writeClipboard(text: string) {
   await navigator.clipboard.writeText(text);
 }
 
+function clearPendingSelectionCopy() {
+  if (copySelectionTimer) {
+    window.clearTimeout(copySelectionTimer);
+    copySelectionTimer = null;
+  }
+}
+
+function getSelectedTextareaText() {
+  const textarea = textareaRef.value;
+
+  if (!textarea || document.activeElement !== textarea) {
+    return null;
+  }
+
+  const selectionStart = textarea.selectionStart ?? 0;
+  const selectionEnd = textarea.selectionEnd ?? 0;
+
+  if (selectionEnd <= selectionStart) {
+    return null;
+  }
+
+  return textarea.value.slice(selectionStart, selectionEnd);
+}
+
+function getSelectedPreviewText() {
+  const preview = previewRef.value;
+  const selection = window.getSelection();
+
+  if (!preview || !selection || selection.isCollapsed || selection.rangeCount < 1) {
+    return null;
+  }
+
+  const anchorNode = selection.anchorNode;
+  const focusNode = selection.focusNode;
+
+  if (!anchorNode || !focusNode) {
+    return null;
+  }
+
+  if (!preview.contains(anchorNode) || !preview.contains(focusNode)) {
+    return null;
+  }
+
+  const text = selection.toString();
+  return text.length > 0 ? text : null;
+}
+
+function getSelectedNoteText() {
+  if (!props.active) {
+    return null;
+  }
+
+  return getSelectedTextareaText() ?? getSelectedPreviewText();
+}
+
+function scheduleSelectionCopy() {
+  const selection = getSelectedNoteText();
+
+  if (!selection) {
+    lastCopiedSelection = null;
+    clearPendingSelectionCopy();
+    return;
+  }
+
+  clearPendingSelectionCopy();
+  copySelectionTimer = window.setTimeout(async () => {
+    const currentSelection = getSelectedNoteText();
+
+    if (!currentSelection || currentSelection === lastCopiedSelection) {
+      return;
+    }
+
+    try {
+      await writeClipboard(currentSelection);
+      lastCopiedSelection = currentSelection;
+      showCopyToast('Copied');
+    } catch {
+      showCopyToast('Copy failed');
+    }
+  }, 90);
+}
+
 async function copyFilePathText(text: string, successMessage: string) {
   try {
     await writeClipboard(text);
@@ -669,6 +754,11 @@ async function handleCopyProjectRelativePathMenuClick() {
 async function handleCopyFileNameMenuClick() {
   closeFilePathMenu();
   await copyFileName();
+}
+
+function handleRevealInAllFilesMenuClick() {
+  closeFilePathMenu();
+  emit('reveal-in-all-files');
 }
 
 async function copyAll() {
@@ -1284,12 +1374,15 @@ function handleDocumentKeydown(event: KeyboardEvent) {
 onMounted(() => {
   document.addEventListener('keydown', handleDocumentKeydown);
   document.addEventListener('pointerdown', handleDocumentPointerDown);
+  document.addEventListener('selectionchange', scheduleSelectionCopy);
   void focusEditor();
 });
 
 onBeforeUnmount(() => {
   document.removeEventListener('keydown', handleDocumentKeydown);
   document.removeEventListener('pointerdown', handleDocumentPointerDown);
+  document.removeEventListener('selectionchange', scheduleSelectionCopy);
+  clearPendingSelectionCopy();
 
   if (copyToastTimer) {
     window.clearTimeout(copyToastTimer);
@@ -1629,6 +1722,9 @@ defineExpose({
           spellcheck="false"
           placeholder="Write markdown notes, prompts, and snippets..."
           @input="handleInput"
+          @select="scheduleSelectionCopy"
+          @pointerup="scheduleSelectionCopy"
+          @keyup="scheduleSelectionCopy"
         />
       </div>
 
@@ -1673,6 +1769,15 @@ defineExpose({
         @click="handleCopyProjectRelativePathMenuClick"
       >
         Copy path from project root
+      </button>
+      <button
+        class="note-tab__path-menu-item"
+        type="button"
+        role="menuitem"
+        :disabled="!filePath"
+        @click="handleRevealInAllFilesMenuClick"
+      >
+        Reveal in All files
       </button>
       <button
         class="note-tab__path-menu-item"

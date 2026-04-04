@@ -16,12 +16,16 @@ import sqlLanguage from 'highlight.js/lib/languages/sql';
 import typescriptLanguage from 'highlight.js/lib/languages/typescript';
 import xmlLanguage from 'highlight.js/lib/languages/xml';
 import yamlLanguage from 'highlight.js/lib/languages/yaml';
+import { computed, onBeforeUnmount, onMounted, onUpdated, ref } from 'vue';
 import type { GitDiffMode } from '../../shared/bridgegit';
-import { computed, onMounted, onUpdated, ref } from 'vue';
+import CopyableErrorNotice from './CopyableErrorNotice.vue';
 
 interface Props {
   repoPath: string | null;
   viewerMode: 'working-tree' | 'commit';
+  viewMode?: 'side-by-side' | 'line-by-line';
+  showViewToggle?: boolean;
+  eyebrowText?: string | null;
   title: string;
   titleMeta?: string | null;
   hasTarget: boolean;
@@ -45,9 +49,11 @@ const props = defineProps<Props>();
 const emit = defineEmits<{
   'select-previous': [];
   'select-next': [];
+  'update:view-mode': [value: 'side-by-side' | 'line-by-line'];
   'stage-current': [];
   'discard-current': [];
   'open-current-file': [targetLine?: number];
+  'open-diff-target': [payload: { filePath: string; line?: number }];
   'discard-hunk': [patch: string];
   'toggle-collapse': [];
 }>();
@@ -108,10 +114,22 @@ interface ParsedHunkLine {
   newLineNumber: number | null;
 }
 
+interface DiffFileEntry {
+  filePath: string;
+}
+
 const rootRef = ref<HTMLElement | null>(null);
-const viewMode = ref<'side-by-side' | 'line-by-line'>('side-by-side');
+const internalViewMode = ref<'side-by-side' | 'line-by-line'>('side-by-side');
+const copyToast = ref<string | null>(null);
 const isCommitMode = computed(() => props.viewerMode === 'commit');
-const isSideBySide = computed(() => viewMode.value === 'side-by-side');
+const currentViewMode = computed(() => props.viewMode ?? internalViewMode.value);
+const showViewToggle = computed(() => props.showViewToggle ?? true);
+const resolvedEyebrowText = computed(() => (
+  props.eyebrowText === undefined
+    ? (isCommitMode.value ? 'Commit Diff' : 'Diff Viewer')
+    : props.eyebrowText
+));
+const isSideBySide = computed(() => currentViewMode.value === 'side-by-side');
 const viewToggleTitle = computed(() => (
   isSideBySide.value ? 'Switch diff to unified view' : 'Switch diff to side by side view'
 ));
@@ -125,8 +143,12 @@ const currentDiffTargetLine = computed(() => findFirstChangedLine(props.diff));
 const openCurrentFileLabel = computed(() => (
   currentDiffTargetLine.value ? `Open at line ${currentDiffTargetLine.value}` : 'Open file'
 ));
+let copySelectionTimer: number | null = null;
+let copyToastTimer: number | null = null;
+let lastCopiedSelection: string | null = null;
 
 const hasDiff = computed(() => props.diff.includes('diff --git'));
+const diffFileEntries = computed(() => parseDiffFileEntries(props.diff));
 const renderedDiff = computed(() => {
   if (!hasDiff.value) {
     return '';
@@ -136,7 +158,7 @@ const renderedDiff = computed(() => {
     colorScheme: ColorSchemeType.DARK,
     drawFileList: false,
     matching: 'lines',
-    outputFormat: viewMode.value,
+    outputFormat: currentViewMode.value,
   });
 });
 
@@ -191,7 +213,7 @@ const hunkSections = computed<DiffHunkSection[]>(() => {
         colorScheme: ColorSchemeType.DARK,
         drawFileList: false,
         matching: 'lines',
-        outputFormat: viewMode.value,
+        outputFormat: currentViewMode.value,
       }),
       lineActions,
     };
@@ -201,7 +223,15 @@ const hunkSections = computed<DiffHunkSection[]>(() => {
 const shouldRenderHunkSections = computed(() => hunkSections.value.length > 0);
 
 function toggleViewMode() {
-  viewMode.value = isSideBySide.value ? 'line-by-line' : 'side-by-side';
+  const nextValue = isSideBySide.value ? 'line-by-line' : 'side-by-side';
+
+  if (props.viewMode) {
+    emit('update:view-mode', nextValue);
+    return;
+  }
+
+  internalViewMode.value = nextValue;
+  emit('update:view-mode', nextValue);
 }
 
 function formatHunkRange(start: number, count: number) {
@@ -386,6 +416,137 @@ function findFirstChangedLineInHunk(hunkLines: string[]) {
   return firstChangedLine?.newLineNumber ?? firstChangedLine?.oldLineNumber ?? null;
 }
 
+function parseDiffPath(rawPath: string): string | null {
+  const trimmedPath = rawPath.trim();
+
+  if (!trimmedPath || trimmedPath === '/dev/null') {
+    return null;
+  }
+
+  const unquotedPath = (
+    (trimmedPath.startsWith('"') && trimmedPath.endsWith('"'))
+    || (trimmedPath.startsWith('\'') && trimmedPath.endsWith('\''))
+  )
+    ? trimmedPath.slice(1, -1)
+    : trimmedPath;
+
+  const normalizedPath = unquotedPath.replace(/\\/g, '/').replace(/^[ab]\//, '');
+  return normalizedPath || null;
+}
+
+function parseDiffFileEntries(diffText: string): DiffFileEntry[] {
+  if (!diffText.includes('diff --git')) {
+    return [];
+  }
+
+  const entries: DiffFileEntry[] = [];
+  const lines = diffText.replace(/\r\n/g, '\n').split('\n');
+  let oldPath: string | null = null;
+  let newPath: string | null = null;
+  let hasActiveBlock = false;
+
+  function flushCurrentEntry() {
+    if (!hasActiveBlock) {
+      return;
+    }
+
+    const filePath = newPath ?? oldPath;
+
+    if (filePath) {
+      entries.push({ filePath });
+    }
+
+    oldPath = null;
+    newPath = null;
+    hasActiveBlock = false;
+  }
+
+  for (const line of lines) {
+    if (line.startsWith('diff --git ')) {
+      flushCurrentEntry();
+      hasActiveBlock = true;
+      continue;
+    }
+
+    if (!hasActiveBlock) {
+      continue;
+    }
+
+    if (line.startsWith('--- ')) {
+      oldPath = parseDiffPath(line.slice(4));
+      continue;
+    }
+
+    if (line.startsWith('+++ ')) {
+      newPath = parseDiffPath(line.slice(4));
+    }
+  }
+
+  flushCurrentEntry();
+  return entries;
+}
+
+function findClosestDiffFileWrapper(target: HTMLElement | null) {
+  return target?.closest<HTMLElement>('.d2h-file-wrapper') ?? null;
+}
+
+function deriveFilePathFromWrapper(wrapper: HTMLElement): string | null {
+  const annotatedPath = wrapper.dataset.bridgegitFilePath?.trim();
+
+  if (annotatedPath) {
+    return annotatedPath;
+  }
+
+  const fileName = wrapper.querySelector<HTMLElement>('.d2h-file-name')?.textContent?.trim() ?? '';
+  return parseDiffPath(fileName);
+}
+
+function getTargetLineFromCell(cell: HTMLElement): number | null {
+  if (cell.classList.contains('d2h-code-side-linenumber')) {
+    const lineNumber = Number.parseInt(cell.textContent?.trim() ?? '', 10);
+    return Number.isFinite(lineNumber) ? lineNumber : null;
+  }
+
+  const newLineNumber = Number.parseInt(
+    cell.querySelector<HTMLElement>('.line-num2')?.textContent?.trim() ?? '',
+    10,
+  );
+
+  if (Number.isFinite(newLineNumber)) {
+    return newLineNumber;
+  }
+
+  const oldLineNumber = Number.parseInt(
+    cell.querySelector<HTMLElement>('.line-num1')?.textContent?.trim() ?? '',
+    10,
+  );
+
+  return Number.isFinite(oldLineNumber) ? oldLineNumber : null;
+}
+
+function annotateDiffTargets() {
+  if (!rootRef.value) {
+    return;
+  }
+
+  const wrappers = rootRef.value.querySelectorAll<HTMLElement>('.d2h-file-wrapper');
+  const entries = diffFileEntries.value;
+
+  wrappers.forEach((wrapper, index) => {
+    const filePath = (
+      entries.length === 1
+        ? entries[0]?.filePath
+        : entries[index]?.filePath
+    ) ?? deriveFilePathFromWrapper(wrapper);
+
+    if (filePath) {
+      wrapper.dataset.bridgegitFilePath = filePath;
+    } else {
+      delete wrapper.dataset.bridgegitFilePath;
+    }
+  });
+}
+
 function applySyntaxHighlighting() {
   if (!rootRef.value) {
     return;
@@ -419,29 +580,189 @@ function applySyntaxHighlighting() {
   });
 }
 
+function handleRenderedDiffClick(event: MouseEvent) {
+  if (event.defaultPrevented || event.button !== 0) {
+    return;
+  }
+
+  if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) {
+    return;
+  }
+
+  const selection = window.getSelection();
+
+  if (selection && !selection.isCollapsed && selection.toString().trim()) {
+    return;
+  }
+
+  const target = event.target instanceof HTMLElement ? event.target : null;
+
+  if (!target) {
+    return;
+  }
+
+  const headerTarget = target.closest<HTMLElement>('.d2h-file-name-wrapper');
+
+  if (headerTarget && !target.closest('.d2h-file-collapse')) {
+    const wrapper = findClosestDiffFileWrapper(headerTarget);
+    const filePath = wrapper ? deriveFilePathFromWrapper(wrapper) : null;
+
+    if (!filePath) {
+      return;
+    }
+
+    event.preventDefault();
+    emit('open-diff-target', { filePath });
+    return;
+  }
+
+  const lineNumberCell = target.closest<HTMLElement>('.d2h-code-linenumber, .d2h-code-side-linenumber');
+  const lineContentCell = target.closest<HTMLElement>('td.d2h-ins, td.d2h-del, td.d2h-change');
+  const activeLineCell = lineNumberCell ?? lineContentCell?.parentElement?.querySelector<HTMLElement>(
+    '.d2h-code-linenumber, .d2h-code-side-linenumber',
+  ) ?? null;
+
+  if (!activeLineCell) {
+    return;
+  }
+
+  const wrapper = findClosestDiffFileWrapper(activeLineCell);
+  const filePath = wrapper ? deriveFilePathFromWrapper(wrapper) : null;
+  const line = getTargetLineFromCell(activeLineCell);
+
+  if (!filePath || !line) {
+    return;
+  }
+
+  event.preventDefault();
+  emit('open-diff-target', {
+    filePath,
+    line,
+  });
+}
+
+async function writeClipboard(text: string) {
+  try {
+    if (window.bridgegit?.clipboard) {
+      await Promise.resolve(window.bridgegit.clipboard.writeText(text));
+      return;
+    }
+  } catch {
+    // Fall back to the browser clipboard API when the Electron bridge is unavailable.
+  }
+
+  await navigator.clipboard.writeText(text);
+}
+
+function getRenderedDiffElement() {
+  return rootRef.value?.querySelector<HTMLElement>('.diff-viewer__rendered') ?? null;
+}
+
+function getSelectedDiffText() {
+  const renderedDiffElement = getRenderedDiffElement();
+  const selection = window.getSelection();
+
+  if (!renderedDiffElement || !selection || selection.isCollapsed || selection.rangeCount < 1) {
+    return null;
+  }
+
+  const anchorNode = selection.anchorNode;
+  const focusNode = selection.focusNode;
+
+  if (!anchorNode || !focusNode) {
+    return null;
+  }
+
+  if (!renderedDiffElement.contains(anchorNode) || !renderedDiffElement.contains(focusNode)) {
+    return null;
+  }
+
+  const text = selection.toString();
+  return text.length > 0 ? text : null;
+}
+
+function clearPendingSelectionCopy() {
+  if (copySelectionTimer) {
+    window.clearTimeout(copySelectionTimer);
+    copySelectionTimer = null;
+  }
+}
+
+function showCopyToast(message: string) {
+  copyToast.value = message;
+
+  if (copyToastTimer) {
+    window.clearTimeout(copyToastTimer);
+  }
+
+  copyToastTimer = window.setTimeout(() => {
+    copyToast.value = null;
+  }, 1800);
+}
+
+function scheduleSelectionCopy() {
+  const selection = getSelectedDiffText();
+
+  if (!selection) {
+    lastCopiedSelection = null;
+    clearPendingSelectionCopy();
+    return;
+  }
+
+  clearPendingSelectionCopy();
+  copySelectionTimer = window.setTimeout(async () => {
+    const currentSelection = getSelectedDiffText();
+
+    if (!currentSelection || currentSelection === lastCopiedSelection) {
+      return;
+    }
+
+    try {
+      await writeClipboard(currentSelection);
+      lastCopiedSelection = currentSelection;
+      showCopyToast('Copied');
+    } catch {
+      showCopyToast('Copy failed');
+    }
+  }, 90);
+}
+
 onMounted(() => {
   applySyntaxHighlighting();
+  annotateDiffTargets();
+  document.addEventListener('selectionchange', scheduleSelectionCopy);
 });
 
 onUpdated(() => {
   applySyntaxHighlighting();
+  annotateDiffTargets();
+});
+
+onBeforeUnmount(() => {
+  document.removeEventListener('selectionchange', scheduleSelectionCopy);
+  clearPendingSelectionCopy();
+
+  if (copyToastTimer) {
+    window.clearTimeout(copyToastTimer);
+    copyToastTimer = null;
+  }
 });
 </script>
 
 <template>
-  <section ref="rootRef" class="diff-viewer">
+  <section ref="rootRef" class="diff-viewer" @click="handleRenderedDiffClick">
     <header class="diff-viewer__header">
       <div class="diff-viewer__heading">
-        <span class="diff-viewer__eyebrow">
-          {{ isCommitMode ? 'Commit Diff' : 'Diff Viewer' }}
+        <span v-if="resolvedEyebrowText" class="diff-viewer__eyebrow">
+          {{ resolvedEyebrowText }}
         </span>
-        <h2 class="diff-viewer__title">{{ title }}</h2>
+        <h2 v-if="title" class="diff-viewer__title">{{ title }}</h2>
         <p v-if="titleMeta" class="diff-viewer__title-meta">
           {{ titleMeta }}
         </p>
       </div>
 
-      <div v-if="!isCommitMode" class="diff-viewer__navigator">
+      <div class="diff-viewer__navigator">
         <button
           class="diff-viewer__icon-button"
           type="button"
@@ -491,6 +812,8 @@ onUpdated(() => {
       </div>
 
       <div class="diff-viewer__toolbar">
+        <slot name="toolbar-prefix" />
+
         <button
           v-if="!isCommitMode"
           class="diff-viewer__stage"
@@ -512,6 +835,7 @@ onUpdated(() => {
         </button>
 
         <button
+          v-if="showViewToggle"
           class="diff-viewer__icon-button diff-viewer__icon-button--view-toggle"
           type="button"
           :title="viewToggleTitle"
@@ -531,9 +855,9 @@ onUpdated(() => {
         </button>
 
         <button
+          v-if="canCollapse"
           class="diff-viewer__icon-button"
           type="button"
-          :disabled="!canCollapse"
           :title="collapseButtonTitle"
           aria-label="Collapse diff panel"
           @click="emit('toggle-collapse')"
@@ -542,13 +866,17 @@ onUpdated(() => {
             <path d="M6.75 11.25a.75.75 0 0 0 0 1.5h10.5a.75.75 0 0 0 0-1.5H6.75Z" />
           </svg>
         </button>
+
+        <slot name="toolbar-suffix" />
       </div>
     </header>
 
     <div v-if="error" class="diff-viewer__meta">
-      <span v-if="error" class="diff-viewer__badge diff-viewer__badge--remove">
-        {{ error }}
-      </span>
+      <CopyableErrorNotice
+        v-if="error"
+        class="diff-viewer__badge diff-viewer__badge--remove"
+        :message="error"
+      />
     </div>
 
     <div v-if="!repoPath" class="diff-viewer__empty">
@@ -604,6 +932,12 @@ onUpdated(() => {
     </div>
 
     <div v-else class="diff-viewer__rendered" v-html="renderedDiff" />
+
+    <transition name="diff-viewer-toast">
+      <div v-if="copyToast" class="diff-viewer__toast">
+        {{ copyToast }}
+      </div>
+    </transition>
   </section>
 </template>
 
@@ -612,6 +946,7 @@ onUpdated(() => {
   display: grid;
   grid-template-rows: auto auto 1fr;
   gap: 16px;
+  position: relative;
   height: 100%;
   padding: 20px;
 }
@@ -708,6 +1043,17 @@ onUpdated(() => {
   width: 16px;
   height: 16px;
   fill: currentColor;
+}
+
+.diff-viewer__icon-button:disabled,
+.diff-viewer__stage:disabled {
+  cursor: default;
+  opacity: 0.42;
+}
+
+.diff-viewer__icon-button:disabled:not(.diff-viewer__icon-button--view-toggle),
+.diff-viewer__stage:disabled {
+  color: var(--text-dim);
 }
 
 .diff-viewer__icon-button--view-toggle {
@@ -861,8 +1207,64 @@ onUpdated(() => {
   min-width: 0;
 }
 
+.diff-viewer__toast {
+  position: absolute;
+  right: 20px;
+  bottom: 20px;
+  z-index: 3;
+  padding: 0.42rem 0.72rem;
+  border: 1px solid rgba(110, 197, 255, 0.26);
+  border-radius: 10px;
+  background: rgba(8, 12, 17, 0.98);
+  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.28);
+  color: #f2f8ff;
+  font-size: 0.76rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  pointer-events: none;
+}
+
+.diff-viewer-toast-enter-active,
+.diff-viewer-toast-leave-active {
+  transition: opacity 140ms ease, transform 140ms ease;
+}
+
+.diff-viewer-toast-enter-from,
+.diff-viewer-toast-leave-to {
+  opacity: 0;
+  transform: translateY(6px);
+}
+
 :deep(.d2h-wrapper) {
   color: var(--text-primary);
+}
+
+:deep(.d2h-file-name-wrapper) {
+  cursor: pointer;
+}
+
+:deep(.d2h-file-name-wrapper:hover .d2h-file-name) {
+  color: rgba(151, 219, 255, 0.96);
+}
+
+:deep(.d2h-code-linenumber),
+:deep(.d2h-code-side-linenumber),
+:deep(td.d2h-ins),
+:deep(td.d2h-del),
+:deep(td.d2h-change) {
+  cursor: pointer;
+}
+
+:deep(.d2h-code-linenumber:hover),
+:deep(.d2h-code-side-linenumber:hover) {
+  color: rgba(151, 219, 255, 0.96);
+  background: rgba(18, 34, 48, 0.92);
+}
+
+:deep(td.d2h-ins:hover),
+:deep(td.d2h-del:hover),
+:deep(td.d2h-change:hover) {
+  box-shadow: inset 3px 0 0 rgba(123, 208, 255, 0.52);
 }
 
 @media (max-width: 900px) {

@@ -15,12 +15,17 @@ import {
   DeleteBranchResult,
   GitChange,
   GitChangeKind,
+  GitCommitDetail,
   GitCommitRef,
   GitDiffMode,
+  GitLogEntry,
+  GitLogRequest,
+  GitLogScope,
   GitLogResult,
   GitStatusRequestOptions,
   GitStatusSummary,
   GitTextSearchMatch,
+  GitTextSearchOptions,
   GitWorktreeSummary,
   MergeWorktreeIntoPrimaryBranchResult,
   RemoveWorktreeResult,
@@ -109,7 +114,7 @@ async function runWslCommand(context: WslRepositoryContext, args: string[]): Pro
   try {
     const { stdout } = await execFileAsync(
       'wsl.exe',
-      ['-d', context.distro, '--cd', context.linuxPath, ...args],
+      ['-d', context.distro, '--cd', context.linuxPath, '--exec', ...args],
       {
         encoding: 'utf8',
         windowsHide: true,
@@ -1008,20 +1013,10 @@ function getSearchRank(pathValue: string, query: string): number {
   return 4;
 }
 
-async function searchFiles(
-  repoPath: string,
-  query: string,
-  limit = FILE_SEARCH_RESULT_LIMIT,
-): Promise<string[]> {
+async function listFiles(repoPath: string): Promise<string[]> {
   const repoRoot = resolveRepoPath(repoPath);
-  const normalizedQuery = query.trim().toLowerCase();
-  const normalizedLimit = Number.isFinite(limit) ? Math.max(1, Math.min(Math.floor(limit), 500)) : FILE_SEARCH_RESULT_LIMIT;
 
-  if (!normalizedQuery) {
-    return [];
-  }
-
-  async function searchWithRipgrep(): Promise<string[]> {
+  async function listWithRipgrep(): Promise<string[]> {
     const { stdout } = await execFileAsync(
       'rg',
       ['--files', '--hidden', '-g', '!.git'],
@@ -1039,8 +1034,8 @@ async function searchFiles(
       .filter(Boolean);
   }
 
-  async function searchWithFilesystemWalk(): Promise<string[]> {
-    const matches: string[] = [];
+  async function listWithFilesystemWalk(): Promise<string[]> {
+    const files: string[] = [];
 
     async function visit(currentPath: string, relativePath = ''): Promise<boolean> {
       const entries = await readdir(currentPath, { withFileTypes: true });
@@ -1067,23 +1062,43 @@ async function searchFiles(
           continue;
         }
 
-        matches.push(nextRelativePath);
+        files.push(nextRelativePath);
       }
 
       return false;
     }
 
     await visit(repoRoot);
-    return matches;
+    return files;
   }
 
   let candidates: string[];
 
   try {
-    candidates = await searchWithRipgrep();
+    candidates = await listWithRipgrep();
   } catch {
-    candidates = await searchWithFilesystemWalk();
+    candidates = await listWithFilesystemWalk();
   }
+
+  return candidates
+    .map((pathValue) => normalizeSearchPath(pathValue))
+    .filter(Boolean)
+    .sort((left, right) => left.localeCompare(right, undefined, { numeric: true, sensitivity: 'base' }));
+}
+
+async function searchFiles(
+  repoPath: string,
+  query: string,
+  limit = FILE_SEARCH_RESULT_LIMIT,
+): Promise<string[]> {
+  const normalizedQuery = query.trim().toLowerCase();
+  const normalizedLimit = Number.isFinite(limit) ? Math.max(1, Math.min(Math.floor(limit), 500)) : FILE_SEARCH_RESULT_LIMIT;
+
+  if (!normalizedQuery) {
+    return [];
+  }
+
+  const candidates = await listFiles(repoPath);
 
   return candidates
     .filter((pathValue) => pathValue.toLowerCase().includes(normalizedQuery))
@@ -1125,21 +1140,127 @@ function isWholeWordTextMatch(lineText: string, column: number, query: string) {
   return !IDENTIFIER_PART_PATTERN.test(previousCharacter) && !IDENTIFIER_PART_PATTERN.test(nextCharacter);
 }
 
+function normalizeTextSearchFileGlobs(fileGlob: string | null | undefined): string[] {
+  return (fileGlob ?? '')
+    .split(/[,\s]+/)
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+}
+
+function escapeRegularExpression(value: string) {
+  return value.replace(/[|\\{}()[\]^$+?.]/g, '\\$&');
+}
+
+function buildTextSearchGlobRegExp(glob: string): RegExp {
+  let pattern = '^';
+
+  for (let index = 0; index < glob.length; index += 1) {
+    const character = glob[index] ?? '';
+    const nextCharacter = glob[index + 1] ?? '';
+
+    if (character === '*') {
+      if (nextCharacter === '*') {
+        pattern += '.*';
+        index += 1;
+      } else {
+        pattern += '[^/]*';
+      }
+      continue;
+    }
+
+    if (character === '?') {
+      pattern += '[^/]';
+      continue;
+    }
+
+    pattern += escapeRegularExpression(character);
+  }
+
+  pattern += '$';
+  return new RegExp(pattern, 'i');
+}
+
+function matchesTextSearchFileGlob(pathValue: string, glob: string) {
+  const normalizedPath = normalizeSearchPath(pathValue);
+  const normalizedGlob = glob.trim();
+
+  if (!normalizedGlob) {
+    return true;
+  }
+
+  const negative = normalizedGlob.startsWith('!');
+  const effectiveGlob = negative ? normalizedGlob.slice(1) : normalizedGlob;
+
+  if (!effectiveGlob) {
+    return true;
+  }
+
+  const matcher = buildTextSearchGlobRegExp(effectiveGlob);
+  const candidate = effectiveGlob.includes('/') ? normalizedPath : normalizedPath.split('/').at(-1) ?? normalizedPath;
+  const matches = matcher.test(candidate);
+
+  return negative ? !matches : matches;
+}
+
+function matchesTextSearchFileFilter(pathValue: string, globs: string[]) {
+  if (!globs.length) {
+    return true;
+  }
+
+  const positiveGlobs = globs.filter((glob) => !glob.startsWith('!'));
+  const negativeGlobs = globs.filter((glob) => glob.startsWith('!'));
+
+  if (positiveGlobs.length > 0 && !positiveGlobs.some((glob) => matchesTextSearchFileGlob(pathValue, glob))) {
+    return false;
+  }
+
+  return negativeGlobs.every((glob) => matchesTextSearchFileGlob(pathValue, glob));
+}
+
+async function listUntrackedFiles(repoRoot: string): Promise<Set<string>> {
+  try {
+    const { stdout } = await execFileAsync(
+      'git',
+      ['ls-files', '--others', '--exclude-standard', '--'],
+      {
+        cwd: repoRoot,
+        encoding: 'utf8',
+        windowsHide: true,
+        maxBuffer: GIT_OUTPUT_BUFFER_BYTES,
+      },
+    );
+
+    return new Set(
+      stdout
+        .split(/\r?\n/)
+        .map((line) => normalizeSearchPath(line.trim()))
+        .filter(Boolean),
+    );
+  } catch {
+    return new Set();
+  }
+}
+
 async function searchText(
   repoPath: string,
   query: string,
   limit = FILE_SEARCH_RESULT_LIMIT,
-  wholeWord = false,
+  options?: GitTextSearchOptions,
 ): Promise<GitTextSearchMatch[]> {
   const repoRoot = resolveRepoPath(repoPath);
   const normalizedQuery = query.trim();
   const normalizedLimit = Number.isFinite(limit) ? Math.max(1, Math.min(Math.floor(limit), 500)) : FILE_SEARCH_RESULT_LIMIT;
+  const wholeWord = options?.wholeWord ?? false;
+  const includeUntracked = options?.includeUntracked ?? true;
+  const fileGlobs = normalizeTextSearchFileGlobs(options?.fileGlob);
 
   if (!normalizedQuery) {
     return [];
   }
 
   async function searchWithRipgrep(): Promise<GitTextSearchMatch[]> {
+    const untrackedFiles = includeUntracked ? null : await listUntrackedFiles(repoRoot);
+
     try {
       const { stdout } = await execFileAsync(
         'rg',
@@ -1160,6 +1281,7 @@ async function searchText(
           '!release',
           '-g',
           '!vendor',
+          ...fileGlobs.flatMap((glob) => ['-g', glob]),
           '--fixed-strings',
           '--',
           normalizedQuery,
@@ -1193,6 +1315,14 @@ async function searchText(
             return null;
           }
 
+          if (!matchesTextSearchFileFilter(relativePath, fileGlobs)) {
+            return null;
+          }
+
+          if (untrackedFiles?.has(relativePath)) {
+            return null;
+          }
+
           if (wholeWord && !isWholeWordTextMatch(text, column, normalizedQuery)) {
             return null;
           }
@@ -1218,6 +1348,7 @@ async function searchText(
 
   async function searchWithFilesystemWalk(): Promise<GitTextSearchMatch[]> {
     const matches: GitTextSearchMatch[] = [];
+    const untrackedFiles = includeUntracked ? null : await listUntrackedFiles(repoRoot);
 
     async function visit(currentPath: string, relativePath = ''): Promise<boolean> {
       const entries = await readdir(currentPath, { withFileTypes: true });
@@ -1241,6 +1372,16 @@ async function searchText(
         }
 
         if (!entry.isFile()) {
+          continue;
+        }
+
+        const normalizedRelativePath = normalizeSearchPath(nextRelativePath);
+
+        if (!matchesTextSearchFileFilter(normalizedRelativePath, fileGlobs)) {
+          continue;
+        }
+
+        if (untrackedFiles?.has(normalizedRelativePath)) {
           continue;
         }
 
@@ -1274,7 +1415,7 @@ async function searchText(
 
             if (!wholeWord || isWholeWordTextMatch(lineText, column, normalizedQuery)) {
               matches.push({
-                path: normalizeSearchPath(nextRelativePath),
+                path: normalizedRelativePath,
                 filePath: normalizeDiffPath(nextAbsolutePath),
                 line: lineIndex + 1,
                 column,
@@ -1377,8 +1518,10 @@ async function getCommitDiff(
   repoPath: string,
   commitHash: string,
   parentHash?: string | null,
+  filePath?: string | null,
 ): Promise<string> {
   const repository = await resolveRepository(repoPath);
+  const normalizedFilePath = filePath?.trim() || null;
 
   if (!commitHash.trim()) {
     throw new Error('No commit selected.');
@@ -1393,6 +1536,7 @@ async function getCommitDiff(
         '--find-renames',
         parentHash,
         commitHash,
+        ...(normalizedFilePath ? ['--', normalizedFilePath] : []),
       ]);
     }
 
@@ -1404,6 +1548,7 @@ async function getCommitDiff(
       '--no-color',
       '--find-renames',
       commitHash,
+      ...(normalizedFilePath ? ['--', normalizedFilePath] : []),
     ]);
   }
 
@@ -1415,6 +1560,7 @@ async function getCommitDiff(
       '--find-renames',
       parentHash,
       commitHash,
+      ...(normalizedFilePath ? ['--', normalizedFilePath] : []),
     ]);
   }
 
@@ -1426,6 +1572,7 @@ async function getCommitDiff(
     '--no-color',
     '--find-renames',
     commitHash,
+    ...(normalizedFilePath ? ['--', normalizedFilePath] : []),
   ]);
 }
 
@@ -1458,6 +1605,23 @@ async function withTempPatchFile<T>(
     return await callback(patchFilePath);
   } finally {
     await rm(patchDir, { recursive: true, force: true });
+  }
+}
+
+async function withTempTextFile<T>(
+  prefix: string,
+  fileName: string,
+  content: string,
+  callback: (filePath: string) => Promise<T>,
+): Promise<T> {
+  const temporaryDirectory = await mkdtemp(join(tmpdir(), prefix));
+  const filePath = join(temporaryDirectory, fileName);
+
+  try {
+    await writeFile(filePath, content, 'utf8');
+    return await callback(filePath);
+  } finally {
+    await rm(temporaryDirectory, { recursive: true, force: true });
   }
 }
 
@@ -1555,32 +1719,158 @@ async function discardHunk(
   return getStatusSummary(repoPath);
 }
 
-async function getLog(repoPath: string, limit = 20): Promise<GitLogResult> {
+function resolveLogScopeArgs(scope?: GitLogScope): string[] {
+  if (!scope || scope.kind === 'all') {
+    return ['--all'];
+  }
+
+  if (scope.kind === 'head') {
+    return ['HEAD'];
+  }
+
+  const branchName = scope.branchName?.trim();
+
+  if (!branchName) {
+    throw new Error('No branch selected for history scope.');
+  }
+
+  return [branchName];
+}
+
+function parseCommitRecord(record: string): GitCommitDetail {
+  const [
+    hash = '',
+    shortHash = '',
+    rawParents = '',
+    authorName = '',
+    date = '',
+    subject = '',
+    rawRefs = '',
+    ...messageParts
+  ] = record.split('\x1f');
+
+  const message = messageParts.join('\x1f').replace(/\s+$/, '');
+
+  return {
+    hash,
+    shortHash,
+    parentHashes: rawParents.split(' ').filter(Boolean),
+    date,
+    subject,
+    message: message || subject,
+    authorName,
+    refs: parseCommitRefs(rawRefs),
+    files: [],
+    isHead: false,
+  };
+}
+
+function parseCommitFileChanges(rawOutput: string): GitChange[] {
+  const changes = rawOutput
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map<GitChange | null>((line) => {
+      const [rawStatus = '', firstPath = '', secondPath = ''] = line.split('\t');
+      const statusCode = rawStatus[0] ?? '';
+
+      if (!statusCode || !firstPath) {
+        return null;
+      }
+
+      const change: GitChange = {
+        path: secondPath || firstPath,
+        type: mapStatusCode(statusCode),
+      };
+
+      if ((statusCode === 'R' || statusCode === 'C') && secondPath) {
+        change.originalPath = firstPath;
+      }
+
+      return change;
+    })
+    .filter((change): change is GitChange => Boolean(change));
+
+  return sortAndDedupe(changes);
+}
+
+async function resolveHeadHash(repository: RepositoryContext): Promise<string | null> {
+  try {
+    const rawHeadHash = await runGit(repository, ['rev-parse', 'HEAD']);
+    const headHash = rawHeadHash.trim();
+    return headHash || null;
+  } catch (error) {
+    if (isMissingHeadError(error)) {
+      return null;
+    }
+
+    throw error;
+  }
+}
+
+function normalizeLogQuery(value?: string): string {
+  return value?.trim().toLocaleLowerCase() ?? '';
+}
+
+function commitMatchesLogQuery(commit: GitLogEntry, query: string): boolean {
+  if (!query) {
+    return true;
+  }
+
+  const haystack = [
+    commit.message,
+    commit.shortHash,
+    commit.hash,
+    commit.authorName,
+    ...commit.refs.map((ref) => ref.shortName),
+  ]
+    .join('\n')
+    .toLocaleLowerCase();
+
+  return haystack.includes(query);
+}
+
+async function getLog(repoPath: string, request: GitLogRequest = {}): Promise<GitLogResult> {
   const repository = await resolveRepository(repoPath);
-  const maxCount = Math.max(20, Math.min(limit, 300));
+  const scopeArgs = resolveLogScopeArgs(request.scope);
+  const normalizedLimit = Number.isFinite(request.limit) && Number(request.limit) > 0
+    ? Math.max(1, Math.floor(Number(request.limit)))
+    : null;
+  const normalizedOffset = Number.isFinite(request.offset) && Number(request.offset) > 0
+    ? Math.floor(Number(request.offset))
+    : 0;
+  const normalizedQuery = normalizeLogQuery(request.query);
+  const maxCountArgs = normalizedLimit && !normalizedQuery
+    ? [`--max-count=${normalizedLimit + 1}`]
+    : [];
+  const skipArgs = normalizedOffset > 0 && !normalizedQuery
+    ? [`--skip=${normalizedOffset}`]
+    : [];
 
   try {
     const rawLog = repository.mode === 'wsl'
       ? await runWslGit(repository, [
         'log',
-        '--all',
+        ...scopeArgs,
         '--topo-order',
         '--decorate=full',
         '--date=iso-strict',
-        `--max-count=${maxCount}`,
+        ...skipArgs,
+        ...maxCountArgs,
         '--pretty=format:%H%x1f%h%x1f%P%x1f%an%x1f%aI%x1f%s%x1f%D%x1e',
       ])
       : await repository.git.raw([
       'log',
-      '--all',
+      ...scopeArgs,
       '--topo-order',
       '--decorate=full',
       '--date=iso-strict',
-      `--max-count=${maxCount}`,
+      ...skipArgs,
+      ...maxCountArgs,
       '--pretty=format:%H%x1f%h%x1f%P%x1f%an%x1f%aI%x1f%s%x1f%D%x1e',
       ]);
 
-    const items = rawLog
+    const parsedItems = rawLog
       .split('\x1e')
       .map((record) => record.trim())
       .filter(Boolean)
@@ -1606,9 +1896,23 @@ async function getLog(repoPath: string, limit = 20): Promise<GitLogResult> {
         };
       });
 
+    const filteredItems = normalizedQuery
+      ? parsedItems.filter((commit) => commitMatchesLogQuery(commit, normalizedQuery))
+      : parsedItems;
+    const slicedItems = normalizedLimit
+      ? filteredItems.slice(normalizedOffset, normalizedOffset + normalizedLimit)
+      : filteredItems;
+    const hasMore = normalizedLimit
+      ? filteredItems.length > normalizedOffset + normalizedLimit
+      : false;
+
     return {
-      total: items.length,
-      items,
+      total: slicedItems.length,
+      items: slicedItems,
+      hasMore,
+      offset: normalizedOffset,
+      limit: normalizedLimit,
+      query: request.query?.trim() ?? '',
     };
   } catch (error) {
     if (
@@ -1619,6 +1923,10 @@ async function getLog(repoPath: string, limit = 20): Promise<GitLogResult> {
       return {
         total: 0,
         items: [],
+        hasMore: false,
+        offset: normalizedOffset,
+        limit: normalizedLimit,
+        query: request.query?.trim() ?? '',
       };
     }
 
@@ -1670,6 +1978,92 @@ async function commitChanges(repoPath: string, message: string): Promise<GitStat
   }
 
   return getStatusSummary(repoPath);
+}
+
+async function getCommitDetail(repoPath: string, commitHash: string): Promise<GitCommitDetail> {
+  const repository = await resolveRepository(repoPath);
+  const normalizedCommitHash = commitHash.trim();
+
+  if (!normalizedCommitHash) {
+    throw new Error('No commit selected.');
+  }
+
+  const [rawCommit, rawFiles, headHash] = await Promise.all([
+    runGit(repository, [
+      'show',
+      '--quiet',
+      '--decorate=full',
+      '--date=iso-strict',
+      '--format=%H%x1f%h%x1f%P%x1f%an%x1f%aI%x1f%s%x1f%D%x1f%B',
+      normalizedCommitHash,
+    ]),
+    runGit(repository, [
+      'show',
+      '--format=',
+      '--name-status',
+      '--find-renames',
+      '--diff-merges=first-parent',
+      '--root',
+      normalizedCommitHash,
+    ]),
+    resolveHeadHash(repository),
+  ]);
+
+  const detail = parseCommitRecord(rawCommit);
+  detail.files = parseCommitFileChanges(rawFiles);
+  detail.isHead = Boolean(headHash) && detail.hash === headHash;
+  return detail;
+}
+
+async function updateCommitMessage(
+  repoPath: string,
+  commitHash: string,
+  message: string,
+): Promise<GitCommitDetail> {
+  const repository = await resolveRepository(repoPath);
+  const normalizedCommitHash = commitHash.trim();
+  const trimmedMessage = message.trim();
+
+  if (!normalizedCommitHash) {
+    throw new Error('No commit selected.');
+  }
+
+  if (!trimmedMessage) {
+    throw new Error('Commit message cannot be empty.');
+  }
+
+  const headHash = await resolveHeadHash(repository);
+
+  if (!headHash) {
+    throw new Error('Repository does not have any commits yet.');
+  }
+
+  if (headHash !== normalizedCommitHash) {
+    throw new Error('Only the current HEAD commit message can be edited.');
+  }
+
+  await withTempTextFile('bridgegit-commit-message-', 'COMMIT_EDITMSG', message, async (filePath) => {
+    if (repository.mode === 'wsl') {
+      await runWslGit(repository, [
+        'commit',
+        '--amend',
+        '--only',
+        '-F',
+        toWslMountPath(filePath),
+      ]);
+      return;
+    }
+
+    await repository.git.raw([
+      'commit',
+      '--amend',
+      '--only',
+      '-F',
+      filePath,
+    ]);
+  });
+
+  return getCommitDetail(repoPath, 'HEAD');
 }
 
 async function checkoutBranch(repoPath: string, branchName: string): Promise<BranchSummary> {
@@ -2023,16 +2417,10 @@ async function pushCurrentBranch(repoPath: string): Promise<GitStatusSummary> {
     throw new Error('Cannot push from detached HEAD.');
   }
 
-  if (repository.mode === 'wsl') {
-    if (status.trackingBranch) {
-      await runWslGit(repository, ['push']);
-    } else {
-      await runWslGit(repository, ['push', '--set-upstream', 'origin', currentBranch]);
-    }
-  } else if (status.trackingBranch) {
-    await repository.git.push();
+  if (status.trackingBranch) {
+    await runGit(repository, ['push']);
   } else {
-    await repository.git.raw(['push', '--set-upstream', 'origin', currentBranch]);
+    await runGit(repository, ['push', '--set-upstream', 'origin', currentBranch]);
   }
 
   return getStatusSummary(repoPath);
@@ -2071,11 +2459,14 @@ export function registerGitIpcHandlers() {
   ipcMain.handle('git:listDirectory', (_event, repoPath: string, relativePath?: string) =>
     listDirectory(repoPath, relativePath),
   );
+  ipcMain.handle('git:listFiles', (_event, repoPath: string) => listFiles(repoPath));
   ipcMain.handle('git:searchFiles', (_event, repoPath: string, query: string, limit?: number) =>
     searchFiles(repoPath, query, limit),
   );
-  ipcMain.handle('git:searchText', (_event, repoPath: string, query: string, limit?: number, wholeWord?: boolean) =>
-    searchText(repoPath, query, limit, wholeWord),
+  ipcMain.handle(
+    'git:searchText',
+    (_event, repoPath: string, query: string, limit?: number, options?: GitTextSearchOptions) =>
+      searchText(repoPath, query, limit, options),
   );
   ipcMain.handle('git:worktrees', (_event, repoPath: string) => getWorktrees(repoPath));
   ipcMain.handle('git:diff', (_event, repoPath: string, filePath?: string, mode?: GitDiffMode) =>
@@ -2083,11 +2474,19 @@ export function registerGitIpcHandlers() {
   );
   ipcMain.handle(
     'git:commitDiff',
-    (_event, repoPath: string, commitHash: string, parentHash?: string | null) =>
-      getCommitDiff(repoPath, commitHash, parentHash),
+    (_event, repoPath: string, commitHash: string, parentHash?: string | null, filePath?: string | null) =>
+      getCommitDiff(repoPath, commitHash, parentHash, filePath),
   );
-  ipcMain.handle('git:log', (_event, repoPath: string, limit?: number) =>
-    getLog(repoPath, limit),
+  ipcMain.handle('git:log', (_event, repoPath: string, request?: GitLogRequest) =>
+    getLog(repoPath, request),
+  );
+  ipcMain.handle('git:commitDetail', (_event, repoPath: string, commitHash: string) =>
+    getCommitDetail(repoPath, commitHash),
+  );
+  ipcMain.handle(
+    'git:updateCommitMessage',
+    (_event, repoPath: string, commitHash: string, message: string) =>
+      updateCommitMessage(repoPath, commitHash, message),
   );
   ipcMain.handle('git:stage', (_event, repoPath: string, files: string[]) =>
     stageFiles(repoPath, files),

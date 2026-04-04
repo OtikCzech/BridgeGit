@@ -81,10 +81,18 @@ interface PartialWorkspaceCodeTabState {
   fontSize?: number;
 }
 
+interface PartialWorkspaceSearchTabState {
+  id?: string;
+  type?: 'search';
+  title?: string;
+  query?: string;
+}
+
 type PartialWorkspaceTabState =
   | PartialWorkspaceShellTabState
   | PartialWorkspaceNoteTabState
-  | PartialWorkspaceCodeTabState;
+  | PartialWorkspaceCodeTabState
+  | PartialWorkspaceSearchTabState;
 
 interface PartialWorkspaceSessionState {
   tabs?: PartialWorkspaceTabState[];
@@ -111,6 +119,7 @@ interface PartialWorkspaceRepoPanelFilesState {
   viewMode?: RepoPanelFileListMode;
   showAll?: boolean;
   collapsedSections?: Partial<Record<RepoPanelSectionId, boolean>>;
+  expandedDirectories?: string[];
 }
 
 interface PartialWorkspaceRepoPanelState {
@@ -505,6 +514,10 @@ function normalizeWorkspaceTabs(
       continue;
     }
 
+    if (tab.type === 'search') {
+      continue;
+    }
+
     const shellTab = tab as PartialWorkspaceShellTabState;
 
     normalizedTabs.push({
@@ -816,6 +829,15 @@ function normalizeRepoPanelSectionState(
 function normalizeWorkspaceRepoPanelState(
   workspaceRepoPanelState: PartialWorkspaceRepoPanelState | undefined,
 ): WorkspaceRepoPanelState {
+  const expandedDirectories = Array.isArray(workspaceRepoPanelState?.files?.expandedDirectories)
+    ? [...new Set(
+      workspaceRepoPanelState.files.expandedDirectories
+        .filter((path): path is string => typeof path === 'string')
+        .map((path) => path.replace(/\\/g, '/').trim())
+        .filter(Boolean),
+    )].sort((left, right) => left.localeCompare(right, undefined, { numeric: true, sensitivity: 'base' }))
+    : [];
+
   return {
     fontSize: normalizeNoteFontSize(workspaceRepoPanelState?.fontSize),
     historyOpen: workspaceRepoPanelState?.historyOpen ?? false,
@@ -826,6 +848,7 @@ function normalizeWorkspaceRepoPanelState(
       viewMode: workspaceRepoPanelState?.files?.viewMode === 'tree' ? 'tree' : 'list',
       showAll: workspaceRepoPanelState?.files?.showAll ?? false,
       collapsedSections: normalizeRepoPanelSectionState(workspaceRepoPanelState?.files?.collapsedSections),
+      expandedDirectories,
     },
   };
 }
