@@ -9,6 +9,7 @@ import type {
   GitLogScope,
 } from '../../shared/bridgegit';
 import { SHORTCUTS, matchesShortcut } from '../shortcuts';
+import AppConfirmDialog from './AppConfirmDialog.vue';
 import DiffViewer from './DiffViewer.vue';
 import GitHistoryGraph from './GitHistoryGraph.vue';
 
@@ -25,8 +26,10 @@ interface Props {
   currentBranch: string;
   repoPath: string | null;
   isLoading: boolean;
+  availableCommitCount: number | null;
   hasMoreCommits: boolean;
   isLoadingMoreCommits: boolean;
+  paginationMode: 'more' | 'all' | null;
   commitDetail: GitCommitDetail | null;
   isUpdatingCommitMessage: boolean;
   isLoadingCommitDetail: boolean;
@@ -47,6 +50,7 @@ const emit = defineEmits<{
   'select-scope': [scope: GitLogScope];
   'search-query-change': [query: string];
   'load-more-commits': [];
+  'load-all-commits': [];
   'update-commit-message': [payload: { commitHash: string; message: string }];
   'open-diff': [commit: GitLogEntry];
   'preview-diff-file': [payload: { commit: GitLogEntry; filePath: string }];
@@ -56,6 +60,7 @@ const emit = defineEmits<{
 }>();
 
 type ChangedFileViewMode = 'list' | 'tree';
+const LARGE_HISTORY_CONFIRM_THRESHOLD = 1000;
 
 interface ChangedFileTreeRow {
   type: 'directory' | 'file';
@@ -78,6 +83,7 @@ const isResizingSidebarPane = ref(false);
 const previewHeight = ref(320);
 const isResizingPreviewPane = ref(false);
 const previewViewMode = ref<'side-by-side' | 'line-by-line'>('side-by-side');
+const showLoadAllWarning = ref(false);
 let sidebarResizePointerId: number | null = null;
 let sidebarResizeStartX = 0;
 let sidebarResizeStartWidth = 320;
@@ -94,7 +100,12 @@ const detailDateFormatter = new Intl.DateTimeFormat('en', {
 });
 
 function closeDialog() {
+  showLoadAllWarning.value = false;
   emit('update:modelValue', false);
+}
+
+function closeLoadAllWarning() {
+  showLoadAllWarning.value = false;
 }
 
 function toggleScopeMenu() {
@@ -392,9 +403,69 @@ const canSelectNextPreviewFile = computed(() => (
 ));
 const commitCountLabel = computed(() => (
   props.historyQuery.trim()
-    ? `${props.commits.length.toLocaleString()} shown`
-    : `${props.commits.length.toLocaleString()} commits`
+    ? `${props.commits.length.toLocaleString()} / ${(props.availableCommitCount ?? props.commits.length).toLocaleString()} shown`
+    : props.availableCommitCount !== null
+      ? `${props.commits.length.toLocaleString()} / ${props.availableCommitCount.toLocaleString()} commits`
+      : `${props.commits.length.toLocaleString()} commits`
 ));
+const historyFooterLabel = computed(() => (
+  props.availableCommitCount !== null
+    ? `${props.commits.length.toLocaleString()} of ${props.availableCommitCount.toLocaleString()} commits loaded`
+    : `${props.commits.length.toLocaleString()} commits loaded`
+));
+const historyFooterStatusLabel = computed(() => {
+  if (!props.isLoadingMoreCommits) {
+    return historyFooterLabel.value;
+  }
+
+  if (props.availableCommitCount !== null) {
+    const action = props.paginationMode === 'all' ? 'Loading all commits' : 'Loading more commits';
+    return `${action}... ${props.commits.length.toLocaleString()} / ${props.availableCommitCount.toLocaleString()}`;
+  }
+
+  return props.paginationMode === 'all' ? 'Loading all commits...' : 'Loading more commits...';
+});
+const loadMoreLabel = computed(() => {
+  if (props.isLoadingMoreCommits && props.paginationMode === 'more') {
+    return 'Loading...';
+  }
+
+  return props.availableCommitCount !== null
+    ? `Load Next ${Math.min(100, Math.max(props.availableCommitCount - props.commits.length, 0)).toLocaleString()}`
+    : 'Load More';
+});
+const loadAllLabel = computed(() => {
+  if (props.isLoadingMoreCommits && props.paginationMode === 'all') {
+    return 'Loading all...';
+  }
+
+  if (props.availableCommitCount !== null) {
+    const remainingCount = Math.max(props.availableCommitCount - props.commits.length, 0);
+    return remainingCount > 0 ? `Load All ${remainingCount.toLocaleString()} Remaining` : 'Load All';
+  }
+
+  return 'Load All';
+});
+const remainingCommitCount = computed(() => (
+  props.availableCommitCount !== null
+    ? Math.max(props.availableCommitCount - props.commits.length, 0)
+    : 0
+));
+const loadAllWarningCopy = computed(() => (
+  `This will load the remaining ${remainingCommitCount.value.toLocaleString()} commits into the history view. `
+  + 'In very large repositories this may take a while and make the dialog heavier to render.'
+));
+const loadAllWarningActions = computed(() => ([
+  {
+    id: 'confirm',
+    label: `Load ${remainingCommitCount.value.toLocaleString()} commits`,
+    tone: 'danger' as const,
+  },
+  {
+    id: 'cancel',
+    label: 'Cancel',
+  },
+]));
 const panelStyle = computed(() => ({
   '--commit-history-sidebar-width': `${sidebarPaneWidth.value}px`,
   '--commit-history-font-size-px': String(props.workspacePanelFontSize),
@@ -412,6 +483,33 @@ function openSelectedCommitDiff() {
   }
 
   emit('open-diff', selectedCommit.value);
+}
+
+function handleLoadAllCommits() {
+  if (props.isLoadingMoreCommits) {
+    return;
+  }
+
+  if (remainingCommitCount.value > LARGE_HISTORY_CONFIRM_THRESHOLD) {
+    showLoadAllWarning.value = true;
+    return;
+  }
+
+  emit('load-all-commits');
+}
+
+function confirmLoadAllCommits() {
+  showLoadAllWarning.value = false;
+  emit('load-all-commits');
+}
+
+function handleLoadAllWarningAction(actionId: string) {
+  if (actionId === 'confirm') {
+    confirmLoadAllCommits();
+    return;
+  }
+
+  closeLoadAllWarning();
 }
 
 function handleOpenCommitHash(commitHash: string) {
@@ -554,6 +652,12 @@ async function handleGlobalKeydown(event: KeyboardEvent) {
     return;
   }
 
+  if (event.key === 'Escape' && showLoadAllWarning.value) {
+    event.preventDefault();
+    closeLoadAllWarning();
+    return;
+  }
+
   if (event.key === 'Escape' && isScopeMenuOpen.value) {
     event.preventDefault();
     closeScopeMenu();
@@ -628,6 +732,7 @@ watch(
   async (isOpen) => {
     if (!isOpen) {
       closeScopeMenu();
+      closeLoadAllWarning();
       isEditingMessage.value = false;
 
       if (hasPreviewPanel.value) {
@@ -1069,13 +1174,29 @@ watch(
                 />
 
                 <div v-if="hasMoreCommits || isLoadingMoreCommits" class="commit-history-dialog__history-footer">
+                  <span class="commit-history-dialog__history-footer-count">
+                    <span
+                      v-if="isLoadingMoreCommits"
+                      class="commit-history-dialog__history-spinner"
+                      aria-hidden="true"
+                    />
+                    {{ historyFooterStatusLabel }}
+                  </span>
                   <button
                     class="commit-history-dialog__action-button"
                     type="button"
                     :disabled="isLoadingMoreCommits"
                     @click="emit('load-more-commits')"
                   >
-                    {{ isLoadingMoreCommits ? 'Loading…' : 'Load More' }}
+                    {{ loadMoreLabel }}
+                  </button>
+                  <button
+                    class="commit-history-dialog__action-button"
+                    type="button"
+                    :disabled="isLoadingMoreCommits"
+                    @click="handleLoadAllCommits"
+                  >
+                    {{ loadAllLabel }}
                   </button>
                 </div>
               </section>
@@ -1147,6 +1268,17 @@ watch(
           </section>
         </div>
       </section>
+
+      <AppConfirmDialog
+        :model-value="showLoadAllWarning"
+        dialog-label="Confirm loading all commits"
+        eyebrow="Large History"
+        title="Load all remaining commits?"
+        :copy="loadAllWarningCopy"
+        :actions="loadAllWarningActions"
+        @update:model-value="closeLoadAllWarning"
+        @action="handleLoadAllWarningAction"
+      />
     </div>
   </teleport>
 </template>
@@ -1566,8 +1698,38 @@ watch(
 
 .commit-history-dialog__history-footer {
   display: flex;
+  align-items: center;
   justify-content: center;
+  gap: 10px;
   padding-top: 2px;
+  flex-wrap: wrap;
+}
+
+.commit-history-dialog__history-footer-count {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-muted);
+  font-size: calc(0.72rem * var(--commit-history-scale));
+}
+
+.commit-history-dialog__history-spinner {
+  width: 0.85rem;
+  height: 0.85rem;
+  border: 2px solid rgba(124, 147, 182, 0.24);
+  border-top-color: rgba(124, 147, 182, 0.95);
+  border-radius: 999px;
+  animation: commit-history-dialog-spin 0.8s linear infinite;
+}
+
+@keyframes commit-history-dialog-spin {
+  from {
+    transform: rotate(0deg);
+  }
+
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .commit-history-dialog__preview-splitter {

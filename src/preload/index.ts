@@ -13,6 +13,8 @@ import type {
   GitStatusRequestOptions,
   GitStatusSummary,
   GitTextSearchMatch,
+  GitTextReplaceRequest,
+  GitTextReplaceResult,
   GitTextSearchOptions,
   GitWorktreeSummary,
   MergeWorktreeIntoPrimaryBranchResult,
@@ -82,6 +84,8 @@ const bridgegitApi = {
       ipcRenderer.invoke('git:searchFiles', repoPath, query, limit) as Promise<string[]>,
     searchText: (repoPath: string, query: string, limit?: number, options?: GitTextSearchOptions) =>
       ipcRenderer.invoke('git:searchText', repoPath, query, limit, options) as Promise<GitTextSearchMatch[]>,
+    replaceText: (repoPath: string, request: GitTextReplaceRequest) =>
+      ipcRenderer.invoke('git:replaceText', repoPath, request) as Promise<GitTextReplaceResult>,
     worktrees: (repoPath: string) =>
       ipcRenderer.invoke('git:worktrees', repoPath) as Promise<GitWorktreeSummary[]>,
     diff: (repoPath: string, filePath?: string, mode?: GitDiffMode) =>

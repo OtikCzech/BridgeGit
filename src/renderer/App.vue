@@ -85,6 +85,7 @@ const terminalPanelRef = ref<{
   openAllTabsDialog: () => void;
   openQuickOpenDialog: () => void;
   openFindInFilesDialog: () => void;
+  openFindInFilesDialogInMode: (mode: 'find' | 'replace') => void;
   openCreationMenu: () => void;
   openFile: () => Promise<unknown>;
   openNoteFilePath: (filePath: string) => Promise<unknown>;
@@ -178,6 +179,7 @@ const {
   historyScope,
   historyQuery,
   hasMoreHistoryCommits,
+  historyPaginationMode,
   selectedHistoryCommitHash,
   commitDetail,
   selectedPath,
@@ -204,6 +206,7 @@ const {
   refresh: refreshRepoStatus,
   loadLog,
   loadMoreLog,
+  loadAllLog,
   selectHistoryCommit,
   updateCommitMessage,
   setRepoPath,
@@ -2555,6 +2558,10 @@ async function handleLoadMoreHistoryCommits() {
   await loadMoreLog();
 }
 
+async function handleLoadAllHistoryCommits() {
+  await loadAllLog();
+}
+
 async function handleUpdateHistoryCommitMessage(payload: { commitHash: string; message: string }) {
   await updateCommitMessage(payload.commitHash, payload.message);
 }
@@ -2656,6 +2663,23 @@ function handleGlobalKeydown(event: KeyboardEvent) {
     }
 
     terminalPanelRef.value?.openFindInFilesDialog();
+    return;
+  }
+
+  if (
+    matchesShortcut(event, SHORTCUTS.workspaceReplaceInFiles)
+    && sessionReady.value
+    && !isSettingsOpen.value
+    && !isCommitHistoryOpen.value
+  ) {
+    event.preventDefault();
+
+    if (terminalCollapsed.value) {
+      terminalCollapsed.value = false;
+      scheduleSessionSave();
+    }
+
+    terminalPanelRef.value?.openFindInFilesDialogInMode('replace');
     return;
   }
 
@@ -3501,8 +3525,10 @@ onBeforeUnmount(() => {
       :current-branch="branch"
       :repo-path="repoPath"
       :is-loading="isLoadingLog"
+      :available-commit-count="log?.availableTotal ?? null"
       :has-more-commits="hasMoreHistoryCommits"
       :is-loading-more-commits="isLoadingMoreHistoryCommits"
+      :pagination-mode="historyPaginationMode"
       :commit-detail="commitDetail"
       :is-updating-commit-message="isUpdatingCommitMessage"
       :is-loading-commit-detail="isLoadingCommitDetail"
@@ -3517,6 +3543,7 @@ onBeforeUnmount(() => {
       @select-scope="handleSelectHistoryScope"
       @search-query-change="handleHistorySearchQueryChange"
       @load-more-commits="handleLoadMoreHistoryCommits"
+      @load-all-commits="handleLoadAllHistoryCommits"
       @update-commit-message="handleUpdateHistoryCommitMessage"
       @open-diff="handleOpenCommitDiff"
       @preview-diff-file="handlePreviewCommitFileDiff"

@@ -2,13 +2,13 @@
 
 This note is the default place for release updates and small product messages inside BridgeGit.
 
-## New in 0.5.0
+## New in 0.5.1
 
-- rebuilt repository history browser with stronger preview flow
-- `Quick Open` and `Find in files` for faster workspace navigation
-- better `All files` browsing with reveal-active-file, type-to-select and persistent tree state
-- safer shell tab close behavior with clearer attention cues
-- improved session restore and Windows packaging polish
+- `Replace in Files` now builds directly on the workspace search overlay with `Ctrl+Shift+H`
+- replace one match, all shown matches in the current file, or all shown matches across the repo
+- keep the existing preview, file filter and tracked/untracked scope while replacing
+- refresh open clean tabs and search results after replace so the workspace stays in sync
+- continue with the same repo, editor and session workflow introduced in `0.5.0`
 
 ## Quick Start
 

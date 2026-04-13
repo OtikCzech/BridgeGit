@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.5.1 - 2026-04-13
+
+Search follow-up release focused on finishing workspace text replacement and smoothing the release handoff.
+
+- Added `Replace in Files` on top of the existing workspace search overlay with `Ctrl+Shift+H`
+- Reused current search results, preview, file filtering and tracked/untracked scope for replace actions
+- Added replace selected, replace in document and replace all flows with confirmation for broader changes
+- Refreshed affected tabs and search results after replace to keep editor and overlay state in sync
+- Polished the workspace search flow and prepared the next round of repo and workspace improvements
+
 ## v0.5.0 - 2026-04-04
 
 Workspace navigation and history release focused on moving through larger repos faster while keeping shell workflows smoother.

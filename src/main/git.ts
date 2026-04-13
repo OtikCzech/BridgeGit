@@ -24,6 +24,8 @@ import {
   GitLogResult,
   GitStatusRequestOptions,
   GitStatusSummary,
+  GitTextReplaceRequest,
+  GitTextReplaceResult,
   GitTextSearchMatch,
   GitTextSearchOptions,
   GitWorktreeSummary,
@@ -1455,6 +1457,131 @@ async function searchText(
   }
 }
 
+function buildTextReplaceMatchKey(match: GitTextSearchMatch) {
+  return `${normalizeSearchPath(match.path)}:${match.line}:${match.column}`;
+}
+
+async function replaceText(
+  repoPath: string,
+  request: GitTextReplaceRequest,
+): Promise<GitTextReplaceResult> {
+  const repoRoot = resolveRepoPath(repoPath);
+  const query = request.query;
+  const replacement = request.replacement ?? '';
+  const requestedMatches = Array.isArray(request.matches) ? request.matches : [];
+
+  if (!query) {
+    throw new Error('Replace query cannot be empty.');
+  }
+
+  if (!requestedMatches.length) {
+    return {
+      requestedCount: 0,
+      replacedCount: 0,
+      skippedCount: 0,
+      affectedFiles: [],
+    };
+  }
+
+  const dedupedMatches = [...new Map(
+    requestedMatches
+      .filter((match) => (
+        typeof match?.path === 'string'
+        && typeof match?.line === 'number'
+        && typeof match?.column === 'number'
+      ))
+      .map((match) => {
+        const normalizedPath = normalizeSearchPath(match.path);
+
+        return [
+          `${normalizedPath}:${match.line}:${match.column}`,
+          {
+            ...match,
+            path: normalizedPath,
+          } satisfies GitTextSearchMatch,
+        ] as const;
+      }),
+  ).values()];
+
+  const matchesByPath = new Map<string, GitTextSearchMatch[]>();
+
+  for (const match of dedupedMatches) {
+    if (!match.path || match.path.startsWith('../')) {
+      continue;
+    }
+
+    const fileMatches = matchesByPath.get(match.path) ?? [];
+    fileMatches.push(match);
+    matchesByPath.set(match.path, fileMatches);
+  }
+
+  let replacedCount = 0;
+  const affectedFiles = new Set<string>();
+
+  for (const [relativePath, fileMatches] of matchesByPath) {
+    const absolutePath = join(repoRoot, relativePath);
+    let originalContent: string;
+
+    try {
+      originalContent = await readFile(absolutePath, 'utf8');
+    } catch {
+      continue;
+    }
+
+    if (originalContent.includes('\0')) {
+      continue;
+    }
+
+    const newline = originalContent.includes('\r\n') ? '\r\n' : '\n';
+    const normalizedContent = originalContent.replace(/\r\n/g, '\n');
+    const lines = normalizedContent.split('\n');
+    let fileReplacedCount = 0;
+
+    const sortedMatches = [...fileMatches].sort((left, right) => (
+      right.line - left.line
+      || right.column - left.column
+      || buildTextReplaceMatchKey(right).localeCompare(buildTextReplaceMatchKey(left))
+    ));
+
+    for (const match of sortedMatches) {
+      const lineIndex = match.line - 1;
+
+      if (lineIndex < 0 || lineIndex >= lines.length) {
+        continue;
+      }
+
+      const lineText = lines[lineIndex] ?? '';
+      const startIndex = match.column - 1;
+
+      if (startIndex < 0 || startIndex > lineText.length) {
+        continue;
+      }
+
+      if (lineText.slice(startIndex, startIndex + query.length) !== query) {
+        continue;
+      }
+
+      lines[lineIndex] = `${lineText.slice(0, startIndex)}${replacement}${lineText.slice(startIndex + query.length)}`;
+      fileReplacedCount += 1;
+    }
+
+    if (!fileReplacedCount) {
+      continue;
+    }
+
+    await writeFile(absolutePath, lines.join(newline), 'utf8');
+    replacedCount += fileReplacedCount;
+    affectedFiles.add(normalizeDiffPath(absolutePath));
+  }
+
+  return {
+    requestedCount: dedupedMatches.length,
+    replacedCount,
+    skippedCount: Math.max(0, dedupedMatches.length - replacedCount),
+    affectedFiles: [...affectedFiles].sort((left, right) => left.localeCompare(right, undefined, { numeric: true, sensitivity: 'base' })),
+  };
+}
+
 async function getWorktrees(repoPath: string): Promise<GitWorktreeSummary[]> {
   const repository = await resolveRepository(repoPath);
   const currentRepoPath = resolveRepoPath(repoPath);
@@ -1830,6 +1957,13 @@ function commitMatchesLogQuery(commit: GitLogEntry, query: string): boolean {
   return haystack.includes(query);
 }
 
+async function countLogCommits(repository: RepositoryContext, scopeArgs: string[]): Promise<number> {
+  const rawCount = await runGit(repository, ['rev-list', '--count', ...scopeArgs]);
+  const parsedCount = Number.parseInt(rawCount.trim(), 10);
+
+  return Number.isFinite(parsedCount) && parsedCount >= 0 ? parsedCount : 0;
+}
+
 async function getLog(repoPath: string, request: GitLogRequest = {}): Promise<GitLogResult> {
   const repository = await resolveRepository(repoPath);
   const scopeArgs = resolveLogScopeArgs(request.scope);
@@ -1899,15 +2033,24 @@ async function getLog(repoPath: string, request: GitLogRequest = {}): Promise<Gi
     const filteredItems = normalizedQuery
       ? parsedItems.filter((commit) => commitMatchesLogQuery(commit, normalizedQuery))
       : parsedItems;
+    const availableTotal = normalizedQuery
+      ? filteredItems.length
+      : await countLogCommits(repository, scopeArgs);
     const slicedItems = normalizedLimit
-      ? filteredItems.slice(normalizedOffset, normalizedOffset + normalizedLimit)
+      ? filteredItems.slice(
+        normalizedQuery ? normalizedOffset : 0,
+        normalizedQuery ? normalizedOffset + normalizedLimit : normalizedLimit,
+      )
       : filteredItems;
     const hasMore = normalizedLimit
-      ? filteredItems.length > normalizedOffset + normalizedLimit
+      ? (normalizedQuery
+        ? filteredItems.length > normalizedOffset + normalizedLimit
+        : filteredItems.length > normalizedLimit)
       : false;
 
     return {
       total: slicedItems.length,
+      availableTotal,
       items: slicedItems,
       hasMore,
       offset: normalizedOffset,
@@ -1922,6 +2065,7 @@ async function getLog(repoPath: string, request: GitLogRequest = {}): Promise<Gi
     ) {
       return {
         total: 0,
+        availableTotal: 0,
         items: [],
         hasMore: false,
         offset: normalizedOffset,
@@ -2467,6 +2611,11 @@ export function registerGitIpcHandlers() {
     'git:searchText',
     (_event, repoPath: string, query: string, limit?: number, options?: GitTextSearchOptions) =>
       searchText(repoPath, query, limit, options),
+  );
+  ipcMain.handle(
+    'git:replaceText',
+    (_event, repoPath: string, request: GitTextReplaceRequest) =>
+      replaceText(repoPath, request),
   );
   ipcMain.handle('git:worktrees', (_event, repoPath: string) => getWorktrees(repoPath));
   ipcMain.handle('git:diff', (_event, repoPath: string, filePath?: string, mode?: GitDiffMode) =>

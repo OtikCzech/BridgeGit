@@ -39,6 +39,7 @@ interface LoadLogOptions {
   query?: string;
   append?: boolean;
   preserveSelection?: boolean;
+  loadAll?: boolean;
 }
 
 interface RepoStateCacheEntry {
@@ -48,6 +49,7 @@ interface RepoStateCacheEntry {
 
 const HISTORY_PAGE_SIZE = 100;
 const SILENT_REFRESH_FAILURES_BEFORE_ERROR = 2;
+type HistoryPaginationMode = 'more' | 'all' | null;
 
 function extractRawErrorMessage(error: unknown): string {
   if (error instanceof Error) {
@@ -164,6 +166,7 @@ export function useGit() {
   const historyScope = ref<GitLogScope>({ kind: 'all' });
   const historyQuery = ref('');
   const hasMoreHistoryCommits = ref(false);
+  const historyPaginationMode = ref<HistoryPaginationMode>(null);
   const selectedHistoryCommitHash = ref<string | null>(null);
   const commitDetail = ref<GitCommitDetail | null>(null);
   const selectedPath = ref<string | null>(null);
@@ -1108,6 +1111,7 @@ export function useGit() {
     const append = options.append === true && !scopeChanged && !queryChanged;
     const previousItems = append ? (log.value?.items ?? []) : [];
     const nextOffset = append ? previousItems.length : 0;
+    const limit = options.loadAll === true ? undefined : HISTORY_PAGE_SIZE;
     const shouldPreserveSelection = options.preserveSelection === true;
 
     historyScope.value = nextScope;
@@ -1121,15 +1125,17 @@ export function useGit() {
       clearCommitDetailState();
     }
 
-    if (append) {
+    if (append || options.loadAll === true) {
+      historyPaginationMode.value = options.loadAll === true ? 'all' : 'more';
       isLoadingMoreHistoryCommits.value = true;
     } else {
+      historyPaginationMode.value = null;
       isLoadingLog.value = true;
     }
 
     try {
       const nextLog = await window.bridgegit.git.log(request.repoPath!, {
-        limit: HISTORY_PAGE_SIZE,
+        limit,
         offset: nextOffset,
         query: nextQuery,
         scope: nextScope,
@@ -1184,6 +1190,7 @@ export function useGit() {
       if (isRepoRequestCurrent(request) && requestVersion === logRequestVersion) {
         isLoadingLog.value = false;
         isLoadingMoreHistoryCommits.value = false;
+        historyPaginationMode.value = null;
       }
     }
   }
@@ -1199,6 +1206,17 @@ export function useGit() {
     });
   }
 
+  async function loadAllLog() {
+    if (!hasMoreHistoryCommits.value || isLoadingMoreHistoryCommits.value) {
+      return null;
+    }
+
+    return loadLog({
+      loadAll: true,
+      preserveSelection: true,
+    });
+  }
+
   return {
     repoPath,
     status,
@@ -1207,6 +1225,7 @@ export function useGit() {
     historyScope,
     historyQuery,
     hasMoreHistoryCommits,
+    historyPaginationMode,
     selectedHistoryCommitHash,
     commitDetail,
     selectedPath,
@@ -1234,6 +1253,7 @@ export function useGit() {
     refresh,
     loadLog,
     loadMoreLog,
+    loadAllLog,
     selectHistoryCommit,
     updateCommitMessage,
     setRepoPath,

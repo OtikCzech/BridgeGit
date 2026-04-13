@@ -3808,11 +3808,7 @@ onBeforeUnmount(() => {
                       </div>
                     </div>
 
-                    <p v-if="isSectionCollapsed(section.id)" class="repo-panel__group-collapsed-copy">
-                      {{ sectionCollapsedCopy(section) }}
-                    </p>
-
-                    <ul v-else-if="fileListMode === 'list'" class="repo-panel__files">
+                    <ul v-if="!isSectionCollapsed(section.id) && fileListMode === 'list'" class="repo-panel__files">
                       <li
                         v-for="item in sortedItemsBySection[section.id]"
                         :key="`${item.type}:${item.path}`"
@@ -3836,7 +3832,7 @@ onBeforeUnmount(() => {
                       </li>
                     </ul>
 
-                    <ul v-else class="repo-panel__tree">
+                    <ul v-else-if="!isSectionCollapsed(section.id)" class="repo-panel__tree">
                       <li
                         v-for="row in treeRowsBySection[section.id]"
                         :key="`${row.type}:${row.path}`"

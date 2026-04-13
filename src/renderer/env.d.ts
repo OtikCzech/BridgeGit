@@ -14,6 +14,8 @@ import type {
   GitStatusRequestOptions,
   GitStatusSummary,
   GitTextSearchMatch,
+  GitTextReplaceRequest,
+  GitTextReplaceResult,
   GitTextSearchOptions,
   GitWorktreeSummary,
   MergeWorktreeIntoPrimaryBranchResult,
@@ -77,6 +79,10 @@ declare global {
           limit?: number,
           options?: GitTextSearchOptions,
         ) => Promise<GitTextSearchMatch[]>;
+        replaceText: (
+          repoPath: string,
+          request: GitTextReplaceRequest,
+        ) => Promise<GitTextReplaceResult>;
         worktrees: (repoPath: string) => Promise<GitWorktreeSummary[]>;
         diff: (repoPath: string, filePath?: string, mode?: GitDiffMode) => Promise<string>;
         commitDiff: (

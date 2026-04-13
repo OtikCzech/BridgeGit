@@ -36,6 +36,7 @@ import {
 } from '../../shared/bridgegit';
 import { SHORTCUTS, formatCommandSlotShortcut } from '../shortcuts';
 import { playNotificationBeep } from '../utils/notification-audio';
+import AppConfirmDialog from './AppConfirmDialog.vue';
 import NoteTabView from './NoteTabView.vue';
 import TerminalSessionView from './TerminalSessionView.vue';
 
@@ -69,6 +70,7 @@ interface Props {
 
 const props = defineProps<Props>();
 const CREATION_MENU_ACTION_ORDER = ['shell', 'note', 'open-file'] as const;
+type FindInFilesMode = 'find' | 'replace';
 type CreationMenuActionId = (typeof CREATION_MENU_ACTION_ORDER)[number];
 const ALL_TABS_TYPE_FILTER_OPTIONS = [
   { value: 'all', label: 'All' },
@@ -101,6 +103,9 @@ const editingInput = ref<HTMLInputElement | null>(null);
 const allTabsSearchInput = ref<HTMLInputElement | null>(null);
 const quickOpenSearchInput = ref<HTMLInputElement | null>(null);
 const findInFilesSearchInput = ref<HTMLInputElement | null>(null);
+const findInFilesReplaceInput = ref<HTMLInputElement | null>(null);
+const findInFilesPreviewEditor = ref<HTMLElement | null>(null);
+const findInFilesPreviewMatchLineText = ref<HTMLElement | null>(null);
 const reconnectTokens = ref<Record<string, number>>({});
 const tabMenu = ref<{ tabId: string; x: number; y: number } | null>(null);
 const creationMenu = ref<{ x: number; y: number } | null>(null);
@@ -118,13 +123,17 @@ const quickOpenTotalResultCount = ref(0);
 const quickOpenSelectedPath = ref<string | null>(null);
 const quickOpenError = ref<string | null>(null);
 const isSearchingQuickOpen = ref(false);
+const findInFilesMode = ref<FindInFilesMode>('find');
 const findInFilesSearchQuery = ref('');
+const findInFilesReplaceQuery = ref('');
 const findInFilesFileFilter = ref('');
 const findInFilesIncludeUntracked = ref(false);
 const findInFilesResults = ref<GitTextSearchMatch[]>([]);
 const findInFilesSelectedMatchKey = ref<string | null>(null);
 const findInFilesError = ref<string | null>(null);
 const isSearchingFindInFiles = ref(false);
+const isReplacingFindInFiles = ref(false);
+const findInFilesReplaceSummary = ref<string | null>(null);
 const findInFilesPreviewPath = ref<string | null>(null);
 const findInFilesPreviewMatchLine = ref<number | null>(null);
 const findInFilesPreviewLines = ref<Array<{ lineNumber: number; text: string; isMatchLine: boolean }>>([]);
@@ -157,7 +166,14 @@ type PendingCloseDialogState = {
   shellAttentionCount: number;
   shellActivityCount: number;
 };
+type PendingFindInFilesReplaceDialogState = {
+  matches: GitTextSearchMatch[];
+  matchCount: number;
+  fileCount: number;
+  scope: 'document' | 'all';
+};
 const pendingCloseDialog = ref<PendingCloseDialogState | null>(null);
+const pendingFindInFilesReplaceDialog = ref<PendingFindInFilesReplaceDialogState | null>(null);
 const creationButtonRef = ref<HTMLElement | null>(null);
 const allTabsFilterButtonRef = ref<HTMLElement | null>(null);
 const creationMenuActiveActionId = ref<CreationMenuActionId>('shell');
@@ -205,6 +221,12 @@ const menuTab = computed(() => (
 const findInFilesDialogStyle = computed(() => ({
   '--terminal-panel-find-result-font-size-px': String(normalizeNoteFontSize(props.workspaceTabDefaults.noteFontSize)),
 }));
+const findInFilesDialogTitle = computed(() => (
+  findInFilesMode.value === 'replace' ? 'Replace in Files' : 'Find in Files'
+));
+const findInFilesDialogLabel = computed(() => (
+  findInFilesMode.value === 'replace' ? 'Replace in files' : 'Find in files'
+));
 const sortedPresets = computed(() => (
   [...props.presets].sort((left, right) => {
     const leftSlot = left.shortcutSlot ?? Number.MAX_SAFE_INTEGER;
@@ -408,6 +430,70 @@ const pendingCloseDialogDiscardLabel = computed(() => {
 
   return dialog.mode === 'bulk' || dialog.kind === 'shell' ? 'Close anyway' : 'Discard';
 });
+const pendingCloseDialogActions = computed(() => {
+  const actions: Array<{ id: string; label: string; tone?: 'default' | 'primary' | 'danger' }> = [];
+
+  if (pendingCloseDialogCanSave.value) {
+    actions.push({
+      id: 'save',
+      label: pendingCloseDialogSaveLabel.value,
+      tone: 'primary',
+    });
+
+    if (pendingCloseDialogCanSaveAs.value) {
+      actions.push({
+        id: 'saveAs',
+        label: 'Save As',
+      });
+    }
+  }
+
+  actions.push({
+    id: 'discard',
+    label: pendingCloseDialogDiscardLabel.value,
+    tone: 'danger',
+  });
+  actions.push({
+    id: 'cancel',
+    label: 'Cancel',
+  });
+
+  return actions;
+});
+const pendingFindInFilesReplaceDialogTitle = computed(() => {
+  const dialog = pendingFindInFilesReplaceDialog.value;
+
+  if (!dialog) {
+    return '';
+  }
+
+  return dialog.scope === 'document'
+    ? 'Replace in document?'
+    : 'Replace all?';
+});
+const pendingFindInFilesReplaceDialogCopy = computed(() => {
+  const dialog = pendingFindInFilesReplaceDialog.value;
+
+  if (!dialog) {
+    return '';
+  }
+
+  const matchLabel = dialog.matchCount === 1 ? 'match' : 'matches';
+  const fileLabel = dialog.fileCount === 1 ? 'file' : 'files';
+
+  return `${dialog.matchCount} ${matchLabel} in ${dialog.fileCount} ${fileLabel}.`;
+});
+const pendingFindInFilesReplaceDialogActions = computed(() => ([
+  {
+    id: 'confirm',
+    label: 'Replace',
+    tone: 'danger' as const,
+  },
+  {
+    id: 'cancel',
+    label: 'Cancel',
+  },
+]));
 const quickOpenProjectKey = computed(() => getQuickOpenProjectKey());
 const quickOpenRecentQueries = computed(() => {
   const projectKey = quickOpenProjectKey.value;
@@ -518,6 +604,14 @@ const findInFilesVisibleItems = computed(() => {
   }));
 });
 const findInFilesMeta = computed(() => {
+  if (findInFilesError.value) {
+    return findInFilesError.value;
+  }
+
+  if (findInFilesReplaceSummary.value) {
+    return findInFilesReplaceSummary.value;
+  }
+
   if (!props.projectRoot) {
     return 'Open a repository to search text across files.';
   }
@@ -540,6 +634,34 @@ const findInFilesMeta = computed(() => {
 });
 const findInFilesScopeLabel = computed(() => (
   findInFilesIncludeUntracked.value ? 'With untracked' : 'Tracked only'
+));
+const canReplaceSelectedFindInFilesMatch = computed(() => (
+  findInFilesMode.value === 'replace'
+  && Boolean(selectedFindInFilesMatch.value)
+  && Boolean(findInFilesSearchQuery.value.trim())
+  && !isReplacingFindInFiles.value
+));
+const selectedFindInFilesMatchPath = computed(() => selectedFindInFilesMatch.value?.path ?? null);
+const findInFilesVisibleResultsInSelectedMatchFile = computed(() => {
+  const currentMatchPath = selectedFindInFilesMatchPath.value;
+
+  if (!currentMatchPath) {
+    return [];
+  }
+
+  return findInFilesVisibleResults.value.filter((match) => match.path === currentMatchPath);
+});
+const canReplaceSelectedMatchFileFindInFilesMatches = computed(() => (
+  findInFilesMode.value === 'replace'
+  && findInFilesVisibleResultsInSelectedMatchFile.value.length > 0
+  && Boolean(findInFilesSearchQuery.value.trim())
+  && !isReplacingFindInFiles.value
+));
+const canReplaceAllShownFindInFilesMatches = computed(() => (
+  findInFilesMode.value === 'replace'
+  && findInFilesVisibleResults.value.length > 0
+  && Boolean(findInFilesSearchQuery.value.trim())
+  && !isReplacingFindInFiles.value
 ));
 const findInFilesEmptyState = computed(() => {
   if (findInFilesError.value) {
@@ -577,7 +699,7 @@ const findInFilesPreviewMeta = computed(() => {
     return 'Select a result to preview matching lines.';
   }
 
-  return `${findInFilesPreviewPath.value ?? selectedFindInFilesMatch.value.path} • line ${selectedFindInFilesMatch.value.line}`;
+  return `${findInFilesPreviewPath.value ?? selectedFindInFilesMatch.value.path} • line ${selectedFindInFilesMatch.value.line}:${selectedFindInFilesMatch.value.column}`;
 });
 
 function isShellTab(tab: WorkspaceTabState): tab is WorkspaceShellTabState {
@@ -1224,6 +1346,11 @@ function buildNoteTab(): WorkspaceNoteTabState {
 }
 
 function openFindInFilesDialog() {
+  openFindInFilesDialogInMode('find');
+}
+
+function openFindInFilesDialogInMode(mode: FindInFilesMode) {
+  findInFilesMode.value = mode;
   closeAllTabsDialog();
   closeQuickOpenDialog();
   closeTabMenu();
@@ -1231,7 +1358,13 @@ function openFindInFilesDialog() {
   closeCommandMenu();
   findInFilesDialogOpen.value = true;
   findInFilesError.value = null;
+  findInFilesReplaceSummary.value = null;
   isSearchingFindInFiles.value = false;
+  if (mode === 'replace' && findInFilesSearchQuery.value.trim()) {
+    focusFindInFilesReplace();
+    return;
+  }
+
   focusFindInFilesSearch();
 }
 
@@ -2868,6 +3001,10 @@ function setFindInFilesSearchInput(element: Element | ComponentPublicInstance | 
   findInFilesSearchInput.value = element as HTMLInputElement | null;
 }
 
+function setFindInFilesReplaceInput(element: Element | ComponentPublicInstance | null) {
+  findInFilesReplaceInput.value = element as HTMLInputElement | null;
+}
+
 function setAllTabsFilterButtonRef(element: Element | ComponentPublicInstance | null) {
   allTabsFilterButtonRef.value = element as HTMLElement | null;
 }
@@ -2967,6 +3104,13 @@ function focusFindInFilesSearch() {
   void nextTick(() => {
     findInFilesSearchInput.value?.focus();
     findInFilesSearchInput.value?.select();
+  });
+}
+
+function focusFindInFilesReplace() {
+  void nextTick(() => {
+    findInFilesReplaceInput.value?.focus();
+    findInFilesReplaceInput.value?.select();
   });
 }
 
@@ -3213,8 +3357,10 @@ async function runFindInFilesSearch(query: string) {
 function closeFindInFilesDialog() {
   findInFilesDialogOpen.value = false;
   findInFilesError.value = null;
+  findInFilesReplaceSummary.value = null;
   findInFilesSelectedMatchKey.value = null;
   isSearchingFindInFiles.value = false;
+  isReplacingFindInFiles.value = false;
   findInFilesPreviewPath.value = null;
   findInFilesPreviewMatchLine.value = null;
   findInFilesPreviewLines.value = [];
@@ -3315,6 +3461,13 @@ async function loadFindInFilesPreview(matchKey: string | null) {
     }
 
     findInFilesPreviewLines.value = buildFindInFilesPreviewLines(fileHandle.content, match);
+    await nextTick();
+
+    if (token !== findInFilesPreviewToken) {
+      return;
+    }
+
+    scrollFindInFilesPreviewToMatch();
   } catch (error) {
     if (token !== findInFilesPreviewToken) {
       return;
@@ -3327,6 +3480,204 @@ async function loadFindInFilesPreview(matchKey: string | null) {
       isLoadingFindInFilesPreview.value = false;
     }
   }
+}
+
+function clearFindInFilesPreviewCache(filePaths: string[]) {
+  filePaths.forEach((filePath) => {
+    findInFilesPreviewCache.delete(filePath);
+  });
+}
+
+function getEditableTabsForFilePaths(filePaths: string[]) {
+  const targetPaths = new Set(filePaths.map((filePath) => normalizeFileLookup(filePath)));
+
+  return tabs.value.filter((tab) => {
+    if (!isEditableTab(tab) || !tab.filePath) {
+      return false;
+    }
+
+    return targetPaths.has(normalizeFileLookup(tab.filePath));
+  });
+}
+
+function formatFindInFilesFileList(filePaths: string[]) {
+  return filePaths
+    .map((filePath) => getPathLeafName(filePath))
+    .slice(0, 3)
+    .join(', ');
+}
+
+async function reloadCleanEditableTabsForFilePaths(filePaths: string[]) {
+  const editableTabs = getEditableTabsForFilePaths(filePaths);
+
+  for (const tab of editableTabs) {
+    if (isEditableTabDirty(tab)) {
+      continue;
+    }
+
+    await reloadEditableTabFromDisk(tab.id);
+  }
+}
+
+function setFindInFilesPreviewEditor(element: Element | ComponentPublicInstance | null) {
+  findInFilesPreviewEditor.value = element instanceof HTMLElement ? element : null;
+}
+
+function setFindInFilesPreviewMatchLineText(element: Element | ComponentPublicInstance | null) {
+  findInFilesPreviewMatchLineText.value = element instanceof HTMLElement ? element : null;
+}
+
+function scrollFindInFilesPreviewToMatch() {
+  const previewEditor = findInFilesPreviewEditor.value;
+  const previewLineText = findInFilesPreviewMatchLineText.value;
+  const match = selectedFindInFilesMatch.value;
+
+  if (!previewEditor || !previewLineText || !match) {
+    return;
+  }
+
+  const previewLine = previewLineText.closest('.terminal-panel__switcher-preview-code-line');
+
+  if (previewLine instanceof HTMLElement) {
+    previewEditor.scrollTop = Math.max(
+      0,
+      previewLine.offsetTop - Math.max(18, (previewEditor.clientHeight - previewLine.offsetHeight) / 2),
+    );
+  }
+
+  const contentLength = previewLineText.textContent?.length ?? 0;
+  const averageCharacterWidth = contentLength > 0
+    ? previewLineText.getBoundingClientRect().width / contentLength
+    : 8;
+
+  previewEditor.scrollLeft = Math.max(
+    0,
+    previewLineText.offsetLeft + Math.max(0, match.column - 1) * averageCharacterWidth - previewEditor.clientWidth * 0.35,
+  );
+}
+
+function getReplaceBlockedEditableTabs(matches: GitTextSearchMatch[]) {
+  const affectedFilePaths = [...new Set(matches.map((match) => match.filePath))];
+
+  return getEditableTabsForFilePaths(affectedFilePaths).filter((tab) => isEditableTabDirty(tab));
+}
+
+function requestReplaceFindInFilesMatches(matches: GitTextSearchMatch[], scope: 'document' | 'all') {
+  if (!matches.length) {
+    return false;
+  }
+
+  pendingFindInFilesReplaceDialog.value = {
+    matches: matches.map((match) => ({ ...match })),
+    matchCount: matches.length,
+    fileCount: new Set(matches.map((match) => match.path)).size,
+    scope,
+  };
+  return true;
+}
+
+async function replaceFindInFilesMatches(matches: GitTextSearchMatch[]) {
+  if (!props.projectRoot || !window.bridgegit?.git) {
+    return false;
+  }
+
+  const query = findInFilesSearchQuery.value.trim();
+
+  if (!query) {
+    findInFilesError.value = 'Enter search text first.';
+    return false;
+  }
+
+  if (!matches.length) {
+    findInFilesError.value = 'No matches available for replace.';
+    return false;
+  }
+
+  const blockedTabs = getReplaceBlockedEditableTabs(matches);
+
+  if (blockedTabs.length > 0) {
+    const blockedFiles = [...new Set(
+      blockedTabs
+        .map((tab) => getEditableTabFilePath(tab))
+        .filter((filePath): filePath is string => Boolean(filePath)),
+    )];
+
+    findInFilesError.value = blockedFiles.length === 1
+      ? `Save or reload the dirty tab for ${formatFindInFilesFileList(blockedFiles)} before replace.`
+      : `Save or reload dirty tabs before replace: ${formatFindInFilesFileList(blockedFiles)}.`;
+    return false;
+  }
+
+  isReplacingFindInFiles.value = true;
+  findInFilesError.value = null;
+  findInFilesReplaceSummary.value = null;
+
+  try {
+    const result = await window.bridgegit.git.replaceText(props.projectRoot, {
+      query,
+      replacement: findInFilesReplaceQuery.value,
+      matches,
+    });
+    const affectedFileLabel = result.affectedFiles.length === 1 ? 'file' : 'files';
+
+    clearFindInFilesPreviewCache(result.affectedFiles);
+    await reloadCleanEditableTabsForFilePaths(result.affectedFiles);
+    await runFindInFilesSearch(query);
+
+    findInFilesReplaceSummary.value = result.replacedCount > 0
+      ? `Replaced ${result.replacedCount.toLocaleString()} matches in ${result.affectedFiles.length.toLocaleString()} ${affectedFileLabel}.`
+      : 'No matches were replaced. The files may have changed since the search results were collected.';
+    return result.replacedCount > 0;
+  } catch (error) {
+    findInFilesError.value = error instanceof Error ? error.message : 'Failed to replace matches.';
+    return false;
+  } finally {
+    isReplacingFindInFiles.value = false;
+  }
+}
+
+async function replaceSelectedFindInFilesMatch() {
+  if (!selectedFindInFilesMatch.value) {
+    return false;
+  }
+
+  return replaceFindInFilesMatches([selectedFindInFilesMatch.value]);
+}
+
+async function replaceSelectedMatchFileFindInFilesMatches() {
+  if (!findInFilesVisibleResultsInSelectedMatchFile.value.length) {
+    return false;
+  }
+
+  return requestReplaceFindInFilesMatches(findInFilesVisibleResultsInSelectedMatchFile.value, 'document');
+}
+
+async function replaceAllShownFindInFilesMatches() {
+  if (!findInFilesVisibleResults.value.length) {
+    return false;
+  }
+
+  return requestReplaceFindInFilesMatches(findInFilesVisibleResults.value, 'all');
+}
+
+async function handlePendingFindInFilesReplaceConfirm() {
+  const dialog = pendingFindInFilesReplaceDialog.value;
+
+  if (!dialog) {
+    return;
+  }
+
+  closePendingFindInFilesReplaceDialog();
+  await replaceFindInFilesMatches(dialog.matches);
+}
+
+async function handlePendingFindInFilesReplaceDialogAction(actionId: string) {
+  if (actionId === 'confirm') {
+    await handlePendingFindInFilesReplaceConfirm();
+    return;
+  }
+
+  closePendingFindInFilesReplaceDialog();
 }
 
 function selectQuickOpenItem(path: string | null) {
@@ -3613,13 +3964,31 @@ function handleFindInFilesDialogKeydown(event: KeyboardEvent) {
     return false;
   }
 
-  if (event.key === 'ArrowDown' || (event.key === 'Tab' && !event.shiftKey)) {
+  if ((event.ctrlKey || event.metaKey) && event.shiftKey && event.key.toLocaleLowerCase() === 'h') {
+    event.preventDefault();
+    findInFilesMode.value = 'replace';
+    if (findInFilesSearchQuery.value.trim()) {
+      focusFindInFilesReplace();
+    } else {
+      focusFindInFilesSearch();
+    }
+    return true;
+  }
+
+  if ((event.ctrlKey || event.metaKey) && event.shiftKey && event.key.toLocaleLowerCase() === 'f') {
+    event.preventDefault();
+    findInFilesMode.value = 'find';
+    focusFindInFilesSearch();
+    return true;
+  }
+
+  if (event.key === 'ArrowDown') {
     event.preventDefault();
     moveFindInFilesSelection(1);
     return true;
   }
 
-  if (event.key === 'ArrowUp' || (event.key === 'Tab' && event.shiftKey)) {
+  if (event.key === 'ArrowUp') {
     event.preventDefault();
     moveFindInFilesSelection(-1);
     return true;
@@ -3640,6 +4009,15 @@ function handleFindInFilesDialogKeydown(event: KeyboardEvent) {
 
   if (event.key === 'Enter') {
     event.preventDefault();
+    if (
+      findInFilesMode.value === 'replace'
+      && document.activeElement === findInFilesReplaceInput.value
+      && selectedFindInFilesMatch.value
+    ) {
+      void replaceSelectedFindInFilesMatch();
+      return true;
+    }
+
     void activateSelectedFindInFilesItem();
     return true;
   }
@@ -3731,6 +4109,10 @@ function performCloseTab(tabId: string) {
 
 function closePendingCloseDialog() {
   pendingCloseDialog.value = null;
+}
+
+function closePendingFindInFilesReplaceDialog() {
+  pendingFindInFilesReplaceDialog.value = null;
 }
 
 function requestCloseTabs(
@@ -4044,6 +4426,33 @@ function handlePendingCloseDiscard() {
 
   closePendingCloseDialog();
   performCloseTabs(dialog.tabIds, dialog.keepTabId);
+}
+
+async function handlePendingCloseDialogAction(actionId: string) {
+  if (actionId === 'save') {
+    await handlePendingCloseSave();
+    return;
+  }
+
+  if (actionId === 'saveAs') {
+    await handlePendingCloseSaveAs();
+    return;
+  }
+
+  if (actionId === 'discard') {
+    handlePendingCloseDiscard();
+    return;
+  }
+
+  closePendingCloseDialog();
+}
+
+async function handlePendingFindInFilesReplaceDialogModelValue(nextValue: boolean) {
+  if (nextValue) {
+    return;
+  }
+
+  closePendingFindInFilesReplaceDialog();
 }
 
 async function startEditing(tab: WorkspaceTabState) {
@@ -4386,13 +4795,20 @@ watch(
 
     findInFilesResults.value = [];
     findInFilesError.value = null;
+    findInFilesReplaceSummary.value = null;
     isSearchingFindInFiles.value = false;
     findInFilesSelectedMatchKey.value = null;
   },
 );
 
 watch(
-  [findInFilesDialogOpen, () => props.projectRoot, findInFilesSearchQuery, findInFilesFileFilter, findInFilesIncludeUntracked],
+  [
+    findInFilesDialogOpen,
+    () => props.projectRoot,
+    findInFilesSearchQuery,
+    findInFilesFileFilter,
+    findInFilesIncludeUntracked,
+  ],
   ([isOpen, projectRoot, query]) => {
     if (findInFilesSearchDebounceTimer !== null) {
       window.clearTimeout(findInFilesSearchDebounceTimer);
@@ -4404,6 +4820,7 @@ watch(
     if (!isOpen || !projectRoot) {
       findInFilesResults.value = [];
       findInFilesError.value = null;
+      findInFilesReplaceSummary.value = null;
       isSearchingFindInFiles.value = false;
       findInFilesSelectedMatchKey.value = null;
       return;
@@ -4414,6 +4831,7 @@ watch(
     if (!normalizedQuery) {
       findInFilesResults.value = [];
       findInFilesError.value = null;
+      findInFilesReplaceSummary.value = null;
       isSearchingFindInFiles.value = false;
       findInFilesSelectedMatchKey.value = null;
       return;
@@ -4421,12 +4839,25 @@ watch(
 
     findInFilesResults.value = [];
     findInFilesError.value = null;
+    findInFilesReplaceSummary.value = null;
     isSearchingFindInFiles.value = true;
     findInFilesSearchDebounceTimer = window.setTimeout(() => {
       void runFindInFilesSearch(normalizedQuery);
     }, 120);
   },
   { immediate: true },
+);
+
+watch(
+  [findInFilesMode, findInFilesReplaceQuery],
+  () => {
+    if (!findInFilesDialogOpen.value) {
+      return;
+    }
+
+    findInFilesError.value = null;
+    findInFilesReplaceSummary.value = null;
+  },
 );
 
 watch(
@@ -4606,6 +5037,7 @@ defineExpose({
   openAllTabsDialog,
   openQuickOpenDialog,
   openFindInFilesDialog,
+  openFindInFilesDialogInMode: (mode: FindInFilesMode) => openFindInFilesDialogInMode(mode),
   openCreationMenu: () => openCreationMenu(),
   openFile: () => openWorkspaceFile(),
   openNoteFilePath: (filePath: string) => openNoteFilePath(filePath),
@@ -5304,26 +5736,29 @@ defineExpose({
         :style="findInFilesDialogStyle"
         role="dialog"
         aria-modal="true"
-        aria-label="Find in files"
+        :aria-label="findInFilesDialogLabel"
         @click.stop
       >
         <header class="terminal-panel__switcher-header">
           <div class="terminal-panel__switcher-heading">
             <span class="terminal-panel__switcher-eyebrow">Workspace</span>
-            <h3 class="terminal-panel__switcher-title">Find in Files</h3>
+            <h3 class="terminal-panel__switcher-title">{{ findInFilesDialogTitle }}</h3>
           </div>
 
           <button
             class="terminal-panel__switcher-close"
             type="button"
-            aria-label="Close find in files"
+            :aria-label="`Close ${findInFilesDialogLabel}`"
             @click="closeFindInFilesDialog"
           >
             ×
           </button>
         </header>
 
-        <div class="terminal-panel__switcher-toolbar terminal-panel__switcher-toolbar--find">
+        <div
+          class="terminal-panel__switcher-toolbar terminal-panel__switcher-toolbar--find"
+          :class="{ 'terminal-panel__switcher-toolbar--replace': findInFilesMode === 'replace' }"
+        >
           <label class="terminal-panel__switcher-search">
             <span class="terminal-panel__switcher-search-meta">{{ findInFilesMeta }}</span>
             <input
@@ -5331,10 +5766,28 @@ defineExpose({
               v-model="findInFilesSearchQuery"
               class="terminal-panel__switcher-search-input"
               type="text"
-              aria-label="Search text in current repo"
+              :aria-label="findInFilesMode === 'replace' ? 'Find text to replace in current repo' : 'Search text in current repo'"
               placeholder="Search text in current repo"
               autocomplete="off"
               spellcheck="false"
+              @keydown="handleFindInFilesDialogKeydown"
+            >
+          </label>
+
+          <label
+            v-if="findInFilesMode === 'replace'"
+            class="terminal-panel__switcher-search terminal-panel__switcher-search--compact"
+          >
+            <input
+              :ref="setFindInFilesReplaceInput"
+              v-model="findInFilesReplaceQuery"
+              class="terminal-panel__switcher-search-input"
+              type="text"
+              aria-label="Replace matching text with"
+              placeholder="Replace with"
+              autocomplete="off"
+              spellcheck="false"
+              @keydown="handleFindInFilesDialogKeydown"
             >
           </label>
 
@@ -5347,6 +5800,7 @@ defineExpose({
               placeholder="Filter files (*.php)"
               autocomplete="off"
               spellcheck="false"
+              @keydown="handleFindInFilesDialogKeydown"
             >
           </label>
 
@@ -5361,6 +5815,36 @@ defineExpose({
               <span>{{ findInFilesScopeLabel }}</span>
             </button>
           </div>
+        </div>
+
+        <div v-if="findInFilesMode === 'replace'" class="terminal-panel__switcher-action-row">
+          <button
+            class="terminal-panel__switcher-action"
+            type="button"
+            :disabled="!canReplaceSelectedFindInFilesMatch"
+            @click="replaceSelectedFindInFilesMatch()"
+          >
+            {{ isReplacingFindInFiles ? 'Replacing…' : 'Replace' }}
+          </button>
+
+          <button
+            class="terminal-panel__switcher-action"
+            type="button"
+            :disabled="!canReplaceSelectedMatchFileFindInFilesMatches"
+            :title="selectedFindInFilesMatchPath ? `Replace shown matches in ${getPathLeafName(selectedFindInFilesMatchPath)}` : 'Select a match to use Replace in document'"
+            @click="replaceSelectedMatchFileFindInFilesMatches()"
+          >
+            {{ isReplacingFindInFiles ? 'Replacing…' : 'Replace in document' }}
+          </button>
+
+          <button
+            class="terminal-panel__switcher-action"
+            type="button"
+            :disabled="!canReplaceAllShownFindInFilesMatches"
+            @click="replaceAllShownFindInFilesMatches()"
+          >
+            {{ isReplacingFindInFiles ? 'Replacing…' : 'Replace all' }}
+          </button>
         </div>
 
         <div class="terminal-panel__switcher-body terminal-panel__switcher-body--find">
@@ -5401,7 +5885,7 @@ defineExpose({
                     </span>
                   </span>
                   <span class="terminal-panel__find-result-secondary">
-                    <span class="terminal-panel__find-result-path">{{ match.path }}:{{ match.line }}</span>
+                    <span class="terminal-panel__find-result-path">{{ match.path }}:{{ match.line }}:{{ match.column }}</span>
                     <span v-if="match.fileMatchCount > 1" class="terminal-panel__switcher-badge terminal-panel__find-result-count">
                       {{ match.fileMatchCount.toLocaleString() }} in file
                     </span>
@@ -5425,6 +5909,7 @@ defineExpose({
 
             <div
               v-if="findInFilesPreviewLines.length"
+              :ref="setFindInFilesPreviewEditor"
               class="terminal-panel__switcher-preview-editor"
             >
               <div class="terminal-panel__switcher-preview-code">
@@ -5435,7 +5920,10 @@ defineExpose({
                   :class="{ 'terminal-panel__switcher-preview-code-line--match': previewLine.isMatchLine }"
                 >
                   <span class="terminal-panel__switcher-preview-line-number">{{ previewLine.lineNumber }}</span>
-                  <span class="terminal-panel__switcher-preview-line-text">
+                  <span
+                    :ref="previewLine.isMatchLine ? setFindInFilesPreviewMatchLineText : undefined"
+                    class="terminal-panel__switcher-preview-line-text"
+                  >
                     <template v-for="(fragment, fragmentIndex) in buildQuickOpenHighlightedFragments(previewLine.text, findInFilesSearchQuery)" :key="`${findInFilesPreviewPath}:${previewLine.lineNumber}:${fragmentIndex}`">
                       <mark v-if="fragment.highlighted" class="terminal-panel__switcher-highlight">{{ fragment.text }}</mark>
                       <template v-else>{{ fragment.text || ' ' }}</template>
@@ -5504,64 +5992,27 @@ defineExpose({
       </button>
     </div>
 
-    <div
-      v-if="pendingCloseDialog"
-      class="terminal-panel__dialog-backdrop"
-      @click="closePendingCloseDialog"
-    >
-      <section
-        class="terminal-panel__dialog"
-        role="dialog"
-        aria-modal="true"
-        aria-label="Confirm tab close"
-        @click.stop
-      >
-        <span class="terminal-panel__dialog-eyebrow">
-          {{ pendingCloseDialogEyebrow }}
-        </span>
-        <h3 class="terminal-panel__dialog-title">
-          {{ pendingCloseDialogTitle }}
-        </h3>
-        <p class="terminal-panel__dialog-copy">
-          {{ pendingCloseDialogCopy }}
-        </p>
+    <AppConfirmDialog
+      :model-value="Boolean(pendingCloseDialog)"
+      dialog-label="Confirm tab close"
+      :eyebrow="pendingCloseDialogEyebrow"
+      :title="pendingCloseDialogTitle"
+      :copy="pendingCloseDialogCopy"
+      :actions="pendingCloseDialogActions"
+      @update:model-value="closePendingCloseDialog"
+      @action="handlePendingCloseDialogAction"
+    />
 
-        <div class="terminal-panel__dialog-actions">
-          <template v-if="pendingCloseDialogCanSave">
-            <button
-              class="terminal-panel__dialog-button terminal-panel__dialog-button--primary"
-              type="button"
-              @click="handlePendingCloseSave"
-            >
-              {{ pendingCloseDialogSaveLabel }}
-            </button>
-            <button
-              v-if="pendingCloseDialogCanSaveAs"
-              class="terminal-panel__dialog-button"
-              type="button"
-              @click="handlePendingCloseSaveAs"
-            >
-              Save As
-            </button>
-          </template>
-
-          <button
-            class="terminal-panel__dialog-button terminal-panel__dialog-button--danger"
-            type="button"
-            @click="handlePendingCloseDiscard"
-          >
-            {{ pendingCloseDialogDiscardLabel }}
-          </button>
-          <button
-            class="terminal-panel__dialog-button"
-            type="button"
-            @click="closePendingCloseDialog"
-          >
-            Cancel
-          </button>
-        </div>
-      </section>
-    </div>
+    <AppConfirmDialog
+      :model-value="Boolean(pendingFindInFilesReplaceDialog)"
+      dialog-label="Confirm replace in files"
+      eyebrow="Replace in files"
+      :title="pendingFindInFilesReplaceDialogTitle"
+      :copy="pendingFindInFilesReplaceDialogCopy"
+      :actions="pendingFindInFilesReplaceDialogActions"
+      @update:model-value="handlePendingFindInFilesReplaceDialogModelValue"
+      @action="handlePendingFindInFilesReplaceDialogAction"
+    />
 
     <div
       v-if="creationMenu"
@@ -5609,10 +6060,6 @@ defineExpose({
   --terminal-panel-menu-bg: rgba(10, 14, 19, 0.98);
   --terminal-panel-menu-hover-bg: rgba(24, 33, 43, 0.92);
   --terminal-panel-menu-shortcut-bg: rgba(8, 12, 17, 0.42);
-  --terminal-panel-dialog-backdrop: rgba(2, 5, 8, 0.5);
-  --terminal-panel-dialog-bg:
-    linear-gradient(160deg, rgba(69, 151, 250, 0.08), transparent 34%),
-    rgba(10, 14, 19, 0.98);
   position: relative;
   display: grid;
   grid-template-rows: auto 1fr;
@@ -5631,10 +6078,6 @@ defineExpose({
   --terminal-panel-menu-bg: rgba(255, 255, 255, 0.98);
   --terminal-panel-menu-hover-bg: rgba(230, 238, 247, 0.98);
   --terminal-panel-menu-shortcut-bg: rgba(236, 242, 249, 0.98);
-  --terminal-panel-dialog-backdrop: rgba(214, 224, 237, 0.58);
-  --terminal-panel-dialog-bg:
-    linear-gradient(160deg, rgba(88, 154, 225, 0.08), transparent 34%),
-    rgba(248, 251, 255, 0.98);
 }
 
 .terminal-panel[data-appearance-theme='github-dark'] {
@@ -5648,10 +6091,6 @@ defineExpose({
   --terminal-panel-menu-bg: #161b22;
   --terminal-panel-menu-hover-bg: #21262d;
   --terminal-panel-menu-shortcut-bg: rgba(13, 17, 23, 0.42);
-  --terminal-panel-dialog-backdrop: rgba(1, 4, 9, 0.58);
-  --terminal-panel-dialog-bg:
-    linear-gradient(160deg, rgba(56, 139, 253, 0.08), transparent 34%),
-    #0d1117;
 }
 
 .terminal-panel[data-appearance-theme='github-light'] {
@@ -5665,10 +6104,6 @@ defineExpose({
   --terminal-panel-menu-bg: #ffffff;
   --terminal-panel-menu-hover-bg: #eef2f6;
   --terminal-panel-menu-shortcut-bg: rgba(246, 248, 250, 0.98);
-  --terminal-panel-dialog-backdrop: rgba(208, 215, 222, 0.46);
-  --terminal-panel-dialog-bg:
-    linear-gradient(160deg, rgba(9, 105, 218, 0.06), transparent 34%),
-    #ffffff;
 }
 
 .terminal-panel[data-appearance-theme='nord'] {
@@ -5682,10 +6117,6 @@ defineExpose({
   --terminal-panel-menu-bg: rgba(46, 52, 64, 0.98);
   --terminal-panel-menu-hover-bg: rgba(59, 66, 82, 0.96);
   --terminal-panel-menu-shortcut-bg: rgba(46, 52, 64, 0.5);
-  --terminal-panel-dialog-backdrop: rgba(36, 41, 51, 0.58);
-  --terminal-panel-dialog-bg:
-    linear-gradient(160deg, rgba(136, 192, 208, 0.08), transparent 34%),
-    rgba(46, 52, 64, 0.98);
 }
 
 .terminal-panel__tabs-header {
@@ -6180,80 +6611,6 @@ defineExpose({
   white-space: nowrap;
 }
 
-.terminal-panel__dialog-backdrop {
-  position: absolute;
-  inset: 0;
-  z-index: 20;
-  display: grid;
-  place-items: center;
-  padding: 24px;
-  background: var(--terminal-panel-dialog-backdrop);
-  backdrop-filter: blur(3px);
-}
-
-.terminal-panel__dialog {
-  display: grid;
-  gap: 12px;
-  width: min(460px, 100%);
-  padding: 18px;
-  border: 1px solid var(--border-strong);
-  border-radius: 18px;
-  background: var(--terminal-panel-dialog-bg);
-  box-shadow: 0 22px 48px rgba(0, 0, 0, 0.38);
-}
-
-.terminal-panel__dialog-eyebrow {
-  color: var(--text-dim);
-  font-size: 0.72rem;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-}
-
-.terminal-panel__dialog-title {
-  margin: 0;
-  color: var(--text-primary);
-  font-family: var(--font-display);
-  font-size: 1.08rem;
-}
-
-.terminal-panel__dialog-copy {
-  margin: 0;
-  color: var(--text-muted);
-  font-size: 0.82rem;
-  line-height: 1.5;
-}
-
-.terminal-panel__dialog-actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-}
-
-.terminal-panel__dialog-button {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  padding: 0.55rem 0.82rem;
-  border: 1px solid var(--border-subtle);
-  border-radius: 10px;
-  background: rgba(17, 23, 31, 0.9);
-  color: var(--text-primary);
-  font-size: 0.78rem;
-  font-weight: 600;
-}
-
-.terminal-panel__dialog-button--primary {
-  border-color: rgba(110, 197, 255, 0.28);
-  background: rgba(69, 151, 250, 0.16);
-  color: #b9dcff;
-}
-
-.terminal-panel__dialog-button--danger {
-  border-color: rgba(188, 87, 87, 0.24);
-  background: rgba(188, 87, 87, 0.14);
-  color: #ffb3ad;
-}
-
 .terminal-panel__switcher-backdrop {
   position: fixed;
   inset: 0;
@@ -6267,7 +6624,7 @@ defineExpose({
 
 .terminal-panel__switcher {
   display: grid;
-  grid-template-rows: auto auto minmax(0, 1fr);
+  grid-template-rows: auto auto auto minmax(0, 1fr);
   gap: 14px;
   width: min(720px, 100%);
   max-height: min(620px, 100%);
@@ -6350,6 +6707,26 @@ defineExpose({
   grid-template-columns: minmax(0, 1fr) minmax(200px, 240px) auto;
 }
 
+.terminal-panel__switcher-toolbar--document {
+  grid-template-columns: minmax(0, 1fr) minmax(200px, 240px) auto auto;
+}
+
+.terminal-panel__switcher-toolbar--replace {
+  grid-template-columns: minmax(0, 1fr) minmax(180px, 220px) minmax(180px, 220px) auto;
+}
+
+.terminal-panel__switcher-toolbar--replace.terminal-panel__switcher-toolbar--document {
+  grid-template-columns: minmax(0, 1fr) minmax(180px, 220px) minmax(180px, 220px) auto auto;
+}
+
+.terminal-panel__switcher-action-row {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: -8px;
+}
+
 .terminal-panel__switcher-search,
 .terminal-panel__switcher-filter {
   display: grid;
@@ -6403,6 +6780,33 @@ defineExpose({
   cursor: pointer;
 }
 
+.terminal-panel__switcher-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 34px;
+  padding: 0.42rem 0.72rem;
+  border: 1px solid rgba(108, 124, 148, 0.18);
+  border-radius: 10px;
+  background: rgba(17, 23, 31, 0.9);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 0.74rem;
+  font-weight: 600;
+  line-height: 1.1;
+  white-space: nowrap;
+}
+
+.terminal-panel__switcher-action:hover:not(:disabled) {
+  border-color: rgba(110, 197, 255, 0.28);
+  background: rgba(24, 33, 43, 0.92);
+}
+
+.terminal-panel__switcher-action:disabled {
+  cursor: not-allowed;
+  opacity: 0.48;
+}
+
 .terminal-panel__switcher-filter-button svg {
   width: 14px;
   height: 14px;
@@ -6416,6 +6820,7 @@ defineExpose({
 
 .terminal-panel__switcher-search-input:focus,
 .terminal-panel__switcher-filter-button:focus,
+.terminal-panel__switcher-action:focus,
 .terminal-panel__switcher-filter-button[aria-expanded='true'] {
   outline: none;
   border-color: rgba(110, 197, 255, 0.34);
@@ -6706,7 +7111,7 @@ defineExpose({
 .terminal-panel__switcher-highlight {
   padding: 0;
   border-radius: 3px;
-  background: rgba(110, 197, 255, 0.22);
+  background: color-mix(in srgb, var(--accent-strong) 22%, transparent);
   color: inherit;
 }
 
@@ -6772,6 +7177,7 @@ defineExpose({
   border-radius: 14px;
   background: rgba(11, 15, 21, 0.9);
   overflow: auto;
+  scroll-behavior: smooth;
 }
 
 .terminal-panel__switcher-preview-code {
@@ -6789,7 +7195,7 @@ defineExpose({
 }
 
 .terminal-panel__switcher-preview-code-line--match {
-  background: rgba(69, 151, 250, 0.12);
+  background: color-mix(in srgb, var(--accent-strong) 12%, transparent);
 }
 
 .terminal-panel__switcher-preview-line-number {
@@ -6808,6 +7214,17 @@ defineExpose({
   font-size: 0.76rem;
   line-height: 1.9;
   white-space: pre;
+}
+
+.terminal-panel__switcher-preview-line-text .terminal-panel__switcher-highlight {
+  border-radius: 4px;
+  padding: 0 0.08em;
+  background: color-mix(in srgb, var(--accent-strong) 52%, transparent);
+  box-shadow:
+    0 0 0 1px color-mix(in srgb, var(--accent-strong) 44%, transparent),
+    0 0 0 3px color-mix(in srgb, var(--accent-strong) 16%, transparent);
+  color: var(--text-primary);
+  font-weight: 700;
 }
 
 .terminal-panel__switcher-empty {
@@ -6867,6 +7284,11 @@ defineExpose({
 
   .terminal-panel__switcher-toolbar--find {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  .terminal-panel__switcher-action-row {
+    flex-direction: column;
+    align-items: stretch;
   }
 
   .terminal-panel__find-result-secondary {

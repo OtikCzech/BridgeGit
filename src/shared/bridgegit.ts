@@ -122,6 +122,7 @@ export interface GitLogEntry {
 
 export interface GitLogResult {
   total: number;
+  availableTotal: number;
   items: GitLogEntry[];
   hasMore: boolean;
   offset: number;
@@ -397,6 +398,19 @@ export interface GitTextSearchOptions {
   wholeWord?: boolean;
   fileGlob?: string | null;
   includeUntracked?: boolean;
+}
+
+export interface GitTextReplaceRequest {
+  query: string;
+  replacement: string;
+  matches: GitTextSearchMatch[];
+}
+
+export interface GitTextReplaceResult {
+  requestedCount: number;
+  replacedCount: number;
+  skippedCount: number;
+  affectedFiles: string[];
 }
 
 export type WorkspaceExternalFileChangeState = 'changed' | 'unavailable' | 'session-dirty';
