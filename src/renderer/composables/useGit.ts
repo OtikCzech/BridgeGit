@@ -49,6 +49,7 @@ interface RepoStateCacheEntry {
 
 const HISTORY_PAGE_SIZE = 100;
 const SILENT_REFRESH_FAILURES_BEFORE_ERROR = 2;
+const REPO_POLL_INTERVAL_MS = 5000;
 type HistoryPaginationMode = 'more' | 'all' | null;
 
 function extractRawErrorMessage(error: unknown): string {
@@ -448,6 +449,52 @@ export function useGit() {
     }
   }
 
+  async function refreshBranchesOnly(options: Pick<RefreshOptions, 'silent'> = {}) {
+    const request = createRepoRequestSnapshot();
+
+    if (!request.repoPath || !window.bridgegit?.git) {
+      branches.value = null;
+      return;
+    }
+
+    try {
+      const nextBranches = await window.bridgegit.git.branches(request.repoPath);
+
+      if (!isRepoRequestCurrent(request)) {
+        return;
+      }
+
+      branches.value = nextBranches;
+      const cachedRepoState = repoStateCache.get(request.repoPath);
+
+      if (cachedRepoState) {
+        repoStateCache.set(request.repoPath, {
+          ...cachedRepoState,
+          branches: cloneBranchSummary(nextBranches),
+        });
+      }
+
+      resetSilentRefreshFailures();
+      clearErrorState();
+    } catch (nextError) {
+      if (!isRepoRequestCurrent(request)) {
+        return;
+      }
+
+      if (options.silent) {
+        consecutiveSilentRefreshFailures += 1;
+
+        if (consecutiveSilentRefreshFailures < SILENT_REFRESH_FAILURES_BEFORE_ERROR) {
+          return;
+        }
+      } else {
+        resetSilentRefreshFailures();
+      }
+
+      assignGitError(nextError);
+    }
+  }
+
   async function loadBranchesOnly(nextRepoPath: string) {
     if (!window.bridgegit?.git) {
       return;
@@ -508,10 +555,13 @@ export function useGit() {
     if (loadMode === 'branches') {
       if (cachedRepoState) {
         branches.value = cloneBranchSummary(cachedRepoState.branches);
+        startPolling();
+        void refreshBranchesOnly({ silent: true });
         return;
       }
 
       await loadBranchesOnly(nextRepoPath);
+      startPolling();
       return;
     }
 
@@ -1077,8 +1127,15 @@ export function useGit() {
         return;
       }
 
-      void refresh({ silent: true });
-    }, 2000);
+      if (status.value && branches.value) {
+        void refresh({ silent: true });
+        return;
+      }
+
+      if (branches.value || repoPath.value) {
+        void refreshBranchesOnly({ silent: true });
+      }
+    }, REPO_POLL_INTERVAL_MS);
   }
 
   function stopPolling() {

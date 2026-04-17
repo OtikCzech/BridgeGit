@@ -7,6 +7,7 @@ import {
   GLOBAL_WORKSPACE_SESSION_KEY,
   areRepoPathsEquivalent,
   cloneDismissedWorktreePaths,
+  cloneDockerDialogState,
   cloneSeenInfoNoteRevisions,
   clonePanelLayoutsByWorkspace,
   cloneProjectTitlesByContext,
@@ -69,6 +70,7 @@ import {
 import { SHORTCUTS, matchesCommandSlotShortcut, matchesShortcut } from './shortcuts';
 
 const CommitHistoryDialog = defineAsyncComponent(() => import('./components/CommitHistoryDialog.vue'));
+const DockerDialog = defineAsyncComponent(() => import('./components/DockerDialog.vue'));
 const DiffViewer = defineAsyncComponent(() => import('./components/DiffViewer.vue'));
 const ProjectSettingsDialog = defineAsyncComponent(() => import('./components/ProjectSettingsDialog.vue'));
 
@@ -77,6 +79,7 @@ const contentRef = ref<HTMLElement | null>(null);
 const terminalPanelRef = ref<{
   addShellTab: () => void;
   addNoteTab: () => void;
+  openDockerLogs: (containerId: string, containerName: string) => Promise<void>;
   closeActiveTab: () => void;
   closeEditorPane: (direction: 'left' | 'right' | 'up' | 'down') => boolean;
   focusPreviousTab: () => void;
@@ -124,6 +127,7 @@ const soundNotificationsEnabled = ref(true);
 const projectTitleSaveToast = ref<string | null>(null);
 const isSettingsOpen = ref(false);
 const isCommitHistoryOpen = ref(false);
+const isDockerDialogOpen = ref(false);
 const commitHistorySearchToken = ref(0);
 const commitMessage = ref('');
 const recentRepos = ref<RecentRepoEntry[]>([]);
@@ -136,6 +140,7 @@ const workspaceEditorPaneLayout = ref<WorkspaceEditorPaneLayout>({
   panes: [],
   activePaneId: null,
 });
+const workspaceMultiDisplayTabIds = ref<string[]>([]);
 const workspaceRecentActivityByTabId = ref<Record<string, boolean>>({});
 const workspaceRecentActivityByWorkspaceId = ref<Record<string, Record<string, boolean>>>({});
 const workspaceAttentionByWorkspaceId = ref<Record<string, Record<string, boolean>>>({});
@@ -152,6 +157,7 @@ type WorkspaceGitSummary = {
 const workspaceGitSummaryById = ref<Record<string, WorkspaceGitSummary>>({});
 const gitRepositoryValidityByPath = ref<Record<string, boolean>>({});
 const seenInfoNoteRevisions = ref<string[]>([]);
+const dockerDialogState = ref(cloneDockerDialogState(DEFAULT_SESSION_DATA.dockerDialogState));
 const detectedWorktrees = ref<GitWorktreeSummary[]>([]);
 const sessionReady = ref(false);
 const isSwitchingWorkspaceContext = ref(false);
@@ -242,11 +248,15 @@ type BackgroundShellSubscription = {
 
 const activeResize = ref<ResizeTarget>(null);
 const INACTIVE_WORKSPACE_GIT_SUMMARY_POLL_MS = 15_000;
+const INACTIVE_WORKSPACE_GIT_SUMMARY_STAGGER_MS = 350;
+const INITIAL_INACTIVE_WORKSPACE_GIT_SUMMARY_DELAY_MS = 1200;
 const BACKGROUND_SHELL_ACTIVITY_TIMEOUT_MS = 1600;
 let persistTimer: number | null = null;
 let projectTitleSaveToastTimer: number | null = null;
 let inactiveWorkspaceGitSummaryTimer: number | null = null;
+let initialInactiveWorkspaceGitSummaryTimer: number | null = null;
 let worktreeDetectionTimer: number | null = null;
+let inactiveWorkspaceGitSummaryRefreshInFlight = false;
 const backgroundShellSubscriptions = new Map<string, BackgroundShellSubscription>();
 const backgroundShellActivityTimers = new Map<string, number>();
 const commitDiffDateFormatter = new Intl.DateTimeFormat('en', {
@@ -580,22 +590,18 @@ async function loadWorkspaceGitSummary(nextWorkspaceId: string, nextRepoPath: st
   }
 }
 
-async function loadAllWorkspaceGitSummaries() {
-  const workspaceEntries = Object.values(workspaceDescriptors.value)
-    .filter((workspaceDescriptor) => workspaceDescriptor.kind === 'project' && workspaceDescriptor.repoPath)
-    .map((workspaceDescriptor) => ({
-      workspaceId: workspaceDescriptor.id,
-      repoPath: workspaceDescriptor.repoPath!,
-    }));
-
-  await Promise.all(
-    workspaceEntries.map((workspaceEntry) => (
-      loadWorkspaceGitSummary(workspaceEntry.workspaceId, workspaceEntry.repoPath)
-    )),
-  );
+function sleep(ms: number) {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, ms);
+  });
 }
 
-async function loadInactiveWorkspaceGitSummaries() {
+async function loadInactiveWorkspaceGitSummaries(options: { staggerMs?: number } = {}) {
+  if (inactiveWorkspaceGitSummaryRefreshInFlight) {
+    return;
+  }
+
+  inactiveWorkspaceGitSummaryRefreshInFlight = true;
   const currentWorkspaceId = getCurrentWorkspaceId();
   const workspaceEntries = Object.values(workspaceDescriptors.value)
     .filter((workspaceDescriptor) => (
@@ -608,11 +614,37 @@ async function loadInactiveWorkspaceGitSummaries() {
       repoPath: workspaceDescriptor.repoPath!,
     }));
 
-  await Promise.all(
-    workspaceEntries.map((workspaceEntry) => (
-      loadWorkspaceGitSummary(workspaceEntry.workspaceId, workspaceEntry.repoPath)
-    )),
-  );
+  const staggerMs = Math.max(0, options.staggerMs ?? 0);
+
+  try {
+    for (const [index, workspaceEntry] of workspaceEntries.entries()) {
+      await loadWorkspaceGitSummary(workspaceEntry.workspaceId, workspaceEntry.repoPath);
+
+      if (staggerMs > 0 && index < workspaceEntries.length - 1) {
+        await sleep(staggerMs);
+      }
+    }
+  } finally {
+    inactiveWorkspaceGitSummaryRefreshInFlight = false;
+  }
+}
+
+function scheduleInitialInactiveWorkspaceGitSummaryLoad() {
+  if (initialInactiveWorkspaceGitSummaryTimer !== null) {
+    window.clearTimeout(initialInactiveWorkspaceGitSummaryTimer);
+  }
+
+  initialInactiveWorkspaceGitSummaryTimer = window.setTimeout(() => {
+    initialInactiveWorkspaceGitSummaryTimer = null;
+
+    if (!sessionReady.value || isSwitchingWorkspaceContext.value || document.visibilityState !== 'visible') {
+      return;
+    }
+
+    void loadInactiveWorkspaceGitSummaries({
+      staggerMs: INACTIVE_WORKSPACE_GIT_SUMMARY_STAGGER_MS,
+    });
+  }, INITIAL_INACTIVE_WORKSPACE_GIT_SUMMARY_DELAY_MS);
 }
 
 function startInactiveWorkspaceGitSummaryPolling() {
@@ -625,7 +657,9 @@ function startInactiveWorkspaceGitSummaryPolling() {
       return;
     }
 
-    void loadInactiveWorkspaceGitSummaries();
+    void loadInactiveWorkspaceGitSummaries({
+      staggerMs: INACTIVE_WORKSPACE_GIT_SUMMARY_STAGGER_MS,
+    });
   }, INACTIVE_WORKSPACE_GIT_SUMMARY_POLL_MS);
 }
 
@@ -1027,6 +1061,7 @@ function buildWorkspaceSessionState(
     tabs,
     activeTabId,
     editorPaneLayout: cloneWorkspaceEditorPaneLayout(workspaceEditorPaneLayout.value),
+    multiDisplayTabIds: [...workspaceMultiDisplayTabIds.value],
   });
 }
 
@@ -1047,11 +1082,13 @@ function applyWorkspaceSession(nextWorkspaceId: string | null) {
           panes: [],
           activePaneId: null,
         },
+        multiDisplayTabIds: [],
       };
 
   workspaceTabs.value = nextWorkspaceSession.tabs;
   activeWorkspaceTabId.value = nextWorkspaceSession.activeTabId;
   workspaceEditorPaneLayout.value = nextWorkspaceSession.editorPaneLayout;
+  workspaceMultiDisplayTabIds.value = [...nextWorkspaceSession.multiDisplayTabIds];
 }
 
 function captureWorkspaceSession(nextWorkspaceId: string | null) {
@@ -1263,6 +1300,7 @@ function buildSessionSavePayload(
     soundNotificationsEnabled: soundNotificationsEnabled.value,
     seenInfoNoteRevisions: seenInfoNoteRevisions.value,
     terminalCommandPresets: terminalCommandPresets.value,
+    dockerDialogState: cloneDockerDialogState(dockerDialogState.value),
     workspaceSessions: buildPersistedWorkspaceSessions(),
     panelLayout: buildCurrentPanelLayout(),
     panelLayoutsByWorkspace: buildPersistedPanelLayoutsByWorkspace(),
@@ -2499,6 +2537,37 @@ async function focusCommitHistorySearch() {
   }
 }
 
+function openDockerDialog() {
+  isDockerDialogOpen.value = true;
+}
+
+function closeDockerDialog() {
+  isDockerDialogOpen.value = false;
+}
+
+function updateDockerDialogExpandedGroupIds(groupIds: string[]) {
+  dockerDialogState.value = {
+    ...dockerDialogState.value,
+    expandedGroupIds: groupIds,
+  };
+}
+
+function updateDockerDialogActiveView(activeView: 'containers' | 'images') {
+  dockerDialogState.value = {
+    ...dockerDialogState.value,
+    activeView,
+  };
+}
+
+async function handleOpenDockerLogs(containerId: string, containerName: string) {
+  if (terminalCollapsed.value) {
+    terminalCollapsed.value = false;
+    scheduleSessionSave();
+  }
+
+  await terminalPanelRef.value?.openDockerLogs(containerId, containerName);
+}
+
 async function handleSelectFile(filePath: string, diffMode?: GitDiffMode) {
   if (diffCollapsed.value) {
     diffCollapsed.value = false;
@@ -2578,11 +2647,21 @@ function handleGlobalKeydown(event: KeyboardEvent) {
       return;
     }
 
+    if (isDockerDialogOpen.value) {
+      event.preventDefault();
+      closeDockerDialog();
+      return;
+    }
+
     if (isSettingsOpen.value) {
       event.preventDefault();
       isSettingsOpen.value = false;
       return;
     }
+  }
+
+  if (isDockerDialogOpen.value) {
+    return;
   }
 
   if (matchesShortcut(event, SHORTCUTS.historyOpen) && repoPath.value && !isCommitHistoryOpen.value) {
@@ -2624,6 +2703,26 @@ function handleGlobalKeydown(event: KeyboardEvent) {
   if (matchesShortcut(event, SHORTCUTS.terminalNextTab) && sessionReady.value) {
     event.preventDefault();
     terminalPanelRef.value?.focusNextTab();
+    return;
+  }
+
+  if (
+    matchesShortcut(event, SHORTCUTS.settingsOpen)
+    && !isSettingsOpen.value
+    && !isCommitHistoryOpen.value
+  ) {
+    event.preventDefault();
+    isSettingsOpen.value = true;
+    return;
+  }
+
+  if (
+    matchesShortcut(event, SHORTCUTS.dockerDialogOpen)
+    && !isSettingsOpen.value
+    && !isCommitHistoryOpen.value
+  ) {
+    event.preventDefault();
+    openDockerDialog();
     return;
   }
 
@@ -3110,7 +3209,7 @@ watch(repoPath, () => {
   scheduleSessionSave();
 });
 
-watch([recentRepos, workspaceOrder, appAppearance, editorTheme, workspaceIndicatorVisibility, workspaceTabDefaults, soundNotificationsEnabled, terminalCommandPresets, workspaceTabs, workspaceEditorPaneLayout, activeWorkspaceTabId, workspaceRepoPanelStates], () => {
+watch([recentRepos, workspaceOrder, appAppearance, editorTheme, workspaceIndicatorVisibility, workspaceTabDefaults, soundNotificationsEnabled, terminalCommandPresets, dockerDialogState, workspaceTabs, workspaceEditorPaneLayout, workspaceMultiDisplayTabIds, activeWorkspaceTabId, workspaceRepoPanelStates], () => {
   scheduleSessionSave();
 }, { deep: true });
 
@@ -3225,6 +3324,7 @@ onMounted(async () => {
   panelLayoutsByWorkspace.value = clonePanelLayoutsByWorkspace(initialSession.panelLayoutsByWorkspace);
   workspaceRepoPanelStates.value = cloneWorkspaceRepoPanelStates(initialSession.workspaceRepoPanelStates);
   terminalCommandPresets.value = initialSession.terminalCommandPresets;
+  dockerDialogState.value = cloneDockerDialogState(initialSession.dockerDialogState);
   workspaceSessions.value = cloneWorkspaceSessions(initialSession.workspaceSessions);
   seenInfoNoteRevisions.value = cloneSeenInfoNoteRevisions(initialSession.seenInfoNoteRevisions);
   sidebarWidth.value = initialSession.panelLayout.sidebarWidth;
@@ -3242,46 +3342,50 @@ onMounted(async () => {
   const initialRepoPath = requestedInitialRepoPath;
   const initialRepoIsGitRepository = await isGitRepositoryPath(requestedInitialRepoPath);
   const initialRepoPanelState = getWorkspaceRepoPanelStateValue(initialSession.activeWorkspaceId ?? GLOBAL_WORKSPACE_ID);
-  void loadAllWorkspaceGitSummaries();
 
-    if (requestedInitialRepoPath) {
-      const nextProjectTitlesByContext = buildProjectTitlesByContext(
-        projectTitlesByContext.value,
-        initialSession.activeWorkspaceId ?? GLOBAL_WORKSPACE_ID,
-        requestedInitialRepoPath,
-      );
-      projectTitlesByContext.value = nextProjectTitlesByContext;
-    }
+  if (requestedInitialRepoPath) {
+    const nextProjectTitlesByContext = buildProjectTitlesByContext(
+      projectTitlesByContext.value,
+      initialSession.activeWorkspaceId ?? GLOBAL_WORKSPACE_ID,
+      requestedInitialRepoPath,
+    );
+    projectTitlesByContext.value = nextProjectTitlesByContext;
+  }
 
-    if (initialRepoPath) {
-      await setRepoPath(initialRepoPath, {
-        loadMode: initialRepoIsGitRepository ? 'branches' : 'none',
-      });
-      if (initialRepoIsGitRepository) {
-        await detectWorktrees();
-      } else {
-        detectedWorktrees.value = [];
-      }
-
-      if (initialRepoIsGitRepository && shouldLoadDetailedGitStatus(initialRepoPanelState)) {
-        void ensureFullStatus();
-      }
-
-      await restoreCommitHistoryState(initialRepoPanelState, {
-        isGitRepository: initialRepoIsGitRepository,
-      });
+  if (initialRepoPath) {
+    await setRepoPath(initialRepoPath, {
+      loadMode: initialRepoIsGitRepository ? 'branches' : 'none',
+    });
+    if (initialRepoIsGitRepository) {
+      await detectWorktrees();
     } else {
-      await setRepoPath(null);
-      await restoreCommitHistoryState(initialRepoPanelState, {
-        isGitRepository: false,
-      });
+      detectedWorktrees.value = [];
     }
+
+    if (initialWorkspaceDescriptor?.id) {
+      void loadWorkspaceGitSummary(initialWorkspaceDescriptor.id, initialRepoPath);
+    }
+
+    if (initialRepoIsGitRepository && shouldLoadDetailedGitStatus(initialRepoPanelState)) {
+      void ensureFullStatus();
+    }
+
+    await restoreCommitHistoryState(initialRepoPanelState, {
+      isGitRepository: initialRepoIsGitRepository,
+    });
+  } else {
+    await setRepoPath(null);
+    await restoreCommitHistoryState(initialRepoPanelState, {
+      isGitRepository: false,
+    });
+  }
 
   markInfoNoteAsSeenWhenActive();
 
   sessionReady.value = true;
   syncBackgroundShellSubscriptions();
   startInactiveWorkspaceGitSummaryPolling();
+  scheduleInitialInactiveWorkspaceGitSummaryLoad();
   startWorktreeDetectionPolling();
 });
 
@@ -3301,6 +3405,10 @@ onBeforeUnmount(() => {
 
   if (inactiveWorkspaceGitSummaryTimer) {
     window.clearInterval(inactiveWorkspaceGitSummaryTimer);
+  }
+
+  if (initialInactiveWorkspaceGitSummaryTimer) {
+    window.clearTimeout(initialInactiveWorkspaceGitSummaryTimer);
   }
 
   if (worktreeDetectionTimer) {
@@ -3349,6 +3457,7 @@ onBeforeUnmount(() => {
           :collapse-shortcut-display="SHORTCUTS.panelRepoToggle.display"
           @open-info="handleOpenWelcomeNote"
           @open-settings="isSettingsOpen = true"
+          @open-docker="openDockerDialog"
           @open-repo="handleOpenRepo"
           @select-repo="handleSelectRepo"
           @select-workspace="handleSelectWorkspace"
@@ -3450,6 +3559,7 @@ onBeforeUnmount(() => {
             :workspace-tab-defaults="workspaceTabDefaults"
             :tabs="workspaceTabs"
             :editor-pane-layout="workspaceEditorPaneLayout"
+            :multi-display-tab-ids="workspaceMultiDisplayTabIds"
             :active-tab-id="activeWorkspaceTabId"
             :recent-activity="workspaceRecentActivityByWorkspaceId[getCurrentWorkspaceId()] ?? {}"
             :attention="workspaceAttentionByWorkspaceId[getCurrentWorkspaceId()] ?? {}"
@@ -3458,13 +3568,15 @@ onBeforeUnmount(() => {
             :collapsed="terminalCollapsed"
             @update:tabs="workspaceTabs = $event"
             @update:editor-pane-layout="workspaceEditorPaneLayout = $event"
+            @update:multi-display-tab-ids="workspaceMultiDisplayTabIds = $event"
             @update:active-tab-id="activeWorkspaceTabId = $event"
             @update:recent-activity="handleWorkspaceRecentActivityUpdate($event.workspaceId, $event.recentActivity)"
-            @update:attention="handleWorkspaceAttentionUpdate($event.workspaceId, $event.attention)"
-            @reveal-in-all-files="handleRevealInAllFiles"
-            @toggle-collapse="togglePanel('terminal')"
-          />
-        </div>
+          @update:attention="handleWorkspaceAttentionUpdate($event.workspaceId, $event.attention)"
+          @reveal-in-all-files="handleRevealInAllFiles"
+          @open-docker="openDockerDialog"
+          @toggle-collapse="togglePanel('terminal')"
+        />
+      </div>
 
         <div v-if="!hasVisibleRightPanels" class="app__surface app__surface--empty">
           <div class="app__empty-state">
@@ -3510,6 +3622,16 @@ onBeforeUnmount(() => {
       :terminal-command-presets="terminalCommandPresets"
       @open-info="handleOpenWelcomeNote"
       @save="handleSaveSettings"
+    />
+
+    <DockerDialog
+      v-model="isDockerDialogOpen"
+      :active-view="dockerDialogState.activeView"
+      :expanded-group-ids="dockerDialogState.expandedGroupIds"
+      :project-root="repoPath"
+      @update:active-view="updateDockerDialogActiveView"
+      @update:expanded-group-ids="updateDockerDialogExpandedGroupIds"
+      @open-logs="handleOpenDockerLogs"
     />
 
     <CommitHistoryDialog

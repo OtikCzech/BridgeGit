@@ -58,6 +58,7 @@ const props = defineProps<Props>();
 const emit = defineEmits<{
   (event: 'open-info'): void;
   (event: 'open-settings'): void;
+  (event: 'open-docker'): void;
   (event: 'open-repo'): void;
   (event: 'select-repo', path: string): void;
   (event: 'select-workspace', workspaceId: string | null): void;
@@ -143,7 +144,7 @@ interface RepoSectionViewModel {
 }
 
 interface FilesStatusIndicator {
-  id: 'staged' | 'changed' | 'untracked';
+  id: 'changed' | 'untracked' | 'conflicts';
   label: string;
   active: boolean;
   accentClass: string;
@@ -324,22 +325,28 @@ const sections = computed<Omit<RepoSectionViewModel, 'filteredItems'>[]>(() => {
 
 const fileStatusIndicators = computed<FilesStatusIndicator[]>(() => [
   {
-    id: 'staged',
-    label: 'Staged',
-    active: Boolean(props.status?.staged.length),
-    accentClass: 'repo-panel__group-dot--success',
-  },
-  {
     id: 'changed',
     label: 'Changed',
-    active: Boolean(props.status?.unstaged.length),
+    active: props.status
+      ? Boolean(props.status.staged.length || props.status.unstaged.length)
+      : Boolean(currentWorkspaceItem.value?.changedCount),
     accentClass: 'repo-panel__group-dot--warning',
   },
   {
     id: 'untracked',
     label: 'Untracked',
-    active: Boolean(props.status?.untracked.length),
+    active: props.status
+      ? Boolean(props.status.untracked.length)
+      : Boolean(currentWorkspaceItem.value?.untrackedCount),
     accentClass: 'repo-panel__group-dot--muted',
+  },
+  {
+    id: 'conflicts',
+    label: 'Conflicts',
+    active: props.status
+      ? Boolean(props.status.conflicted.length)
+      : Boolean(currentWorkspaceItem.value?.conflictedCount),
+    accentClass: 'repo-panel__group-dot--danger',
   },
 ]);
 
@@ -2953,7 +2960,7 @@ onBeforeUnmount(() => {
             class="repo-panel__project-settings"
             type="button"
             aria-label="Open project settings"
-            title="Project settings"
+            :title="`Project settings ${SHORTCUTS.settingsOpen.display}`"
             @click="emit('open-settings')"
           >
             <span aria-hidden="true">⚙</span>
@@ -2980,6 +2987,23 @@ onBeforeUnmount(() => {
       <div class="repo-panel__workspaces-header">
         <div class="repo-panel__workspaces-heading">
           <span class="repo-panel__label">Workspaces</span>
+        </div>
+
+        <div class="repo-panel__workspaces-actions">
+          <button
+            class="repo-panel__mini-action repo-panel__mini-action--icon"
+            type="button"
+            aria-label="Open Docker dialog"
+            :title="`Open Docker ${SHORTCUTS.dockerDialogOpen.display}`"
+            @click="emit('open-docker')"
+          >
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M4.75 8.25h14.5v4.5H4.75z" />
+              <path d="M4.75 14.25h6.5v4.5h-6.5z" />
+              <path d="M12.75 14.25h6.5v4.5h-6.5z" />
+            </svg>
+          </button>
+
           <button
             class="repo-panel__mini-action repo-panel__mini-action--icon"
             type="button"
@@ -2988,24 +3012,24 @@ onBeforeUnmount(() => {
             @click="emit('open-repo')"
           >
             <svg viewBox="0 0 24 24" aria-hidden="true">
-              <path d="M4.75 6A2.75 2.75 0 0 1 7.5 3.25h3.19c.53 0 1.04.22 1.4.61l1.1 1.14h3.31A2.75 2.75 0 0 1 19.25 7.75v8.75a2.75 2.75 0 0 1-2.75 2.75h-9A2.75 2.75 0 0 1 4.75 16.5V6Zm2.75-1.25c-.69 0-1.25.56-1.25 1.25v10.5c0 .69.56 1.25 1.25 1.25h9c.69 0 1.25-.56 1.25-1.25V7.75c0-.69-.56-1.25-1.25-1.25h-3.63a.75.75 0 0 1-.54-.23L11 5.13a.75.75 0 0 0-.54-.23H7.5Z" />
+            <path d="M4.75 6A2.75 2.75 0 0 1 7.5 3.25h3.19c.53 0 1.04.22 1.4.61l1.1 1.14h3.31A2.75 2.75 0 0 1 19.25 7.75v8.75a2.75 2.75 0 0 1-2.75 2.75h-9A2.75 2.75 0 0 1 4.75 16.5V6Zm2.75-1.25c-.69 0-1.25.56-1.25 1.25v10.5c0 .69.56 1.25 1.25 1.25h9c.69 0 1.25-.56 1.25-1.25V7.75c0-.69-.56-1.25-1.25-1.25h-3.63a.75.75 0 0 1-.54-.23L11 5.13a.75.75 0 0 0-.54-.23H7.5Z" />
               <path d="M12 8.25a.75.75 0 0 1 .75.75v2.25H15a.75.75 0 0 1 0 1.5h-2.25V15a.75.75 0 0 1-1.5 0v-2.25H9a.75.75 0 0 1 0-1.5h2.25V9a.75.75 0 0 1 .75-.75Z" />
             </svg>
           </button>
-        </div>
 
-        <button
-          class="repo-panel__mini-action repo-panel__mini-action--icon"
-          :class="{ 'repo-panel__mini-action--active': isWorkspaceFamilyFocus }"
-          type="button"
-          :aria-label="isWorkspaceFamilyFocus ? 'Show all workspaces' : 'Show only current repo family'"
-          :title="isWorkspaceFamilyFocus ? 'Show all workspaces' : 'Show only current repo family'"
-          @click="handleWorkspaceFamilyFocusToggle"
-        >
-          <svg viewBox="0 0 24 24" aria-hidden="true">
-            <path d="M4.75 6.75A2.75 2.75 0 0 1 7.5 4h9A2.75 2.75 0 0 1 19.25 6.75v1.14c0 .53-.19 1.03-.53 1.42l-3.97 4.47v3.08a.75.75 0 0 1-.27.58l-2.5 2.03A.75.75 0 0 1 10.75 18.9v-5.12L6.78 9.31a2.13 2.13 0 0 1-.53-1.42V6.75ZM7.5 5.5c-.69 0-1.25.56-1.25 1.25v1.14c0 .15.05.29.15.4l4.16 4.69a.75.75 0 0 1 .19.5v3.85l1-.81v-3.04a.75.75 0 0 1 .19-.5l4.16-4.69c.1-.11.15-.25.15-.4V6.75c0-.69-.56-1.25-1.25-1.25h-9Z" />
-          </svg>
-        </button>
+          <button
+            class="repo-panel__mini-action repo-panel__mini-action--icon"
+            :class="{ 'repo-panel__mini-action--active': isWorkspaceFamilyFocus }"
+            type="button"
+            :aria-label="isWorkspaceFamilyFocus ? 'Show all workspaces' : 'Show only current repo family'"
+            :title="isWorkspaceFamilyFocus ? 'Show all workspaces' : 'Show only current repo family'"
+            @click="handleWorkspaceFamilyFocusToggle"
+          >
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M4.75 6.75A2.75 2.75 0 0 1 7.5 4h9A2.75 2.75 0 0 1 19.25 6.75v1.14c0 .53-.19 1.03-.53 1.42l-3.97 4.47v3.08a.75.75 0 0 1-.27.58l-2.5 2.03A.75.75 0 0 1 10.75 18.9v-5.12L6.78 9.31a2.13 2.13 0 0 1-.53-1.42V6.75ZM7.5 5.5c-.69 0-1.25.56-1.25 1.25v1.14c0 .15.05.29.15.4l4.16 4.69a.75.75 0 0 1 .19.5v3.85l1-.81v-3.04a.75.75 0 0 1 .19-.5l4.16-4.69c.1-.11.15-.25.15-.4V6.75c0-.69-.56-1.25-1.25-1.25h-9Z" />
+            </svg>
+          </button>
+        </div>
       </div>
 
       <div v-if="shouldShowWorkspaceFamilySwitcher" class="repo-panel__workspace-family-switcher">
@@ -4311,6 +4335,13 @@ onBeforeUnmount(() => {
   align-items: center;
   gap: 8px;
   min-width: 0;
+}
+
+.repo-panel__workspaces-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
 }
 
 .repo-panel__workspace-family-switcher {

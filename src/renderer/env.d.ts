@@ -5,6 +5,8 @@ import type {
   CreateBranchOptions,
   CreateBranchResult,
   DeleteBranchResult,
+  DockerContainerInfo,
+  DockerImageInfo,
   GitChange,
   GitCommitDetail,
   GitDiffMode,
@@ -123,6 +125,21 @@ declare global {
         kill: (ptyId: string) => void;
         onData: (listener: (payload: PtyDataEvent) => void) => () => void;
         onExit: (listener: (payload: PtyExitEvent) => void) => () => void;
+      };
+      docker: {
+        available: () => Promise<boolean>;
+        containers: () => Promise<DockerContainerInfo[]>;
+        images: () => Promise<DockerImageInfo[]>;
+        containerAction: (
+          containerId: string,
+          action: 'start' | 'stop' | 'restart' | 'remove',
+        ) => Promise<void>;
+        removeImage: (imageId: string) => Promise<void>;
+        composeUp: (cwd: string) => Promise<void>;
+        composeDown: (cwd: string) => Promise<void>;
+        composeRestart: (cwd: string) => Promise<void>;
+        resetBackend: () => Promise<void>;
+        logsCommand: (containerId: string) => Promise<{ shell: string; command: string }>;
       };
     };
   }

@@ -2,13 +2,13 @@
 
 This note is the default place for release updates and small product messages inside BridgeGit.
 
-## New in 0.5.1
+## New in 0.6.0
 
-- `Replace in Files` now builds directly on the workspace search overlay with `Ctrl+Shift+H`
-- replace one match, all shown matches in the current file, or all shown matches across the repo
-- keep the existing preview, file filter and tracked/untracked scope while replacing
-- refresh open clean tabs and search results after replace so the workspace stays in sync
-- continue with the same repo, editor and session workflow introduced in `0.5.0`
+- open the new global `Docker` dialog to inspect containers and images, group Compose projects, run quick actions and jump straight into logs tabs
+- keep two workspace tabs visible at once with `Ctrl+click` on tab headers; this now works for `shell`, `note` and `code` tabs
+- restore the same two-tab workspace comparison layout after reopening the app
+- use the tab context menu when you want the same side-by-side workspace view without relying on the keyboard
+- keep `wsl` shell jumps, mixed Windows/WSL file paths and background workspace refresh calmer and more reliable than the previous public release line
 
 ## Quick Start
 
@@ -26,6 +26,7 @@ This note is the default place for release updates and small product messages in
 - Hold Ctrl and use the mouse wheel over shell, note, code, or the workspace sidebar to change font size.
 - Use the layout settings to move the repository panel left or right and place diff top, bottom, left, or right.
 - Use `Ctrl+Alt+Arrow` to split or focus editor panes, and `Ctrl+Alt+Shift+Arrow` to merge them back.
+- Use `Ctrl+click` on workspace tabs to show two open tabs side by side.
 - Ctrl/Cmd+click on a file path in code to open it.
 - Ctrl/Cmd+click on a symbol usage to jump to its definition.
 - Ctrl/Cmd+click on a symbol definition to open references.

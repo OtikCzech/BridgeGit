@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.6.0 - 2026-04-17
+
+Workspace expansion release focused on comparing more context at once and bringing Docker runtime control directly into the app.
+
+- Added a global `Docker` dialog with container and image overview, grouped Compose projects, quick actions and direct logs tabs
+- Added `Ctrl+click` two-tab workspace view for `shell`, `note` and `code` tabs so two open tabs can stay visible side by side
+- Persisted the two-tab workspace view across session restore and added matching tab context-menu actions
+- Simplified the Docker dialog header so the global runtime view does not imply a misleading single compose-root scope
+- Brought the internal `0.5.2` terminal and navigation fixes into the release line, including preserved repo cwd when entering `wsl`, more reliable mixed Windows and WSL path opening, and smoother background workspace refresh
+
+## v0.5.2 - 2026-04-15
+
+Patch release focused on terminal path correctness and quieter workspace refresh across mixed Windows and WSL setups.
+
+- Preserved the current repository cwd when entering `wsl` from the integrated PowerShell terminal
+- Resolved mixed Windows and WSL file paths more reliably for note loading and terminal file-link navigation
+- Smoothed background repo refresh for inactive workspaces to reduce bursty polling while keeping branch summaries current
+- Refined repo-panel status indicators to emphasize changed, untracked and conflicted files more clearly
+
 ## v0.5.1 - 2026-04-13
 
 Search follow-up release focused on finishing workspace text replacement and smoothing the release handoff.

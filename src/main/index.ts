@@ -5,8 +5,9 @@ import { existsSync } from 'node:fs';
 import { readdir, readFile, stat, writeFile } from 'node:fs/promises';
 import { basename, dirname, extname, isAbsolute, join, resolve, win32 } from 'node:path';
 import { promisify } from 'node:util';
+import { registerDockerIpcHandlers } from './docker';
 import { registerGitIpcHandlers } from './git';
-import { normalizeStoredPath } from './path-utils';
+import { normalizeStoredPath, parseWindowsWslPath } from './path-utils';
 import { cleanupPtysForWebContents, registerPtyIpcHandlers } from './pty';
 import { loadSession, saveSession } from './store';
 import type { NoteFileHandle, NoteFileStat, SessionData } from '../shared/bridgegit';
@@ -109,13 +110,14 @@ async function resolveDialogDefaultPath(defaultPath?: string | null): Promise<st
 }
 
 async function readNoteFileHandle(filePath: string): Promise<NoteFileHandle> {
+  const resolvedFilePath = await resolveReadableFilePath(filePath);
   const [content, fileStat] = await Promise.all([
-    readFile(filePath, 'utf8'),
-    stat(filePath),
+    readFile(resolvedFilePath, 'utf8'),
+    stat(resolvedFilePath),
   ]);
 
   return {
-    path: filePath,
+    path: resolvedFilePath,
     content,
     lastModifiedMs: fileStat.mtimeMs,
     size: fileStat.size,
@@ -124,20 +126,78 @@ async function readNoteFileHandle(filePath: string): Promise<NoteFileHandle> {
 
 async function readNoteFileStat(filePath: string): Promise<NoteFileStat | null> {
   try {
-    const fileStat = await stat(filePath);
+    const resolvedFilePath = await resolveReadableFilePath(filePath);
+    const fileStat = await stat(resolvedFilePath);
 
     if (!fileStat.isFile()) {
       return null;
     }
 
     return {
-      path: filePath,
+      path: resolvedFilePath,
       lastModifiedMs: fileStat.mtimeMs,
       size: fileStat.size,
     };
   } catch {
     return null;
   }
+}
+
+function buildReadableFilePathCandidates(filePath: string): string[] {
+  const trimmedPath = filePath.trim();
+
+  if (!trimmedPath) {
+    return [];
+  }
+
+  const candidates = new Set<string>();
+  const normalizedStoredPath = normalizeStoredPath(trimmedPath);
+  const normalizedWslUncPath = /^\/(wsl\.localhost|wsl\$)\//i.test(trimmedPath) && !trimmedPath.startsWith('//')
+    ? `/${trimmedPath}`
+    : trimmedPath;
+
+  candidates.add(trimmedPath);
+  candidates.add(normalizedWslUncPath);
+
+  if (normalizedStoredPath) {
+    candidates.add(normalizedStoredPath);
+  }
+
+  if (process.platform !== 'win32') {
+    const normalizedWindowsPath = trimmedPath.replace(/\\/g, '/');
+    const windowsDriveMatch = normalizedWindowsPath.match(/^([A-Za-z]):\/(.*)$/);
+
+    if (windowsDriveMatch) {
+      const [, driveLetter, suffix] = windowsDriveMatch;
+      candidates.add(`/mnt/${driveLetter.toLowerCase()}/${suffix}`);
+    }
+
+    const wslPath = parseWindowsWslPath(normalizedWslUncPath.replace(/\//g, '\\'));
+
+    if (wslPath?.linuxPath) {
+      candidates.add(wslPath.linuxPath);
+    }
+  }
+
+  return [...candidates];
+}
+
+async function resolveReadableFilePath(filePath: string): Promise<string> {
+  const candidates = buildReadableFilePathCandidates(filePath);
+
+  for (const candidate of candidates) {
+    try {
+      const fileStat = await stat(candidate);
+
+      if (fileStat.isFile()) {
+        return candidate;
+      }
+    } catch {
+      // Try the next candidate path variant.
+    }
+  }
+
+  throw new Error(`File not found: ${filePath}`);
 }
 
 function normalizeNoteLinkLookup(value: string) {
@@ -298,6 +358,7 @@ async function createMainWindow() {
 function registerCoreIpcHandlers() {
   registerGitIpcHandlers();
   registerPtyIpcHandlers();
+  registerDockerIpcHandlers();
 
   ipcMain.handle('dialog:openRepo', async (_event, defaultPath?: string | null) => {
     const options: OpenDialogOptions = {

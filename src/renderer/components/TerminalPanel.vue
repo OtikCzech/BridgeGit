@@ -60,6 +60,7 @@ interface Props {
   workspaceTabDefaults: WorkspaceTabDefaults;
   tabs: WorkspaceTabState[];
   editorPaneLayout: WorkspaceEditorPaneLayout;
+  multiDisplayTabIds: string[];
   activeTabId: string | null;
   recentActivity: Record<string, boolean>;
   attention: Record<string, boolean>;
@@ -72,6 +73,7 @@ const props = defineProps<Props>();
 const CREATION_MENU_ACTION_ORDER = ['shell', 'note', 'open-file'] as const;
 type FindInFilesMode = 'find' | 'replace';
 type CreationMenuActionId = (typeof CREATION_MENU_ACTION_ORDER)[number];
+type MultiDisplayTabState = WorkspaceShellTabState | WorkspaceNoteTabState | WorkspaceCodeTabState;
 const ALL_TABS_TYPE_FILTER_OPTIONS = [
   { value: 'all', label: 'All' },
   { value: 'shell', label: 'Shell' },
@@ -83,10 +85,12 @@ type AllTabsTypeFilterValue = (typeof ALL_TABS_TYPE_FILTER_OPTIONS)[number]['val
 const emit = defineEmits<{
   'update:tabs': [tabs: WorkspaceTabState[]];
   'update:editor-pane-layout': [editorPaneLayout: WorkspaceEditorPaneLayout];
+  'update:multi-display-tab-ids': [multiDisplayTabIds: string[]];
   'update:active-tab-id': [activeTabId: string | null];
   'update:recent-activity': [payload: { workspaceId: string; recentActivity: Record<string, boolean> }];
   'update:attention': [payload: { workspaceId: string; attention: Record<string, boolean> }];
   'reveal-in-all-files': [filePath: string];
+  'open-docker': [];
   'toggle-collapse': [];
   activity: [];
 }>();
@@ -97,6 +101,7 @@ const editorPaneLayout = ref<WorkspaceEditorPaneLayout>({
   activePaneId: null,
 });
 const activeTabId = ref<string | null>(null);
+const multiDisplayTabIds = ref<string[]>([]);
 const editingTabId = ref<string | null>(null);
 const draftTitle = ref('');
 const editingInput = ref<HTMLInputElement | null>(null);
@@ -242,7 +247,21 @@ const sortedPresets = computed(() => (
 const activeWorkspaceTab = computed(() => (
   activeTabId.value ? getTabById(activeTabId.value) : null
 ));
-const usesEditorPaneLayout = computed(() => Boolean(activeWorkspaceTab.value && isCodeTab(activeWorkspaceTab.value)));
+const multiDisplayTabs = computed(() => {
+  const displayTabIds = new Set(multiDisplayTabIds.value);
+  const nextTabs = tabs.value.filter((tab): tab is MultiDisplayTabState => (
+    displayTabIds.has(tab.id)
+    && isMultiDisplayTab(tab)
+  ));
+
+  return nextTabs.length === 2 ? nextTabs : [];
+});
+const isMultiDisplayMode = computed(() => multiDisplayTabs.value.length === 2);
+const multiDisplayTabIdSet = computed(() => new Set(multiDisplayTabs.value.map((tab) => tab.id)));
+const usesEditorPaneLayout = computed(() => (
+  !isMultiDisplayMode.value
+  && Boolean(activeWorkspaceTab.value && isPaneTab(activeWorkspaceTab.value))
+));
 const visibleEditorPanes = computed(() => {
   if (!usesEditorPaneLayout.value) {
     return [];
@@ -253,11 +272,11 @@ const visibleEditorPanes = computed(() => {
   return sortEditorPanes(normalizedLayout.panes)
     .map((pane) => {
       const tab = pane.tabId ? getTabById(pane.tabId) : null;
-      return tab && isCodeTab(tab)
+      return tab && isPaneTab(tab)
         ? { pane, tab }
         : null;
     })
-    .filter((entry): entry is { pane: WorkspaceEditorPaneState; tab: WorkspaceCodeTabState } => Boolean(entry));
+    .filter((entry): entry is { pane: WorkspaceEditorPaneState; tab: WorkspaceCodeTabState | WorkspaceNoteTabState } => Boolean(entry));
 });
 const editorPaneGridStyle = computed(() => {
   const hasSecondColumn = visibleEditorPanes.value.some((entry) => entry.pane.col === 1);
@@ -300,7 +319,7 @@ const allTabsResults = computed(() => {
   return tabs.value
     .map((tab) => {
       const secondaryMeta = getTabSecondaryMeta(tab);
-      const paneCount = isCodeTab(tab)
+      const paneCount = isPaneTab(tab)
         ? normalizedLayout.panes.filter((pane) => pane.tabId === tab.id).length
         : 0;
       const searchText = [
@@ -714,8 +733,16 @@ function isCodeTab(tab: WorkspaceTabState): tab is WorkspaceCodeTabState {
   return tab.type === 'code';
 }
 
-function isEditableTab(tab: WorkspaceTabState): tab is WorkspaceNoteTabState | WorkspaceCodeTabState {
+function isMultiDisplayTab(tab: WorkspaceTabState): tab is MultiDisplayTabState {
+  return isShellTab(tab) || isPaneTab(tab);
+}
+
+function isPaneTab(tab: WorkspaceTabState): tab is WorkspaceCodeTabState | WorkspaceNoteTabState {
   return isNoteTab(tab) || isCodeTab(tab);
+}
+
+function isEditableTab(tab: WorkspaceTabState): tab is WorkspaceNoteTabState | WorkspaceCodeTabState {
+  return isPaneTab(tab);
 }
 
 function cloneTabs(source: WorkspaceTabState[]): WorkspaceTabState[] {
@@ -1282,6 +1309,49 @@ function createEditorPaneId() {
   return `pane-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+function normalizeMultiDisplayTabIds(
+  sourceTabIds: string[],
+  sourceTabs = tabs.value,
+) {
+  const validTabIds = new Set(
+    sourceTabs
+      .filter((tab): tab is MultiDisplayTabState => isMultiDisplayTab(tab))
+      .map((tab) => tab.id),
+  );
+  const uniqueTabIds = Array.from(new Set(sourceTabIds)).filter((tabId) => validTabIds.has(tabId));
+  const orderedTabIds = sourceTabs
+    .filter((tab) => uniqueTabIds.includes(tab.id))
+    .map((tab) => tab.id);
+
+  return orderedTabIds.length === 2 ? orderedTabIds : [];
+}
+
+function updateMultiDisplayTabIds(nextTabIds: string[], sourceTabs = tabs.value) {
+  const normalizedTabIds = normalizeMultiDisplayTabIds(nextTabIds, sourceTabs);
+  multiDisplayTabIds.value = normalizedTabIds;
+  emit('update:multi-display-tab-ids', [...normalizedTabIds]);
+
+  const nextStartedShellTabs = { ...startedShellTabs.value };
+  let didChangeStartedShellTabs = false;
+
+  normalizedTabIds.forEach((tabId) => {
+    const tab = sourceTabs.find((entry) => entry.id === tabId);
+
+    if (!tab || !isShellTab(tab) || nextStartedShellTabs[tabId]) {
+      return;
+    }
+
+    nextStartedShellTabs[tabId] = true;
+    didChangeStartedShellTabs = true;
+  });
+
+  if (didChangeStartedShellTabs) {
+    startedShellTabs.value = nextStartedShellTabs;
+  }
+
+  return normalizedTabIds;
+}
+
 function syncState(
   nextTabs: WorkspaceTabState[],
   nextActiveTabId: string | null,
@@ -1291,6 +1361,13 @@ function syncState(
     nextEditorPaneLayout,
     nextTabs,
     nextActiveTabId,
+  );
+  const normalizedMultiDisplayTabIds = normalizeMultiDisplayTabIds(multiDisplayTabIds.value, nextTabs);
+  updateMultiDisplayTabIds(
+    nextActiveTabId && normalizedMultiDisplayTabIds.includes(nextActiveTabId)
+      ? normalizedMultiDisplayTabIds
+      : [],
+    nextTabs,
   );
   tabs.value = cloneTabs(nextTabs);
   editorPaneLayout.value = cloneEditorPaneLayoutState(normalizedEditorPaneLayout);
@@ -1325,6 +1402,7 @@ function buildShellTab(cwd = props.cwd): WorkspaceShellTabState {
     type: 'shell',
     title: `Shell ${getNextTabNumber('shell')}`,
     cwd,
+    shell: null,
     fontSize: props.workspaceTabDefaults.shellFontSize,
     launcherProfileId: null,
   };
@@ -1404,10 +1482,22 @@ function setTabRef(
   tabRefs.set(tabId, tabElement);
 }
 
+function setActiveTabDirect(tabId: string) {
+  activeTabId.value = tabId;
+  emit('update:active-tab-id', tabId);
+  clearTabActivity(tabId);
+  clearTabAttention(tabId);
+  tabMenu.value = null;
+  creationMenu.value = null;
+  commandMenuOpen.value = false;
+  closeAllTabsDialog();
+  markShellTabAsStarted(tabId);
+}
+
 function setActiveTab(tabId: string) {
   const targetTab = getTabById(tabId);
 
-  if (targetTab && isCodeTab(targetTab)) {
+  if (targetTab && isPaneTab(targetTab)) {
     assignTabToActiveEditorPane(tabId);
     clearTabActivity(tabId);
     clearTabAttention(tabId);
@@ -1417,14 +1507,70 @@ function setActiveTab(tabId: string) {
     return;
   }
 
-  activeTabId.value = tabId;
-  emit('update:active-tab-id', tabId);
-  clearTabActivity(tabId);
-  clearTabAttention(tabId);
-  tabMenu.value = null;
-  creationMenu.value = null;
-  commandMenuOpen.value = false;
-  closeAllTabsDialog();
+  setActiveTabDirect(tabId);
+}
+
+function activateMultiDisplayTab(tabId: string) {
+  if (!multiDisplayTabIdSet.value.has(tabId)) {
+    return false;
+  }
+
+  setActiveTabDirect(tabId);
+  return true;
+}
+
+function toggleMultiDisplayTab(tabId: string) {
+  const targetTab = getTabById(tabId);
+
+  if (!targetTab || !isMultiDisplayTab(targetTab)) {
+    return false;
+  }
+
+  if (multiDisplayTabIdSet.value.has(tabId)) {
+    updateMultiDisplayTabIds([]);
+    setActiveTabDirect(tabId);
+    return true;
+  }
+
+  const activeTab = activeTabId.value ? getTabById(activeTabId.value) : null;
+
+  if (!activeTab || !isMultiDisplayTab(activeTab) || activeTab.id === tabId) {
+    return false;
+  }
+
+  const nextTabIds = updateMultiDisplayTabIds([activeTab.id, tabId]);
+
+  if (nextTabIds.length !== 2) {
+    return false;
+  }
+
+  setActiveTabDirect(tabId);
+  return true;
+}
+
+function canToggleMultiDisplayTab(tab: WorkspaceTabState) {
+  if (!isMultiDisplayTab(tab)) {
+    return false;
+  }
+
+  if (multiDisplayTabIdSet.value.has(tab.id)) {
+    return true;
+  }
+
+  const activeTab = activeTabId.value ? getTabById(activeTabId.value) : null;
+  return Boolean(activeTab && isMultiDisplayTab(activeTab) && activeTab.id !== tab.id);
+}
+
+function multiDisplayMenuActionLabel(tab: WorkspaceTabState) {
+  return multiDisplayTabIdSet.value.has(tab.id)
+    ? 'Stop showing side by side'
+    : 'Open side by side';
+}
+
+function handleMultiDisplayMenuAction(tabId: string) {
+  if (toggleMultiDisplayTab(tabId)) {
+    closeTabMenu();
+  }
 }
 
 function markShellTabAsInteracted(tabId: string) {
@@ -1453,16 +1599,35 @@ function markShellTabAsStarted(tabId: string) {
   };
 }
 
-function handleTabClick(tabId: string) {
+function handleTabClick(tabId: string, event?: MouseEvent) {
   if (editingTabId.value === tabId) {
     return;
   }
 
   markShellTabAsStarted(tabId);
+
+  if ((event?.ctrlKey || event?.metaKey) && toggleMultiDisplayTab(tabId)) {
+    return;
+  }
+
+  if (isMultiDisplayMode.value) {
+    if (activateMultiDisplayTab(tabId)) {
+      return;
+    }
+
+    updateMultiDisplayTabIds([]);
+    setActiveTabDirect(tabId);
+    return;
+  }
+
   setActiveTab(tabId);
 }
 
 function handleTerminalViewActivate(tabId: string) {
+  if (multiDisplayTabIdSet.value.has(tabId)) {
+    setActiveTabDirect(tabId);
+  }
+
   markShellTabAsStarted(tabId);
   markShellTabAsInteracted(tabId);
 }
@@ -1834,7 +1999,7 @@ function getTabSecondaryMeta(tab: WorkspaceTabState) {
     return tab.cwd;
   }
 
-  return tab.filePath;
+  return isEditableTab(tab) ? tab.filePath : null;
 }
 
 function splitShortcutDisplay(display: string) {
@@ -2010,6 +2175,39 @@ function updateShellTabState(tabId: string, patch: Partial<WorkspaceShellTabStat
   syncState(nextTabs, activeTabId.value);
 }
 
+async function openDockerLogs(containerId: string, containerName: string) {
+  if (!window.bridgegit?.docker) {
+    return;
+  }
+
+  const logsCommand = await window.bridgegit.docker.logsCommand(containerId);
+  const shellTab = buildShellTab(props.cwd);
+  shellTab.title = `logs:${containerName.slice(0, 20)}`;
+  shellTab.shell = logsCommand.shell;
+  syncState([...tabs.value, shellTab], shellTab.id);
+
+  const sessionView = await waitForSessionView(shellTab.id);
+
+  if (!sessionView) {
+    return;
+  }
+
+  await sessionView.runPreset({
+    id: `docker-logs-${containerId}`,
+    name: `Docker logs ${containerName}`,
+    target: 'active-tab',
+    shortcutSlot: null,
+    steps: [
+      {
+        id: 'docker-logs-cmd',
+        type: 'write',
+        value: logsCommand.command,
+        submit: true,
+      },
+    ],
+  });
+}
+
 function findNoteTabByFilePath(filePath: string, excludeTabId?: string | null): WorkspaceNoteTabState | null {
   const lookupPath = normalizeFileLookup(filePath);
 
@@ -2036,7 +2234,7 @@ function findEditorPaneByTabId(tabId: string, sourceLayout = editorPaneLayout.va
 }
 
 function activateExistingWorkspaceFileTab<T extends WorkspaceNoteTabState | WorkspaceCodeTabState>(tab: T): T {
-  if (isCodeTab(tab)) {
+  if (isPaneTab(tab)) {
     const normalizedLayout = normalizeEditorPaneLayout(editorPaneLayout.value, tabs.value, tab.id);
     const pane = findEditorPaneByTabId(tab.id, normalizedLayout);
 
@@ -2075,8 +2273,8 @@ function buildFileBackedCodeTab(filePath: string, content: string): WorkspaceCod
   };
 }
 
-function getCodeTabs(sourceTabs = tabs.value) {
-  return sourceTabs.filter((tab): tab is WorkspaceCodeTabState => isCodeTab(tab));
+function getPaneTabs(sourceTabs = tabs.value) {
+  return sourceTabs.filter((tab): tab is WorkspaceCodeTabState | WorkspaceNoteTabState => isPaneTab(tab));
 }
 
 function sortEditorPanes(panes: WorkspaceEditorPaneState[]) {
@@ -2094,10 +2292,10 @@ function normalizeEditorPaneLayout(
   nextTabs = tabs.value,
   nextActiveTabId = activeTabId.value,
 ): WorkspaceEditorPaneLayout {
-  const codeTabs = getCodeTabs(nextTabs);
+  const paneTabs = getPaneTabs(nextTabs);
   const fallbackTabId = (
-    (nextActiveTabId && codeTabs.some((tab) => tab.id === nextActiveTabId) ? nextActiveTabId : null)
-    ?? codeTabs[0]?.id
+    (nextActiveTabId && paneTabs.some((tab) => tab.id === nextActiveTabId) ? nextActiveTabId : null)
+    ?? paneTabs[0]?.id
     ?? null
   );
 
@@ -2105,14 +2303,14 @@ function normalizeEditorPaneLayout(
     return buildEmptyEditorPaneLayout();
   }
 
-  const codeTabIds = new Set(codeTabs.map((tab) => tab.id));
+  const paneTabIds = new Set(paneTabs.map((tab) => tab.id));
   const normalizedPanes = sortEditorPanes(sourceLayout.panes)
     .filter((pane, index, panes) => (
       panes.findIndex((candidate) => candidate.row === pane.row && candidate.col === pane.col) === index
     ))
     .map((pane) => ({
       ...pane,
-      tabId: pane.tabId && codeTabIds.has(pane.tabId) ? pane.tabId : fallbackTabId,
+      tabId: pane.tabId && paneTabIds.has(pane.tabId) ? pane.tabId : fallbackTabId,
     }));
 
   const panes = normalizedPanes.length > 0
@@ -2248,9 +2446,13 @@ function compactEditorPaneLayout(sourceLayout: WorkspaceEditorPaneLayout): Works
 }
 
 function splitEditorPane(direction: 'left' | 'right' | 'up' | 'down') {
+  if (isMultiDisplayMode.value) {
+    return false;
+  }
+
   const activeTab = activeTabId.value ? getTabById(activeTabId.value) : null;
 
-  if (!activeTab || !isCodeTab(activeTab)) {
+  if (!activeTab || !isPaneTab(activeTab)) {
     return false;
   }
 
@@ -2301,9 +2503,13 @@ function splitEditorPane(direction: 'left' | 'right' | 'up' | 'down') {
 }
 
 function closeEditorPane(direction: 'left' | 'right' | 'up' | 'down') {
+  if (isMultiDisplayMode.value) {
+    return false;
+  }
+
   const activeTab = activeTabId.value ? getTabById(activeTabId.value) : null;
 
-  if (!activeTab || !isCodeTab(activeTab)) {
+  if (!activeTab || !isPaneTab(activeTab)) {
     return false;
   }
 
@@ -2338,7 +2544,7 @@ function splitSpecificEditorPane(paneId: string, direction: 'left' | 'right' | '
 
   const currentTab = getTabById(pane.tabId);
 
-  if (!currentTab || !isCodeTab(currentTab)) {
+  if (!currentTab || !isPaneTab(currentTab)) {
     return false;
   }
 
@@ -3779,7 +3985,15 @@ function activateSelectedAllTabsItem() {
 }
 
 function activateAllTabsItem(tabId: string) {
-  setActiveTab(tabId);
+  if (isMultiDisplayMode.value) {
+    if (!activateMultiDisplayTab(tabId)) {
+      updateMultiDisplayTabIds([]);
+      setActiveTabDirect(tabId);
+    }
+  } else {
+    setActiveTab(tabId);
+  }
+
   closeAllTabsDialog();
 }
 
@@ -4042,7 +4256,7 @@ function collapseEditorPanesForTabs(
   nextActiveTabId: string | null,
   sourceLayout = editorPaneLayout.value,
 ) {
-  if (getCodeTabs(nextTabs).length <= 1) {
+  if (getPaneTabs(nextTabs).length <= 1) {
     return buildEmptyEditorPaneLayout();
   }
 
@@ -4145,7 +4359,9 @@ function requestCloseTabs(
     const singleTab = closingTabs.length === 1 ? closingTabs[0] : null;
     pendingCloseDialog.value = {
       mode: singleTab ? 'single' : 'bulk',
-      kind: singleTab?.type ?? 'shell',
+      kind: singleTab
+        ? (isCodeTab(singleTab) ? 'code' : (isNoteTab(singleTab) ? 'note' : 'shell'))
+        : 'shell',
       tabIds: closingTabs.map((tab) => tab.id),
       title: options.title ?? (singleTab ? singleTab.title : `Close ${closingTabs.length} tabs?`),
       hasSavedFile: Boolean(singleTab && isEditableTab(singleTab) && singleTab.filePath),
@@ -4895,6 +5111,11 @@ watch(
   () => props.tabs,
   (nextTabs) => {
     tabs.value = cloneTabs(nextTabs);
+    const normalizedMultiDisplayTabIds = normalizeMultiDisplayTabIds(multiDisplayTabIds.value, nextTabs);
+    if (normalizedMultiDisplayTabIds.join('|') !== multiDisplayTabIds.value.join('|')) {
+      emit('update:multi-display-tab-ids', [...normalizedMultiDisplayTabIds]);
+    }
+    multiDisplayTabIds.value = normalizedMultiDisplayTabIds;
     pruneTabActivityState(nextTabs);
     pruneExternalFileRuntimeState(nextTabs);
     editorPaneLayout.value = normalizeEditorPaneLayout(editorPaneLayout.value, nextTabs, activeTabId.value);
@@ -4944,9 +5165,21 @@ watch(
 );
 
 watch(
+  () => props.multiDisplayTabIds,
+  (nextMultiDisplayTabIds) => {
+    multiDisplayTabIds.value = normalizeMultiDisplayTabIds(nextMultiDisplayTabIds, tabs.value);
+  },
+  { deep: true, immediate: true },
+);
+
+watch(
   () => props.activeTabId,
   (nextActiveTabId) => {
     activeTabId.value = nextActiveTabId ?? props.tabs[0]?.id ?? null;
+    if (activeTabId.value && !multiDisplayTabIdSet.value.has(activeTabId.value)) {
+      emit('update:multi-display-tab-ids', []);
+      multiDisplayTabIds.value = [];
+    }
     editorPaneLayout.value = normalizeEditorPaneLayout(editorPaneLayout.value, tabs.value, activeTabId.value);
 
     if (activeTabId.value) {
@@ -4974,6 +5207,7 @@ watch(
 
     isRestoringWorkspaceIndicators = true;
     resetTransientTabState();
+    multiDisplayTabIds.value = normalizeMultiDisplayTabIds(props.multiDisplayTabIds, props.tabs);
     await nextTick();
     restoreWorkspaceIndicatorState();
     isRestoringWorkspaceIndicators = false;
@@ -4985,6 +5219,7 @@ onMounted(async () => {
   tabs.value = cloneTabs(props.tabs);
   editorPaneLayout.value = normalizeEditorPaneLayout(props.editorPaneLayout, props.tabs, props.activeTabId ?? props.tabs[0]?.id ?? null);
   activeTabId.value = props.activeTabId ?? props.tabs[0]?.id ?? null;
+  multiDisplayTabIds.value = normalizeMultiDisplayTabIds(props.multiDisplayTabIds, props.tabs);
   if (activeTabId.value) {
     markShellTabAsStarted(activeTabId.value);
   }
@@ -5029,6 +5264,7 @@ onBeforeUnmount(() => {
 defineExpose({
   addShellTab,
   addNoteTab,
+  openDockerLogs,
   closeActiveTab,
   closeEditorPane: (direction: 'left' | 'right' | 'up' | 'down') => closeEditorPane(direction),
   focusPreviousTab: () => selectAdjacentTab(-1),
@@ -5059,12 +5295,13 @@ defineExpose({
           class="terminal-panel__tab"
           :class="{
             'terminal-panel__tab--active': hasTabActiveChrome(tab),
+            'terminal-panel__tab--displayed': multiDisplayTabIdSet.has(tab.id),
             'terminal-panel__tab--editing': editingTabId === tab.id,
             'terminal-panel__tab--dragging': tab.id === draggedTabId,
             'terminal-panel__tab--drop-target': tab.id === dropTargetTabId && tab.id !== draggedTabId,
           }"
           :draggable="sortedTabCount > 1 && editingTabId !== tab.id"
-          @click="handleTabClick(tab.id)"
+          @click="handleTabClick(tab.id, $event)"
           @contextmenu="openTabMenu($event, tab)"
           @dragstart="handleTabDragStart($event, tab.id)"
           @dragover="handleTabDragOver($event, tab.id)"
@@ -5214,13 +5451,14 @@ defineExpose({
     <div class="terminal-panel__views">
       <template v-for="tab in tabs" :key="tab.id">
         <TerminalSessionView
-          v-if="tab.type === 'shell' && shouldMountShellTab(tab)"
+          v-if="tab.type === 'shell' && shouldMountShellTab(tab) && !multiDisplayTabIdSet.has(tab.id)"
           :key="buildWorkspaceTabRuntimeKey(props.workspaceId, tab.id)"
           :ref="(instance) => setSessionViewRef(tab.id, instance)"
           class="terminal-panel__view"
           :class="{ 'terminal-panel__view--active': tab.id === activeTabId }"
           :session-key="buildWorkspaceTabRuntimeKey(props.workspaceId, tab.id)"
           :cwd="tab.cwd"
+          :shell="tab.shell ?? null"
           :project-root="props.projectRoot"
           :font-size="tab.fontSize"
           :appearance-theme="props.appearanceTheme"
@@ -5236,7 +5474,7 @@ defineExpose({
         />
 
         <NoteTabView
-          v-else-if="tab.type === 'note'"
+          v-else-if="tab.type === 'note' && !usesEditorPaneLayout && !multiDisplayTabIdSet.has(tab.id)"
           :key="buildWorkspaceTabRuntimeKey(props.workspaceId, tab.id)"
           class="terminal-panel__view"
           :class="{ 'terminal-panel__view--active': tab.id === activeTabId }"
@@ -5266,7 +5504,7 @@ defineExpose({
         />
 
         <CodeTabView
-          v-else-if="tab.type === 'code' && !usesEditorPaneLayout"
+          v-else-if="tab.type === 'code' && !usesEditorPaneLayout && !multiDisplayTabIdSet.has(tab.id)"
           :key="buildWorkspaceTabRuntimeKey(props.workspaceId, tab.id)"
           class="terminal-panel__view"
           :class="{ 'terminal-panel__view--active': tab.id === activeTabId }"
@@ -5296,7 +5534,99 @@ defineExpose({
       </template>
 
       <div
-        v-if="usesEditorPaneLayout && visibleEditorPanes.length"
+        v-if="isMultiDisplayMode"
+        class="terminal-panel__multi-display"
+      >
+        <section
+          v-for="tab in multiDisplayTabs"
+          :key="`multi-display:${tab.id}`"
+          class="terminal-panel__multi-display-pane"
+          :class="{ 'terminal-panel__multi-display-pane--active': tab.id === activeTabId }"
+          @pointerdown.capture="activateMultiDisplayTab(tab.id)"
+        >
+          <TerminalSessionView
+            v-if="tab.type === 'shell'"
+            :key="buildWorkspaceTabRuntimeKey(props.workspaceId, `multi:${tab.id}`)"
+            :ref="(instance) => setSessionViewRef(tab.id, instance)"
+            class="terminal-panel__multi-display-view"
+            :session-key="buildWorkspaceTabRuntimeKey(props.workspaceId, tab.id)"
+            :cwd="tab.cwd"
+            :shell="tab.shell ?? null"
+            :project-root="props.projectRoot"
+            :font-size="tab.fontSize"
+            :appearance-theme="props.appearanceTheme"
+            :appearance-theme-variant="props.appearanceThemeVariant"
+            :active="tab.id === activeTabId && !collapsed"
+            :reconnect-token="reconnectTokens[tab.id] ?? 0"
+            @activate="handleTerminalViewActivate(tab.id)"
+            @activity="handleTabActivity(tab.id)"
+            @attention="handleTabAttention(tab.id)"
+            @input="handleTabInput(tab.id, $event)"
+            @open-navigation-target="openCodeNavigationTarget($event)"
+            @update:font-size="updateShellFontSize(tab.id, $event)"
+          />
+
+          <NoteTabView
+            v-else-if="tab.type === 'note'"
+            :key="buildWorkspaceTabRuntimeKey(props.workspaceId, `multi:${tab.id}`)"
+            class="terminal-panel__multi-display-view"
+            :active="tab.id === activeTabId && !collapsed"
+            :busy="Boolean(noteBusyByTabId[tab.id])"
+            :content="tab.content"
+            :file-path="tab.filePath"
+            :project-root="props.projectRoot"
+            :appearance-theme="props.appearanceTheme"
+            :appearance-theme-variant="props.appearanceThemeVariant"
+            :is-dirty="tab.content !== tab.savedContent"
+            :external-change="externalFileChangeByTabId[tab.id] ?? null"
+            :view-mode="tab.viewMode"
+            :font-size="tab.fontSize"
+            @focus-previous-tab="selectAdjacentTab(-1)"
+            @focus-next-tab="selectAdjacentTab(1)"
+            @open-file="openWorkspaceFile(tab.id)"
+            @open-note-link="openNoteFilePath($event, tab.id)"
+            @reveal-in-all-files="revealWorkspaceFileInAllFiles(tab.filePath)"
+            @reload-from-disk="reloadEditableTabFromDisk(tab.id)"
+            @save-file="saveNoteFile(tab.id)"
+            @save-file-as="saveNoteFileAs(tab.id)"
+            @dismiss-external-change="dismissExternalFileChange(tab.id)"
+            @update:content="updateNoteContent(tab.id, $event)"
+            @update:font-size="updateNoteFontSize(tab.id, $event)"
+            @update:view-mode="updateNoteViewMode(tab.id, $event)"
+          />
+
+          <CodeTabView
+            v-else
+            :key="buildWorkspaceTabRuntimeKey(props.workspaceId, `multi:${tab.id}`)"
+            class="terminal-panel__multi-display-view"
+            :active="tab.id === activeTabId && !collapsed"
+            :busy="Boolean(noteBusyByTabId[tab.id])"
+            :content="tab.content"
+            :file-path="tab.filePath"
+            :project-root="props.projectRoot"
+            :editor-theme="props.editorTheme"
+            :theme-variant="props.editorThemeVariant"
+            :navigation-request="null"
+            :is-dirty="tab.content !== tab.savedContent"
+            :external-change="externalFileChangeByTabId[tab.id] ?? null"
+            :font-size="tab.fontSize"
+            @focus-previous-tab="selectAdjacentTab(-1)"
+            @focus-next-tab="selectAdjacentTab(1)"
+            @open-file="openWorkspaceFile(tab.id)"
+            @open-navigation-target="openCodeNavigationTarget($event)"
+            @reveal-in-all-files="revealWorkspaceFileInAllFiles(tab.filePath)"
+            @reload-from-disk="reloadEditableTabFromDisk(tab.id)"
+            @save-file="saveCodeFile(tab.id)"
+            @save-file-as="saveCodeFileAs(tab.id)"
+            @dismiss-external-change="dismissExternalFileChange(tab.id)"
+            @update:content="updateCodeContent(tab.id, $event)"
+            @update:font-size="updateCodeFontSize(tab.id, $event)"
+          />
+        </section>
+      </div>
+
+      <div
+        v-else-if="usesEditorPaneLayout && visibleEditorPanes.length"
         class="terminal-panel__editor-panes"
         :style="editorPaneGridStyle"
       >
@@ -5315,7 +5645,7 @@ defineExpose({
             <button
               class="terminal-panel__editor-pane-title"
               type="button"
-              :title="entry.tab.filePath"
+              :title="entry.tab.filePath ?? entry.tab.title"
               @click="setActiveEditorPane(entry.pane.id)"
             >
               {{ entry.tab.title }}
@@ -5366,7 +5696,37 @@ defineExpose({
             </div>
           </header>
 
+          <NoteTabView
+            v-if="entry.tab.type === 'note'"
+            :key="buildWorkspaceTabRuntimeKey(props.workspaceId, `${entry.pane.id}:${entry.tab.id}`)"
+            class="terminal-panel__editor-pane-view"
+            :active="entry.pane.id === editorPaneLayout.activePaneId && !collapsed"
+            :busy="Boolean(noteBusyByTabId[entry.tab.id])"
+            :content="entry.tab.content"
+            :file-path="entry.tab.filePath"
+            :project-root="props.projectRoot"
+            :appearance-theme="props.appearanceTheme"
+            :appearance-theme-variant="props.appearanceThemeVariant"
+            :is-dirty="entry.tab.content !== entry.tab.savedContent"
+            :external-change="externalFileChangeByTabId[entry.tab.id] ?? null"
+            :view-mode="entry.tab.viewMode"
+            :font-size="entry.tab.fontSize"
+            @focus-previous-tab="selectAdjacentTab(-1)"
+            @focus-next-tab="selectAdjacentTab(1)"
+            @open-file="openWorkspaceFile(entry.tab.id)"
+            @open-note-link="openNoteFilePath($event, entry.tab.id)"
+            @reveal-in-all-files="revealWorkspaceFileInAllFiles(entry.tab.filePath)"
+            @reload-from-disk="reloadEditableTabFromDisk(entry.tab.id)"
+            @save-file="saveNoteFile(entry.tab.id)"
+            @save-file-as="saveNoteFileAs(entry.tab.id)"
+            @dismiss-external-change="dismissExternalFileChange(entry.tab.id)"
+            @update:content="updateNoteContent(entry.tab.id, $event)"
+            @update:font-size="updateNoteFontSize(entry.tab.id, $event)"
+            @update:view-mode="updateNoteViewMode(entry.tab.id, $event)"
+          />
+
           <CodeTabView
+            v-else
             :key="buildWorkspaceTabRuntimeKey(props.workspaceId, `${entry.pane.id}:${entry.tab.id}`)"
             class="terminal-panel__editor-pane-view"
             :active="entry.pane.id === editorPaneLayout.activePaneId && !collapsed"
@@ -5759,8 +6119,11 @@ defineExpose({
           class="terminal-panel__switcher-toolbar terminal-panel__switcher-toolbar--find"
           :class="{ 'terminal-panel__switcher-toolbar--replace': findInFilesMode === 'replace' }"
         >
+          <div class="terminal-panel__switcher-search-meta terminal-panel__switcher-search-meta--full">
+            {{ findInFilesMeta }}
+          </div>
+
           <label class="terminal-panel__switcher-search">
-            <span class="terminal-panel__switcher-search-meta">{{ findInFilesMeta }}</span>
             <input
               :ref="setFindInFilesSearchInput"
               v-model="findInFilesSearchQuery"
@@ -5974,6 +6337,15 @@ defineExpose({
       </button>
 
       <button
+        v-if="canToggleMultiDisplayTab(menuTab)"
+        class="terminal-panel__menu-item"
+        type="button"
+        @click="handleMultiDisplayMenuAction(menuTab.id)"
+      >
+        {{ multiDisplayMenuActionLabel(menuTab) }}
+      </button>
+
+      <button
         v-if="sortedTabCount > 1"
         class="terminal-panel__menu-item terminal-panel__menu-item--danger"
         type="button"
@@ -6171,6 +6543,11 @@ defineExpose({
   border-color: rgba(110, 197, 255, 0.36);
   background: var(--terminal-panel-tab-active-bg);
   box-shadow: inset 0 0 0 1px rgba(110, 197, 255, 0.08);
+}
+
+.terminal-panel__tab--displayed {
+  border-color: rgba(110, 197, 255, 0.24);
+  box-shadow: inset 0 0 0 1px rgba(110, 197, 255, 0.06);
 }
 
 .terminal-panel__tab:hover {
@@ -6418,6 +6795,35 @@ defineExpose({
 
 .terminal-panel__views {
   position: relative;
+  min-height: 0;
+}
+
+.terminal-panel__multi-display {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 12px;
+  min-height: 0;
+  height: 100%;
+}
+
+.terminal-panel__multi-display-pane {
+  min-width: 0;
+  min-height: 0;
+  border: 1px solid var(--border-subtle);
+  border-radius: 14px;
+  overflow: hidden;
+  background: rgba(10, 14, 19, 0.82);
+}
+
+.terminal-panel__multi-display-pane--active {
+  border-color: rgba(110, 197, 255, 0.34);
+  box-shadow: inset 0 0 0 1px rgba(110, 197, 255, 0.12);
+}
+
+.terminal-panel__multi-display-view {
+  width: 100%;
+  height: 100%;
+  min-width: 0;
   min-height: 0;
 }
 
@@ -6747,6 +7153,10 @@ defineExpose({
   color: var(--text-dim);
   font-size: 0.76rem;
   line-height: 1.35;
+}
+
+.terminal-panel__switcher-search-meta--full {
+  grid-column: 1 / -1;
 }
 
 .terminal-panel__switcher-search-input,

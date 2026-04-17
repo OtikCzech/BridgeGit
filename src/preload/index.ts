@@ -4,6 +4,8 @@ import type {
   CreateBranchOptions,
   CreateBranchResult,
   DeleteBranchResult,
+  DockerContainerInfo,
+  DockerImageInfo,
   GitChange,
   GitCommitDetail,
   GitDiffMode,
@@ -124,6 +126,28 @@ const bridgegitApi = {
       ipcRenderer.invoke('git:pull', repoPath) as Promise<GitStatusSummary>,
     push: (repoPath: string) =>
       ipcRenderer.invoke('git:push', repoPath) as Promise<GitStatusSummary>,
+  },
+  docker: {
+    available: () =>
+      ipcRenderer.invoke('docker:available') as Promise<boolean>,
+    containers: () =>
+      ipcRenderer.invoke('docker:containers') as Promise<DockerContainerInfo[]>,
+    images: () =>
+      ipcRenderer.invoke('docker:images') as Promise<DockerImageInfo[]>,
+    containerAction: (containerId: string, action: 'start' | 'stop' | 'restart' | 'remove') =>
+      ipcRenderer.invoke('docker:containerAction', containerId, action) as Promise<void>,
+    removeImage: (imageId: string) =>
+      ipcRenderer.invoke('docker:removeImage', imageId) as Promise<void>,
+    composeUp: (cwd: string) =>
+      ipcRenderer.invoke('docker:composeUp', cwd) as Promise<void>,
+    composeDown: (cwd: string) =>
+      ipcRenderer.invoke('docker:composeDown', cwd) as Promise<void>,
+    composeRestart: (cwd: string) =>
+      ipcRenderer.invoke('docker:composeRestart', cwd) as Promise<void>,
+    resetBackend: () =>
+      ipcRenderer.invoke('docker:resetBackend') as Promise<void>,
+    logsCommand: (containerId: string) =>
+      ipcRenderer.invoke('docker:logsCommand', containerId) as Promise<{ shell: string; command: string }>,
   },
   terminal: {
     create: (options: PtyCreateOptions) =>

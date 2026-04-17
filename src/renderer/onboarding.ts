@@ -53,6 +53,7 @@ function buildOnboardingWorkspaceSession(
       panes: [],
       activePaneId: null,
     },
+    multiDisplayTabIds: [],
   };
 }
 

@@ -18,6 +18,7 @@ import { useTerminal } from '../composables/useTerminal';
 interface Props {
   sessionKey: string;
   cwd: string;
+  shell?: string | null;
   projectRoot?: string | null;
   fontSize: number;
   appearanceTheme: AppAppearance;
@@ -229,45 +230,32 @@ function getTerminalTheme(theme: AppAppearance) {
 }
 
 function normalizeTerminalPath(value: string) {
-  return value.replace(/\\/g, '/');
-}
+  const normalizedValue = value.replace(/\\/g, '/');
 
-function splitTerminalPath(value: string) {
-  return normalizeTerminalPath(value).split('/');
-}
-
-function inferTerminalHomePath() {
-  const candidates = [props.cwd, props.projectRoot];
-
-  for (const candidate of candidates) {
-    const normalizedCandidate = normalizeTerminalPath(candidate ?? '');
-    const unixMatch = normalizedCandidate.match(/^(\/home\/[^/]+|\/Users\/[^/]+)(?:\/|$)/);
-
-    if (unixMatch?.[1]) {
-      return unixMatch[1];
-    }
-
-    const windowsMatch = normalizedCandidate.match(/^([A-Za-z]:\/Users\/[^/]+)(?:\/|$)/);
-
-    if (windowsMatch?.[1]) {
-      return windowsMatch[1];
-    }
+  if (/^\/(wsl\.localhost|wsl\$)\//i.test(normalizedValue) && !normalizedValue.startsWith('//')) {
+    return `/${normalizedValue}`;
   }
 
-  return null;
+  return normalizedValue;
 }
 
-function resolveTerminalPath(basePath: string, relativePath: string) {
-  const normalizedBasePath = normalizeTerminalPath(basePath);
-  const normalizedRelativePath = normalizeTerminalPath(relativePath);
-  const isWindowsAbsolutePath = /^[A-Za-z]:\//.test(normalizedRelativePath);
+function parseTerminalUncPath(value: string) {
+  const match = normalizeTerminalPath(value).match(/^\/\/([^/]+)\/([^/]+)(\/.*)?$/);
 
-  if (isWindowsAbsolutePath || normalizedRelativePath.startsWith('/')) {
-    return normalizedRelativePath;
+  if (!match) {
+    return null;
   }
 
-  const baseSegments = splitTerminalPath(normalizedBasePath);
-  const relativeSegments = splitTerminalPath(normalizedRelativePath);
+  return {
+    host: match[1],
+    share: match[2],
+    path: match[3] ?? '/',
+  };
+}
+
+function resolvePosixRelativePath(basePath: string, relativePath: string) {
+  const baseSegments = splitTerminalPath(basePath);
+  const relativeSegments = splitTerminalPath(relativePath);
   const resolvedSegments: string[] = [];
 
   for (const segment of baseSegments) {
@@ -300,6 +288,74 @@ function resolveTerminalPath(basePath: string, relativePath: string) {
   return `/${resolvedSegments.join('/')}`;
 }
 
+function sanitizeTerminalNavigationPath(value: string) {
+  let normalizedValue = value.trim();
+
+  const wrappedPathMatch = normalizedValue.match(/^[A-Za-z][\w-]*\((.+)\)$/);
+
+  if (wrappedPathMatch?.[1]) {
+    normalizedValue = wrappedPathMatch[1].trim();
+  }
+
+  normalizedValue = normalizedValue
+    .replace(/^[`"'<>]+/, '')
+    .replace(/[)`"',;.!<>]+$/, '');
+
+  if (
+    (normalizedValue.startsWith('(') && normalizedValue.endsWith(')'))
+    || (normalizedValue.startsWith('[') && normalizedValue.endsWith(']'))
+  ) {
+    normalizedValue = normalizedValue.slice(1, -1).trim();
+  }
+
+  return normalizedValue;
+}
+
+function splitTerminalPath(value: string) {
+  return normalizeTerminalPath(value).split('/');
+}
+
+function inferTerminalHomePath() {
+  const candidates = [props.cwd, props.projectRoot];
+
+  for (const candidate of candidates) {
+    const normalizedCandidate = normalizeTerminalPath(candidate ?? '');
+    const unixMatch = normalizedCandidate.match(/^(\/home\/[^/]+|\/Users\/[^/]+)(?:\/|$)/);
+
+    if (unixMatch?.[1]) {
+      return unixMatch[1];
+    }
+
+    const windowsMatch = normalizedCandidate.match(/^([A-Za-z]:\/Users\/[^/]+)(?:\/|$)/);
+
+    if (windowsMatch?.[1]) {
+      return windowsMatch[1];
+    }
+  }
+
+  return null;
+}
+
+function resolveTerminalPath(basePath: string, relativePath: string) {
+  const normalizedBasePath = normalizeTerminalPath(basePath);
+  const normalizedRelativePath = normalizeTerminalPath(relativePath);
+  const isWindowsAbsolutePath = /^[A-Za-z]:\//.test(normalizedRelativePath);
+  const relativeUncPath = parseTerminalUncPath(normalizedRelativePath);
+
+  if (isWindowsAbsolutePath || relativeUncPath || normalizedRelativePath.startsWith('/')) {
+    return normalizedRelativePath;
+  }
+
+  const baseUncPath = parseTerminalUncPath(normalizedBasePath);
+
+  if (baseUncPath) {
+    const resolvedUncPath = resolvePosixRelativePath(baseUncPath.path, normalizedRelativePath);
+    return `//${baseUncPath.host}/${baseUncPath.share}${resolvedUncPath === '/' ? '' : resolvedUncPath}`;
+  }
+
+  return resolvePosixRelativePath(normalizedBasePath, normalizedRelativePath);
+}
+
 function buildTerminalNavigationTargets(rawLinkText: string): CodeNavigationTarget[] {
   const normalizedLinkText = rawLinkText.trim();
 
@@ -308,7 +364,7 @@ function buildTerminalNavigationTargets(rawLinkText: string): CodeNavigationTarg
   }
 
   const match = normalizedLinkText.match(/^(.*?)(?::(\d+))?(?::(\d+))?$/);
-  const rawPath = match?.[1]?.trim() ?? normalizedLinkText;
+  const rawPath = sanitizeTerminalNavigationPath(match?.[1]?.trim() ?? normalizedLinkText);
   const line = match?.[2] ? Number.parseInt(match[2], 10) : undefined;
   const column = match?.[3] ? Number.parseInt(match[3], 10) : undefined;
   const normalizedRawPath = normalizeTerminalPath(rawPath);
@@ -366,7 +422,10 @@ async function activateTerminalFileLink(rawLinkText: string) {
         continue;
       }
 
-      emit('open-navigation-target', target);
+      emit('open-navigation-target', {
+        ...target,
+        filePath: inspectedFile.path,
+      });
       return;
     }
 
@@ -944,6 +1003,7 @@ async function connectTerminal(mode: 'start' | 'restart' = 'start') {
   }
 
   const options = {
+    shell: props.shell ?? undefined,
     cwd: props.cwd,
     cols: terminal.cols || 120,
     rows: terminal.rows || 32,

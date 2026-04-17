@@ -339,6 +339,7 @@ export interface WorkspaceShellTabState {
   type: 'shell';
   title: string;
   cwd: string;
+  shell?: string | null;
   fontSize: number;
   launcherProfileId?: string | null;
 }
@@ -413,14 +414,50 @@ export interface GitTextReplaceResult {
   affectedFiles: string[];
 }
 
+export type DockerContainerState = 'running' | 'exited' | 'paused' | 'created' | 'restarting' | 'dead' | 'removing';
+
+export interface DockerContainerInfo {
+  id: string;
+  name: string;
+  image: string;
+  status: string;
+  state: DockerContainerState;
+  ports: string;
+  compose: { project: string; service: string } | null;
+}
+
+export interface DockerImageInfo {
+  id: string;
+  repository: string;
+  tag: string;
+  size: string;
+  created: string;
+}
+
+export type DockerTabActiveView = 'containers' | 'images';
+
+export interface DockerDialogState {
+  activeView: DockerTabActiveView;
+  expandedGroupIds: string[];
+}
+
+export interface WorkspaceDockerTabState {
+  id: string;
+  type: 'docker';
+  title: string;
+  activeView: DockerTabActiveView;
+  expandedGroupIds: string[];
+}
+
 export type WorkspaceExternalFileChangeState = 'changed' | 'unavailable' | 'session-dirty';
 
-export type WorkspaceTabState = WorkspaceShellTabState | WorkspaceNoteTabState | WorkspaceCodeTabState;
+export type WorkspaceTabState = WorkspaceShellTabState | WorkspaceNoteTabState | WorkspaceCodeTabState | WorkspaceDockerTabState;
 
 export interface WorkspaceSessionState {
   tabs: WorkspaceTabState[];
   activeTabId: string | null;
   editorPaneLayout: WorkspaceEditorPaneLayout;
+  multiDisplayTabIds: string[];
 }
 
 export type WorkspaceKind = 'global' | 'project';
@@ -617,6 +654,7 @@ export interface SessionData {
   soundNotificationsEnabled: boolean;
   seenInfoNoteRevisions: string[];
   terminalCommandPresets: TerminalCommandPreset[];
+  dockerDialogState: DockerDialogState;
   workspaceSessions: WorkspaceSessionsById;
 }
 
@@ -652,6 +690,13 @@ export function cloneSeenInfoNoteRevisions(seenInfoNoteRevisions: string[]): str
   return [...seenInfoNoteRevisions];
 }
 
+export function cloneDockerDialogState(dockerDialogState: DockerDialogState): DockerDialogState {
+  return {
+    activeView: dockerDialogState.activeView,
+    expandedGroupIds: [...dockerDialogState.expandedGroupIds],
+  };
+}
+
 export function cloneTerminalCommandPresets(presets: TerminalCommandPreset[]): TerminalCommandPreset[] {
   return presets.map((preset) => ({
     ...preset,
@@ -660,7 +705,11 @@ export function cloneTerminalCommandPresets(presets: TerminalCommandPreset[]): T
 }
 
 export function cloneWorkspaceTabs(workspaceTabs: WorkspaceTabState[]): WorkspaceTabState[] {
-  return workspaceTabs.map((tab) => ({ ...tab }));
+  return workspaceTabs.map((tab) => (
+    tab.type === 'docker'
+      ? { ...tab, expandedGroupIds: [...tab.expandedGroupIds] }
+      : { ...tab }
+  ));
 }
 
 export function cloneWorkspaceEditorPaneLayout(
@@ -677,6 +726,7 @@ export function cloneWorkspaceSessionState(workspaceSession: WorkspaceSessionSta
     tabs: cloneWorkspaceTabs(workspaceSession.tabs),
     activeTabId: workspaceSession.activeTabId,
     editorPaneLayout: cloneWorkspaceEditorPaneLayout(workspaceSession.editorPaneLayout),
+    multiDisplayTabIds: [...workspaceSession.multiDisplayTabIds],
   };
 }
 
@@ -922,5 +972,9 @@ export const DEFAULT_SESSION_DATA: SessionData = {
   soundNotificationsEnabled: true,
   seenInfoNoteRevisions: [],
   terminalCommandPresets: getDefaultTerminalCommandPresets(),
+  dockerDialogState: {
+    activeView: 'containers',
+    expandedGroupIds: [],
+  },
   workspaceSessions: {},
 };

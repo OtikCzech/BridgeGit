@@ -4,16 +4,20 @@ BridgeGit is a desktop Git client with an integrated terminal workspace, built w
 
 It combines:
 - Git status/staging/commit workflows
-- Diff viewer (side-by-side and unified)
-- Workspace tabs for shell sessions and notes
-- Session persistence (repo, layout, tabs, presets)
+- Diff viewer and repository history browsing
+- Workspace tabs for shell sessions, notes and code files
+- Global Docker overview for containers, images and logs
+- Session persistence for repos, layouts, tabs and workspace state
 
 ## Highlights
 
 - Three-panel layout: Repository panel, Diff panel, Workspace panel
 - Shell tabs with multi-session support and reconnect
 - Notes tabs with Markdown source/split/preview modes
-- Custom command presets (including default Codex/Claude presets)
+- Code tabs with editor navigation and save flow
+- Quick Open, Find in Files and Replace in Files for larger repositories
+- Global Docker dialog with grouped Compose projects, quick actions and direct logs tabs
+- `Ctrl+click` two-tab workspace view for comparing shell, note or code tabs side by side
 - Keyboard-driven workflow for common actions
 
 ## Tech Stack
@@ -69,6 +73,7 @@ npm run start
 - `npm run start` – run Electron app
 - `npm run dist:win` – build Windows NSIS installer
 - `npm run dist:win:portable` – build Windows portable package
+- `npm run dist:linux` – build Linux AppImage
 
 ## Default Keyboard Shortcuts
 

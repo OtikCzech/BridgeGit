@@ -56,6 +56,7 @@ interface PartialWorkspaceShellTabState {
   type?: 'shell';
   title?: string;
   cwd?: string;
+  shell?: string | null;
   fontSize?: number;
   launcherProfileId?: string | null;
 }
@@ -88,15 +89,30 @@ interface PartialWorkspaceSearchTabState {
   query?: string;
 }
 
+interface PartialWorkspaceDockerTabState {
+  id?: string;
+  type?: 'docker';
+  title?: string;
+  activeView?: 'containers' | 'images';
+  expandedGroupIds?: string[];
+}
+
+interface PartialDockerDialogState {
+  activeView?: 'containers' | 'images';
+  expandedGroupIds?: string[];
+}
+
 type PartialWorkspaceTabState =
   | PartialWorkspaceShellTabState
   | PartialWorkspaceNoteTabState
   | PartialWorkspaceCodeTabState
-  | PartialWorkspaceSearchTabState;
+  | PartialWorkspaceSearchTabState
+  | PartialWorkspaceDockerTabState;
 
 interface PartialWorkspaceSessionState {
   tabs?: PartialWorkspaceTabState[];
   activeTabId?: string | null;
+  multiDisplayTabIds?: Array<string | null | undefined>;
   editorPaneLayout?: {
     panes?: Array<{
       id?: string;
@@ -130,7 +146,7 @@ interface PartialWorkspaceRepoPanelState {
   files?: PartialWorkspaceRepoPanelFilesState;
 }
 
-interface LegacySessionData extends Partial<Omit<SessionData, 'workspaceSessions' | 'workspaceDescriptors' | 'panelLayoutsByWorkspace' | 'workspaceRepoPanelStates'>> {
+interface LegacySessionData extends Partial<Omit<SessionData, 'workspaceSessions' | 'workspaceDescriptors' | 'panelLayoutsByWorkspace' | 'workspaceRepoPanelStates' | 'dockerDialogState'>> {
   terminalTabs?: Array<Partial<LegacyTerminalTabState>>;
   workspaceTabs?: PartialWorkspaceTabState[];
   activeWorkspaceTabId?: string | null;
@@ -140,6 +156,7 @@ interface LegacySessionData extends Partial<Omit<SessionData, 'workspaceSessions
   workspaceDescriptors?: Record<string, PartialWorkspaceDescriptor>;
   panelLayoutsByWorkspace?: Record<string, Partial<PanelLayout>>;
   workspaceRepoPanelStates?: Record<string, PartialWorkspaceRepoPanelState>;
+  dockerDialogState?: PartialDockerDialogState;
 }
 
 interface SessionStore {
@@ -518,6 +535,10 @@ function normalizeWorkspaceTabs(
       continue;
     }
 
+    if (tab.type === 'docker') {
+      continue;
+    }
+
     const shellTab = tab as PartialWorkspaceShellTabState;
 
     normalizedTabs.push({
@@ -525,6 +546,7 @@ function normalizeWorkspaceTabs(
       type: 'shell',
       title: title || 'Shell',
       cwd: normalizeTerminalCwd(shellTab.cwd, fallbackCwd),
+      shell: shellTab.shell?.trim() || null,
       fontSize: normalizeShellFontSize(shellTab.fontSize ?? workspaceTabDefaults.shellFontSize),
       launcherProfileId: shellTab.launcherProfileId?.trim() || null,
     });
@@ -586,6 +608,23 @@ function normalizeWorkspaceSessionState(
     ?? panes.find((pane) => pane.tabId === fallbackCodeTabId)?.id
     ?? panes[0]?.id
     ?? null;
+  const multiDisplayTabIds = (() => {
+    const validTabIds = new Set(
+      tabs
+        .filter((tab) => tab.type === 'shell' || tab.type === 'note' || tab.type === 'code')
+        .map((tab) => tab.id),
+    );
+    const requestedIds = Array.from(new Set(
+      (workspaceSession?.multiDisplayTabIds ?? [])
+        .map((tabId) => tabId?.trim())
+        .filter((tabId): tabId is string => Boolean(tabId && validTabIds.has(tabId))),
+    ));
+    const orderedIds = tabs
+      .filter((tab) => requestedIds.includes(tab.id))
+      .map((tab) => tab.id);
+
+    return orderedIds.length === 2 ? orderedIds : [];
+  })();
 
   return {
     tabs,
@@ -594,6 +633,7 @@ function normalizeWorkspaceSessionState(
       panes,
       activePaneId,
     },
+    multiDisplayTabIds,
   };
 }
 
@@ -668,6 +708,7 @@ function normalizeWorkspaceSessions(
           panes: [],
           activePaneId: null,
         },
+        multiDisplayTabIds: [],
       };
     }
   });
@@ -966,6 +1007,21 @@ function normalizeDismissedWorktreePaths(
   return [...normalizedPaths.values()];
 }
 
+function normalizeDockerDialogState(
+  dockerDialogState: PartialDockerDialogState | undefined,
+): SessionData['dockerDialogState'] {
+  return {
+    activeView: dockerDialogState?.activeView === 'images' ? 'images' : 'containers',
+    expandedGroupIds: Array.isArray(dockerDialogState?.expandedGroupIds)
+      ? Array.from(new Set(
+        dockerDialogState.expandedGroupIds
+          .map((groupId) => groupId?.trim())
+          .filter((groupId): groupId is string => Boolean(groupId)),
+      ))
+      : [],
+  };
+}
+
 function normalizeSession(session: LegacySessionData): SessionData {
   const lastRepoPath = normalizeStoredPath(session.lastRepoPath ?? DEFAULT_SESSION_DATA.lastRepoPath);
   const fallbackCwd = normalizeTerminalCwd(session.terminalCwd, lastRepoPath);
@@ -1058,6 +1114,7 @@ function normalizeSession(session: LegacySessionData): SessionData {
       session.infoNoteLastSeenRevision,
     ),
     terminalCommandPresets,
+    dockerDialogState: normalizeDockerDialogState(session.dockerDialogState),
     workspaceSessions,
   };
 }
