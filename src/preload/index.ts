@@ -39,6 +39,11 @@ const bridgegitApi = {
     electron: process.versions.electron,
     node: process.versions.node,
   },
+  app: {
+    setTerminalFocusState: (focused: boolean) => {
+      ipcRenderer.send('app:setTerminalFocusState', focused);
+    },
+  },
   dialog: {
     openRepo: (defaultPath?: string | null) =>
       ipcRenderer.invoke('dialog:openRepo', defaultPath) as Promise<string | null>,
@@ -68,6 +73,18 @@ const bridgegitApi = {
     load: () => ipcRenderer.invoke('session:load') as Promise<SessionData>,
     save: (session: Partial<SessionData>) =>
       ipcRenderer.invoke('session:save', session) as Promise<SessionData>,
+    saveSync: (session: Partial<SessionData>) =>
+      ipcRenderer.sendSync('session:saveSync', session) as SessionData | null,
+    onCloseRequested: (callback: () => void) => {
+      const listener = () => callback();
+      ipcRenderer.on('app:closeRequested', listener);
+      return () => {
+        ipcRenderer.removeListener('app:closeRequested', listener);
+      };
+    },
+    notifyCloseReady: () => {
+      ipcRenderer.send('app:closeReady');
+    },
   },
   git: {
     isRepository: (repoPath: string) =>

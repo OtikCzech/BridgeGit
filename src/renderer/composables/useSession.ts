@@ -1,6 +1,7 @@
 import { ref } from 'vue';
 import {
   DEFAULT_SESSION_DATA,
+  cloneClipboardHistoryEntries,
   cloneDismissedWorktreePaths,
   cloneWorkspaceTabDefaults,
   cloneSeenInfoNoteRevisions,
@@ -36,9 +37,14 @@ function cloneSession(session: SessionData): SessionData {
     workspaceTabDefaults: cloneWorkspaceTabDefaults(session.workspaceTabDefaults),
     dismissedWorktreePaths: cloneDismissedWorktreePaths(session.dismissedWorktreePaths),
     seenInfoNoteRevisions: cloneSeenInfoNoteRevisions(session.seenInfoNoteRevisions),
+    clipboardHistory: cloneClipboardHistoryEntries(session.clipboardHistory),
     terminalCommandPresets: cloneTerminalCommandPresets(session.terminalCommandPresets),
     workspaceSessions: cloneWorkspaceSessions(session.workspaceSessions),
   };
+}
+
+function serializeSessionForIpc(session: SessionData): SessionData {
+  return JSON.parse(JSON.stringify(session)) as SessionData;
 }
 
 function cloneRecentRepos(recentRepos: RecentRepoEntry[]): RecentRepoEntry[] {
@@ -102,6 +108,9 @@ function mergeSession(base: SessionData, patch: SessionPatch): SessionData {
     seenInfoNoteRevisions: patch.seenInfoNoteRevisions
       ? cloneSeenInfoNoteRevisions(patch.seenInfoNoteRevisions)
       : cloneSeenInfoNoteRevisions(base.seenInfoNoteRevisions),
+    clipboardHistory: patch.clipboardHistory
+      ? cloneClipboardHistoryEntries(patch.clipboardHistory)
+      : cloneClipboardHistoryEntries(base.clipboardHistory),
     terminalCommandPresets: patch.terminalCommandPresets
       ? cloneTerminalCommandPresets(patch.terminalCommandPresets)
       : cloneTerminalCommandPresets(base.terminalCommandPresets),
@@ -113,6 +122,13 @@ function mergeSession(base: SessionData, patch: SessionPatch): SessionData {
 
 export function useSession() {
   const session = ref<SessionData>(cloneSession(DEFAULT_SESSION_DATA));
+  let saveRevision = 0;
+  let saveQueue: Promise<SessionData | null> = Promise.resolve(null);
+
+  function nextPersistenceRevision() {
+    saveRevision += 1;
+    return saveRevision;
+  }
 
   async function loadSession(): Promise<SessionData> {
     if (!window.bridgegit?.session) {
@@ -121,18 +137,57 @@ export function useSession() {
 
     const loadedSession = await window.bridgegit.session.load();
     session.value = mergeSession(DEFAULT_SESSION_DATA, loadedSession);
+    saveRevision = Math.max(saveRevision, session.value.persistenceRevision);
     return session.value;
   }
 
   async function saveSession(patch: SessionPatch): Promise<SessionData> {
-    const nextSession = mergeSession(session.value, patch);
+    const revision = nextPersistenceRevision();
+    const nextSession = mergeSession(session.value, {
+      ...patch,
+      persistenceRevision: revision,
+    });
+    session.value = nextSession;
 
     if (!window.bridgegit?.session) {
-      session.value = nextSession;
       return session.value;
     }
 
-    const savedSession = await window.bridgegit.session.save(nextSession);
+    saveQueue = saveQueue
+      .catch(() => null)
+      .then(async () => {
+        const serializedSession = serializeSessionForIpc(nextSession);
+        const savedSession = await window.bridgegit!.session.save(serializedSession);
+
+        if (revision === saveRevision) {
+          session.value = mergeSession(DEFAULT_SESSION_DATA, savedSession);
+        }
+
+        return mergeSession(DEFAULT_SESSION_DATA, savedSession);
+      });
+
+    const savedSession = await saveQueue;
+    return savedSession ?? session.value;
+  }
+
+  function saveSessionSync(patch: SessionPatch): SessionData | null {
+    const nextSession = mergeSession(session.value, {
+      ...patch,
+      persistenceRevision: nextPersistenceRevision(),
+    });
+    session.value = nextSession;
+
+    if (!window.bridgegit?.session?.saveSync) {
+      return session.value;
+    }
+
+    const serializedSession = serializeSessionForIpc(nextSession);
+    const savedSession = window.bridgegit.session.saveSync(serializedSession);
+
+    if (!savedSession) {
+      return null;
+    }
+
     session.value = mergeSession(DEFAULT_SESSION_DATA, savedSession);
     return session.value;
   }
@@ -141,5 +196,6 @@ export function useSession() {
     session,
     loadSession,
     saveSession,
+    saveSessionSync,
   };
 }

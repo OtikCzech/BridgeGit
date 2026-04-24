@@ -18,6 +18,7 @@ import xmlLanguage from 'highlight.js/lib/languages/xml';
 import yamlLanguage from 'highlight.js/lib/languages/yaml';
 import { computed, onBeforeUnmount, onMounted, onUpdated, ref } from 'vue';
 import type { GitDiffMode } from '../../shared/bridgegit';
+import { writeClipboardText as writeSharedClipboardText } from '../clipboard';
 import CopyableErrorNotice from './CopyableErrorNotice.vue';
 
 interface Props {
@@ -146,6 +147,8 @@ const openCurrentFileLabel = computed(() => (
 let copySelectionTimer: number | null = null;
 let copyToastTimer: number | null = null;
 let lastCopiedSelection: string | null = null;
+let selectionPointerActive = false;
+let selectionCopyPendingAfterPointer = false;
 
 const hasDiff = computed(() => props.diff.includes('diff --git'));
 const diffFileEntries = computed(() => parseDiffFileEntries(props.diff));
@@ -642,16 +645,7 @@ function handleRenderedDiffClick(event: MouseEvent) {
 }
 
 async function writeClipboard(text: string) {
-  try {
-    if (window.bridgegit?.clipboard) {
-      await Promise.resolve(window.bridgegit.clipboard.writeText(text));
-      return;
-    }
-  } catch {
-    // Fall back to the browser clipboard API when the Electron bridge is unavailable.
-  }
-
-  await navigator.clipboard.writeText(text);
+  await writeSharedClipboardText(text);
 }
 
 function getRenderedDiffElement() {
@@ -701,6 +695,11 @@ function showCopyToast(message: string) {
 }
 
 function scheduleSelectionCopy() {
+  if (selectionPointerActive) {
+    selectionCopyPendingAfterPointer = true;
+    return;
+  }
+
   const selection = getSelectedDiffText();
 
   if (!selection) {
@@ -727,9 +726,35 @@ function scheduleSelectionCopy() {
   }, 90);
 }
 
+function handleDocumentPointerDown(event: PointerEvent) {
+  if (event.button !== 0 || !rootRef.value?.contains(event.target as Node | null)) {
+    return;
+  }
+
+  selectionPointerActive = true;
+  selectionCopyPendingAfterPointer = false;
+}
+
+function handleDocumentPointerUp() {
+  if (!selectionPointerActive) {
+    return;
+  }
+
+  selectionPointerActive = false;
+
+  if (!selectionCopyPendingAfterPointer) {
+    return;
+  }
+
+  selectionCopyPendingAfterPointer = false;
+  scheduleSelectionCopy();
+}
+
 onMounted(() => {
   applySyntaxHighlighting();
   annotateDiffTargets();
+  document.addEventListener('pointerdown', handleDocumentPointerDown);
+  document.addEventListener('pointerup', handleDocumentPointerUp);
   document.addEventListener('selectionchange', scheduleSelectionCopy);
 });
 
@@ -739,6 +764,8 @@ onUpdated(() => {
 });
 
 onBeforeUnmount(() => {
+  document.removeEventListener('pointerdown', handleDocumentPointerDown);
+  document.removeEventListener('pointerup', handleDocumentPointerUp);
   document.removeEventListener('selectionchange', scheduleSelectionCopy);
   clearPendingSelectionCopy();
 

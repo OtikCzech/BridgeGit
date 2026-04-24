@@ -1,14 +1,37 @@
 <script setup lang="ts">
 import DOMPurify from 'dompurify';
 import { marked } from 'marked';
+import { markdown, markdownLanguage } from '@codemirror/lang-markdown';
+import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands';
+import { bracketMatching, indentOnInput } from '@codemirror/language';
+import { highlightSelectionMatches, openSearchPanel, search, searchKeymap } from '@codemirror/search';
+import { Compartment, EditorSelection, EditorState } from '@codemirror/state';
+import {
+  EditorView,
+  drawSelection,
+  highlightActiveLine,
+  highlightActiveLineGutter,
+  keymap,
+  lineNumbers,
+  type ViewUpdate,
+} from '@codemirror/view';
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import {
   normalizeNoteFontSize,
   type AppAppearance,
+  type ResolvedEditorTheme,
   type ThemeVariant,
+  type WorkspaceEditorCursorState,
   type WorkspaceExternalFileChangeState,
   type WorkspaceNoteTabState,
 } from '../../shared/bridgegit';
+import {
+  readClipboardText as readSharedClipboardText,
+  writeClipboardText as writeSharedClipboardText,
+} from '../clipboard';
+import { getCodeEditorThemeExtension } from '../codemirror/codeEditor';
+import { useClipboardHistoryTarget } from '../composables/useClipboardHistoryTarget';
+import { useColumnSplitter } from '../composables/useColumnSplitter';
 import { SHORTCUTS, matchesShortcut } from '../shortcuts';
 
 interface Props {
@@ -21,8 +44,12 @@ interface Props {
   projectRoot: string | null;
   appearanceTheme: AppAppearance;
   appearanceThemeVariant: ThemeVariant;
+  editorTheme: ResolvedEditorTheme;
+  themeVariant: ThemeVariant;
   viewMode: WorkspaceNoteTabState['viewMode'];
+  splitRatio: number;
   fontSize: number;
+  cursor?: WorkspaceEditorCursorState;
 }
 
 const props = defineProps<Props>();
@@ -38,25 +65,51 @@ const emit = defineEmits<{
   'save-file': [];
   'save-file-as': [];
   'update:content': [content: string];
+  'update:cursor': [cursor: WorkspaceEditorCursorState];
   'update:font-size': [fontSize: number];
+  'update:split-ratio': [splitRatio: number];
   'update:view-mode': [viewMode: WorkspaceNoteTabState['viewMode']];
 }>();
 
 const rootRef = ref<HTMLElement | null>(null);
-const textareaRef = ref<HTMLTextAreaElement | null>(null);
+const editorRootRef = ref<HTMLElement | null>(null);
 const previewRef = ref<HTMLElement | null>(null);
 const searchInputRef = ref<HTMLInputElement | null>(null);
 const copyToast = ref<string | null>(null);
 const filePathMenu = ref<{ x: number; y: number } | null>(null);
 const searchVisible = ref(false);
 const searchQuery = ref('');
-const activeSourceMatchIndex = ref(0);
 const activePreviewMatchIndex = ref(0);
 const previewMatchCount = ref(0);
 const renderedMarkdown = ref('<p class="note-tab__preview-empty">Nothing to preview yet.</p>');
+
+const editableCompartment = new Compartment();
+const languageCompartment = new Compartment();
+const themeCompartment = new Compartment();
+const lineNumbersCompartment = new Compartment();
+let editorView: EditorView | null = null;
+let suppressContentSync = false;
+
+const LINE_NUMBERS_STORAGE_KEY = 'bridgegit.note.lineNumbers';
+
+function readStoredLineNumbers(): boolean {
+  try {
+    const raw = window.localStorage.getItem(LINE_NUMBERS_STORAGE_KEY);
+    return raw === null ? true : raw === '1';
+  } catch {
+    return true;
+  }
+}
+
+const lineNumbersEnabled = ref(readStoredLineNumbers());
 let copyToastTimer: number | null = null;
 let copySelectionTimer: number | null = null;
 let lastCopiedSelection: string | null = null;
+let selectionPointerActive = false;
+let selectionCopyPendingAfterPointer = false;
+let selectionKeyboardActive = false;
+let selectionCopyPendingAfterKeyboard = false;
+let selectionKeyboardMode: 'range' | 'select-all' | null = null;
 let markdownRenderToken = 0;
 let mermaidInitialized = false;
 let mermaidThemeVariant: ThemeVariant | null = null;
@@ -535,19 +588,50 @@ const resolvedFontSize = computed(() => normalizeNoteFontSize(props.fontSize));
 const noteStyle = computed(() => ({
   '--note-font-size-px': String(resolvedFontSize.value),
 }));
-const normalizedSearchQuery = computed(() => searchQuery.value.trim());
-const searchMode = computed(() => (props.viewMode === 'preview' ? 'preview' : 'source'));
-const sourceMatches = computed(() => findSearchMatches(props.content, normalizedSearchQuery.value));
-const activeMatchCount = computed(() => (
-  searchMode.value === 'preview' ? previewMatchCount.value : sourceMatches.value.length
+
+const noteSplit = useColumnSplitter({ defaultRatio: props.splitRatio });
+const noteSplitStyle = computed(() => (
+  props.viewMode === 'split'
+    ? { gridTemplateColumns: noteSplit.gridTemplate.value, gap: '0' }
+    : undefined
 ));
-const activeMatchDisplayIndex = computed(() => {
-  if (activeMatchCount.value < 1) {
-    return 0;
+const SPLIT_RATIO_EMIT_DEBOUNCE_MS = 250;
+let splitRatioEmitTimer: number | null = null;
+
+function flushSplitRatioEmit() {
+  if (splitRatioEmitTimer !== null) {
+    window.clearTimeout(splitRatioEmitTimer);
+    splitRatioEmitTimer = null;
   }
 
-  return (searchMode.value === 'preview' ? activePreviewMatchIndex.value : activeSourceMatchIndex.value) + 1;
-});
+  const nextSplitRatio = Number(noteSplit.ratio.value.toFixed(4));
+
+  if (Math.abs(props.splitRatio - nextSplitRatio) < 0.0001) {
+    return;
+  }
+
+  emit('update:split-ratio', nextSplitRatio);
+}
+
+function scheduleSplitRatioEmit() {
+  if (props.viewMode !== 'split') {
+    return;
+  }
+
+  if (splitRatioEmitTimer !== null) {
+    window.clearTimeout(splitRatioEmitTimer);
+  }
+
+  splitRatioEmitTimer = window.setTimeout(() => {
+    splitRatioEmitTimer = null;
+    flushSplitRatioEmit();
+  }, SPLIT_RATIO_EMIT_DEBOUNCE_MS);
+}
+const normalizedSearchQuery = computed(() => searchQuery.value.trim());
+const activeMatchCount = computed(() => previewMatchCount.value);
+const activeMatchDisplayIndex = computed(() => (
+  activeMatchCount.value < 1 ? 0 : activePreviewMatchIndex.value + 1
+));
 const externalChangeCopy = computed(() => {
   if (props.externalChange === 'unavailable') {
     return {
@@ -591,16 +675,7 @@ function showCopyToast(message: string) {
 }
 
 async function writeClipboard(text: string) {
-  try {
-    if (window.bridgegit?.clipboard) {
-      await Promise.resolve(window.bridgegit.clipboard.writeText(text));
-      return;
-    }
-  } catch {
-    // Fall back to the browser clipboard API when the Electron bridge is unavailable.
-  }
-
-  await navigator.clipboard.writeText(text);
+  await writeSharedClipboardText(text);
 }
 
 function clearPendingSelectionCopy() {
@@ -610,21 +685,18 @@ function clearPendingSelectionCopy() {
   }
 }
 
-function getSelectedTextareaText() {
-  const textarea = textareaRef.value;
-
-  if (!textarea || document.activeElement !== textarea) {
+function getSelectedEditorText() {
+  if (!editorView || !editorView.hasFocus) {
     return null;
   }
 
-  const selectionStart = textarea.selectionStart ?? 0;
-  const selectionEnd = textarea.selectionEnd ?? 0;
+  const selection = editorView.state.selection.main;
 
-  if (selectionEnd <= selectionStart) {
+  if (selection.empty) {
     return null;
   }
 
-  return textarea.value.slice(selectionStart, selectionEnd);
+  return editorView.state.sliceDoc(selection.from, selection.to);
 }
 
 function getSelectedPreviewText() {
@@ -655,10 +727,20 @@ function getSelectedNoteText() {
     return null;
   }
 
-  return getSelectedTextareaText() ?? getSelectedPreviewText();
+  return getSelectedEditorText() ?? getSelectedPreviewText();
 }
 
 function scheduleSelectionCopy() {
+  if (selectionKeyboardActive) {
+    selectionCopyPendingAfterKeyboard = true;
+    return;
+  }
+
+  if (selectionPointerActive) {
+    selectionCopyPendingAfterPointer = true;
+    return;
+  }
+
   const selection = getSelectedNoteText();
 
   if (!selection) {
@@ -785,6 +867,16 @@ async function focusSearchInput(selectText = false) {
 }
 
 async function openSearch(selectText = false) {
+  if (props.viewMode !== 'preview') {
+    if (!editorView) {
+      return;
+    }
+
+    editorView.focus();
+    openSearchPanel(editorView);
+    return;
+  }
+
   if (!searchVisible.value) {
     searchVisible.value = true;
   }
@@ -795,43 +887,251 @@ async function openSearch(selectText = false) {
 function closeSearch() {
   searchVisible.value = false;
   searchQuery.value = '';
-  activeSourceMatchIndex.value = 0;
   activePreviewMatchIndex.value = 0;
   previewMatchCount.value = 0;
   clearPreviewSearchHighlights();
   void focusEditor();
 }
 
-function handleInput(event: Event) {
-  const target = event.target as HTMLTextAreaElement | null;
-  emit('update:content', target?.value ?? '');
+function insertTextIntoEditor(text: string) {
+  if (!editorView || !text) {
+    return;
+  }
+
+  editorView.dispatch(editorView.state.replaceSelection(text));
+  editorView.focus();
 }
 
-function findSearchMatches(content: string, query: string) {
-  if (!query) {
-    return [] as Array<{ start: number; end: number }>;
+async function pasteClipboardIntoEditor(eventText?: string | null) {
+  const clipboardText = await readSharedClipboardText({
+    eventText,
+    preferPreviousDistinctOf: getSelectedEditorText(),
+  });
+
+  if (!clipboardText) {
+    return;
   }
 
-  const normalizedContent = content.toLocaleLowerCase();
-  const normalizedQueryValue = query.toLocaleLowerCase();
-  const matches: Array<{ start: number; end: number }> = [];
-  let searchIndex = 0;
+  insertTextIntoEditor(clipboardText);
+}
 
-  while (searchIndex <= normalizedContent.length - normalizedQueryValue.length) {
-    const matchIndex = normalizedContent.indexOf(normalizedQueryValue, searchIndex);
+useClipboardHistoryTarget({
+  isTargetActive: () => props.active && props.viewMode !== 'preview' && Boolean(editorView),
+  insertText: (text) => {
+    insertTextIntoEditor(text);
+  },
+});
 
-    if (matchIndex < 0) {
-      break;
+function buildEditableExtensions() {
+  return [
+    EditorState.readOnly.of(props.busy),
+    EditorView.editable.of(!props.busy),
+  ];
+}
+
+function buildLineNumbersExtension() {
+  return lineNumbersEnabled.value ? lineNumbers() : [];
+}
+
+function toggleLineNumbers() {
+  lineNumbersEnabled.value = !lineNumbersEnabled.value;
+
+  try {
+    window.localStorage.setItem(LINE_NUMBERS_STORAGE_KEY, lineNumbersEnabled.value ? '1' : '0');
+  } catch {
+    // localStorage unavailable; ignore.
+  }
+
+  editorView?.dispatch({
+    effects: lineNumbersCompartment.reconfigure(buildLineNumbersExtension()),
+  });
+}
+
+const CURSOR_EMIT_DEBOUNCE_MS = 250;
+let cursorEmitTimer: number | null = null;
+
+function clampCursor(anchor: number, head: number, docLength: number) {
+  return {
+    anchor: Math.min(Math.max(0, Math.floor(anchor)), docLength),
+    head: Math.min(Math.max(0, Math.floor(head)), docLength),
+  };
+}
+
+function flushCursorEmit() {
+  if (cursorEmitTimer !== null) {
+    window.clearTimeout(cursorEmitTimer);
+    cursorEmitTimer = null;
+  }
+
+  if (!editorView) {
+    return;
+  }
+
+  const mainSelection = editorView.state.selection.main;
+  const nextAnchor = mainSelection.anchor;
+  const nextHead = mainSelection.head;
+
+  if (props.cursor?.anchor === nextAnchor && props.cursor?.head === nextHead) {
+    return;
+  }
+
+  emit('update:cursor', { anchor: nextAnchor, head: nextHead });
+}
+
+function scheduleCursorEmit() {
+  if (cursorEmitTimer !== null) {
+    window.clearTimeout(cursorEmitTimer);
+  }
+
+  cursorEmitTimer = window.setTimeout(() => {
+    cursorEmitTimer = null;
+    flushCursorEmit();
+  }, CURSOR_EMIT_DEBOUNCE_MS);
+}
+
+function buildInitialSelection(docLength: number) {
+  const cursor = props.cursor;
+
+  if (!cursor) {
+    return undefined;
+  }
+
+  const { anchor, head } = clampCursor(cursor.anchor, cursor.head, docLength);
+  return EditorSelection.single(anchor, head);
+}
+
+function handleEditorUpdate(update: ViewUpdate) {
+  if (update.selectionSet) {
+    scheduleSelectionCopy();
+  }
+
+  if (suppressContentSync) {
+    return;
+  }
+
+  if (update.docChanged) {
+    const nextContent = update.state.doc.toString();
+
+    if (nextContent !== props.content) {
+      emit('update:content', nextContent);
     }
-
-    matches.push({
-      start: matchIndex,
-      end: matchIndex + normalizedQueryValue.length,
-    });
-    searchIndex = matchIndex + Math.max(1, normalizedQueryValue.length);
   }
 
-  return matches;
+  if (update.selectionSet) {
+    scheduleCursorEmit();
+  }
+}
+
+function createEditor() {
+  if (!editorRootRef.value) {
+    return;
+  }
+
+  editorView?.destroy();
+
+  const state = EditorState.create({
+    doc: props.content,
+    selection: buildInitialSelection(props.content.length),
+    extensions: [
+      EditorState.tabSize.of(2),
+      EditorView.lineWrapping,
+      lineNumbersCompartment.of(buildLineNumbersExtension()),
+      highlightActiveLine(),
+      highlightActiveLineGutter(),
+      drawSelection(),
+      history(),
+      bracketMatching(),
+      indentOnInput(),
+      search({ top: true }),
+      highlightSelectionMatches(),
+      keymap.of([
+        ...defaultKeymap,
+        ...historyKeymap,
+        ...searchKeymap,
+        indentWithTab,
+      ]),
+      EditorView.contentAttributes.of({
+        autocapitalize: 'off',
+        autocomplete: 'off',
+        autocorrect: 'off',
+        spellcheck: 'false',
+      }),
+      EditorView.domEventHandlers({
+        contextmenu: (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          void pasteClipboardIntoEditor();
+          return true;
+        },
+        paste: (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          void pasteClipboardIntoEditor(event.clipboardData?.getData('text/plain') ?? '');
+          return true;
+        },
+      }),
+      EditorView.updateListener.of((update) => {
+        handleEditorUpdate(update);
+      }),
+      editableCompartment.of(buildEditableExtensions()),
+      languageCompartment.of(markdown({ base: markdownLanguage })),
+      themeCompartment.of(getCodeEditorThemeExtension(props.editorTheme)),
+    ],
+  });
+
+  editorView = new EditorView({
+    state,
+    parent: editorRootRef.value,
+  });
+
+  if (props.cursor) {
+    editorView.dispatch({
+      effects: EditorView.scrollIntoView(editorView.state.selection.main, { y: 'center' }),
+    });
+  }
+
+  if (props.active && props.viewMode !== 'preview') {
+    void nextTick(() => {
+      editorView?.focus();
+    });
+  }
+}
+
+function destroyEditor() {
+  flushCursorEmit();
+  editorView?.destroy();
+  editorView = null;
+}
+
+function syncEditorContent(nextContent: string) {
+  if (!editorView) {
+    return;
+  }
+
+  const currentContent = editorView.state.doc.toString();
+
+  if (currentContent === nextContent) {
+    return;
+  }
+
+  suppressContentSync = true;
+  editorView.dispatch({
+    changes: { from: 0, to: currentContent.length, insert: nextContent },
+  });
+  suppressContentSync = false;
+}
+
+function reconfigureEditor() {
+  if (!editorView) {
+    return;
+  }
+
+  editorView.dispatch({
+    effects: [
+      editableCompartment.reconfigure(buildEditableExtensions()),
+      themeCompartment.reconfigure(getCodeEditorThemeExtension(props.editorTheme)),
+    ],
+  });
 }
 
 function updateChecklistItem(taskIndex: number, checked: boolean) {
@@ -1017,6 +1317,11 @@ async function handlePreviewClick(event: MouseEvent) {
 }
 
 function handleDocumentPointerDown(event: PointerEvent) {
+  if (event.button === 0 && rootRef.value?.contains(event.target as Node | null)) {
+    selectionPointerActive = true;
+    selectionCopyPendingAfterPointer = false;
+  }
+
   if (!filePathMenu.value) {
     return;
   }
@@ -1028,6 +1333,21 @@ function handleDocumentPointerDown(event: PointerEvent) {
   }
 
   closeFilePathMenu();
+}
+
+function handleDocumentPointerUp() {
+  if (!selectionPointerActive) {
+    return;
+  }
+
+  selectionPointerActive = false;
+
+  if (!selectionCopyPendingAfterPointer) {
+    return;
+  }
+
+  selectionCopyPendingAfterPointer = false;
+  scheduleSelectionCopy();
 }
 
 function clearPreviewSearchHighlights() {
@@ -1156,75 +1476,24 @@ async function refreshPreviewSearch(scrollIntoView = false) {
   syncActivePreviewMatch(scrollIntoView);
 }
 
-function syncSourceMatchSelection() {
-  const textarea = textareaRef.value;
-  const matches = sourceMatches.value;
-
-  if (!textarea || matches.length < 1 || props.viewMode === 'preview') {
-    return;
-  }
-
-  const match = matches[Math.min(activeSourceMatchIndex.value, matches.length - 1)];
-
-  if (!match) {
-    return;
-  }
-
-  textarea.setSelectionRange(match.start, match.end, 'forward');
-  textarea.focus({ preventScroll: true });
-  requestAnimationFrame(() => {
-    searchInputRef.value?.focus({ preventScroll: true });
-  });
-}
-
 function goToNextSearchMatch() {
-  if (!normalizedSearchQuery.value) {
+  if (!normalizedSearchQuery.value || previewMatchCount.value < 1) {
     return;
   }
 
-  if (searchMode.value === 'preview') {
-    if (previewMatchCount.value < 1) {
-      return;
-    }
-
-    activePreviewMatchIndex.value = (activePreviewMatchIndex.value + 1) % previewMatchCount.value;
-    syncActivePreviewMatch(true);
-    return;
-  }
-
-  if (sourceMatches.value.length < 1) {
-    return;
-  }
-
-  activeSourceMatchIndex.value = (activeSourceMatchIndex.value + 1) % sourceMatches.value.length;
-  syncSourceMatchSelection();
+  activePreviewMatchIndex.value = (activePreviewMatchIndex.value + 1) % previewMatchCount.value;
+  syncActivePreviewMatch(true);
 }
 
 function goToPreviousSearchMatch() {
-  if (!normalizedSearchQuery.value) {
+  if (!normalizedSearchQuery.value || previewMatchCount.value < 1) {
     return;
   }
 
-  if (searchMode.value === 'preview') {
-    if (previewMatchCount.value < 1) {
-      return;
-    }
-
-    activePreviewMatchIndex.value = (
-      activePreviewMatchIndex.value - 1 + previewMatchCount.value
-    ) % previewMatchCount.value;
-    syncActivePreviewMatch(true);
-    return;
-  }
-
-  if (sourceMatches.value.length < 1) {
-    return;
-  }
-
-  activeSourceMatchIndex.value = (
-    activeSourceMatchIndex.value - 1 + sourceMatches.value.length
-  ) % sourceMatches.value.length;
-  syncSourceMatchSelection();
+  activePreviewMatchIndex.value = (
+    activePreviewMatchIndex.value - 1 + previewMatchCount.value
+  ) % previewMatchCount.value;
+  syncActivePreviewMatch(true);
 }
 
 function handleSearchKeydown(event: KeyboardEvent) {
@@ -1246,6 +1515,17 @@ function handleSearchKeydown(event: KeyboardEvent) {
   }
 
   goToNextSearchMatch();
+}
+
+function isSelectionRangeKeyboardShortcut(event: KeyboardEvent) {
+  return (
+    event.shiftKey
+    && ['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End', 'PageUp', 'PageDown'].includes(event.key)
+  );
+}
+
+function isSelectAllKeyboardShortcut(event: KeyboardEvent) {
+  return (event.ctrlKey || event.metaKey) && !event.altKey && event.key.toLowerCase() === 'a';
 }
 
 function focusHotkeySurface() {
@@ -1273,7 +1553,7 @@ async function focusEditor() {
     return;
   }
 
-  textareaRef.value?.focus();
+  editorView?.focus();
 }
 
 function isShortcutTargetWithinNote(event: KeyboardEvent) {
@@ -1297,6 +1577,14 @@ function isShortcutTargetWithinNote(event: KeyboardEvent) {
 function handleDocumentKeydown(event: KeyboardEvent) {
   if (!isShortcutTargetWithinNote(event)) {
     return;
+  }
+
+  if (isSelectionRangeKeyboardShortcut(event)) {
+    selectionKeyboardActive = true;
+    selectionKeyboardMode = 'range';
+  } else if (isSelectAllKeyboardShortcut(event)) {
+    selectionKeyboardActive = true;
+    selectionKeyboardMode = 'select-all';
   }
 
   if (event.defaultPrevented) {
@@ -1371,23 +1659,84 @@ function handleDocumentKeydown(event: KeyboardEvent) {
   emit('save-file');
 }
 
+function handleDocumentKeyup(event: KeyboardEvent) {
+  if (!selectionKeyboardActive) {
+    return;
+  }
+
+  const shouldFinalizeRangeSelection = (
+    selectionKeyboardMode === 'range'
+    && (
+      event.key === 'Shift'
+      || (
+        !event.shiftKey
+        && ['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End', 'PageUp', 'PageDown'].includes(event.key)
+      )
+    )
+  );
+  const shouldFinalizeSelectAll = selectionKeyboardMode === 'select-all' && isSelectAllKeyboardShortcut(event);
+
+  if (!shouldFinalizeRangeSelection && !shouldFinalizeSelectAll) {
+    return;
+  }
+
+  selectionKeyboardActive = false;
+  selectionKeyboardMode = null;
+
+  if (!selectionCopyPendingAfterKeyboard) {
+    return;
+  }
+
+  selectionCopyPendingAfterKeyboard = false;
+  scheduleSelectionCopy();
+}
+
+const handleFlushEditorState = () => {
+  flushCursorEmit();
+  flushSplitRatioEmit();
+};
+
 onMounted(() => {
+  createEditor();
   document.addEventListener('keydown', handleDocumentKeydown);
+  document.addEventListener('keyup', handleDocumentKeyup);
   document.addEventListener('pointerdown', handleDocumentPointerDown);
+  document.addEventListener('pointerup', handleDocumentPointerUp);
   document.addEventListener('selectionchange', scheduleSelectionCopy);
+  window.addEventListener('bridgegit:flush-editor-state', handleFlushEditorState);
   void focusEditor();
 });
 
 onBeforeUnmount(() => {
+  destroyEditor();
   document.removeEventListener('keydown', handleDocumentKeydown);
+  document.removeEventListener('keyup', handleDocumentKeyup);
   document.removeEventListener('pointerdown', handleDocumentPointerDown);
+  document.removeEventListener('pointerup', handleDocumentPointerUp);
   document.removeEventListener('selectionchange', scheduleSelectionCopy);
+  window.removeEventListener('bridgegit:flush-editor-state', handleFlushEditorState);
   clearPendingSelectionCopy();
+  flushSplitRatioEmit();
 
   if (copyToastTimer) {
     window.clearTimeout(copyToastTimer);
     copyToastTimer = null;
   }
+});
+
+watch(
+  () => props.splitRatio,
+  (nextSplitRatio) => {
+    if (noteSplit.isDragging.value || Math.abs(noteSplit.ratio.value - nextSplitRatio) < 0.0001) {
+      return;
+    }
+
+    noteSplit.ratio.value = nextSplitRatio;
+  },
+);
+
+watch(noteSplit.ratio, () => {
+  scheduleSplitRatioEmit();
 });
 
 watch(
@@ -1440,43 +1789,29 @@ watch(
 watch(
   () => normalizedSearchQuery.value,
   () => {
-    activeSourceMatchIndex.value = 0;
     activePreviewMatchIndex.value = 0;
 
-    if (!searchVisible.value) {
-      return;
+    if (searchVisible.value) {
+      void refreshPreviewSearch();
     }
-
-    syncSourceMatchSelection();
-    void refreshPreviewSearch();
   },
 );
 
 watch(
   () => props.content,
-  () => {
-    if (!searchVisible.value || !normalizedSearchQuery.value) {
-      return;
-    }
+  (nextContent) => {
+    syncEditorContent(nextContent);
 
-    if (activeSourceMatchIndex.value >= sourceMatches.value.length) {
-      activeSourceMatchIndex.value = Math.max(0, sourceMatches.value.length - 1);
+    if (searchVisible.value && normalizedSearchQuery.value) {
+      void refreshPreviewSearch();
     }
-
-    syncSourceMatchSelection();
-    void refreshPreviewSearch();
   },
 );
 
 watch(
-  () => props.viewMode,
+  () => [props.busy, props.editorTheme, props.themeVariant] as const,
   () => {
-    if (!searchVisible.value) {
-      return;
-    }
-
-    syncSourceMatchSelection();
-    void refreshPreviewSearch();
+    reconfigureEditor();
   },
 );
 
@@ -1491,6 +1826,8 @@ defineExpose({
     ref="rootRef"
     class="note-tab"
     :data-appearance-theme="appearanceTheme"
+    :data-editor-theme-id="editorTheme"
+    :data-editor-theme="themeVariant"
     :style="noteStyle"
     tabindex="-1"
   >
@@ -1612,6 +1949,20 @@ defineExpose({
 
         <button
           class="note-tab__action"
+          :class="{ 'note-tab__action--active': lineNumbersEnabled }"
+          type="button"
+          :title="lineNumbersEnabled ? 'Hide line numbers' : 'Show line numbers'"
+          :aria-label="lineNumbersEnabled ? 'Hide line numbers' : 'Show line numbers'"
+          :aria-pressed="lineNumbersEnabled"
+          @click="toggleLineNumbers"
+        >
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M4 6.5a.75.75 0 0 1 .75-.75h1.5a.75.75 0 0 1 0 1.5h-1.5A.75.75 0 0 1 4 6.5Zm5 0a.75.75 0 0 1 .75-.75h10a.75.75 0 0 1 0 1.5h-10A.75.75 0 0 1 9 6.5ZM4 12a.75.75 0 0 1 .75-.75h1.5a.75.75 0 0 1 0 1.5h-1.5A.75.75 0 0 1 4 12Zm5 0a.75.75 0 0 1 .75-.75h10a.75.75 0 0 1 0 1.5h-10A.75.75 0 0 1 9 12Zm-5 5.5a.75.75 0 0 1 .75-.75h1.5a.75.75 0 0 1 0 1.5h-1.5a.75.75 0 0 1-.75-.75Zm5 0a.75.75 0 0 1 .75-.75h10a.75.75 0 0 1 0 1.5h-10a.75.75 0 0 1-.75-.75Z" />
+          </svg>
+        </button>
+
+        <button
+          class="note-tab__action"
           type="button"
           title="Copy full note"
           aria-label="Copy full note"
@@ -1650,7 +2001,7 @@ defineExpose({
       </div>
     </div>
 
-    <div v-if="searchVisible" class="note-tab__search">
+    <div v-if="searchVisible && viewMode === 'preview'" class="note-tab__search">
       <div class="note-tab__search-meta">
         <span class="note-tab__search-count">
           <template v-if="normalizedSearchQuery">
@@ -1707,26 +2058,30 @@ defineExpose({
     </div>
 
     <div
+      :ref="(el) => { noteSplit.containerRef.value = el as HTMLElement | null; }"
       class="note-tab__body"
       :class="{
         'note-tab__body--source-only': viewMode === 'source',
         'note-tab__body--preview-only': viewMode === 'preview',
+        'note-tab__body--split': viewMode === 'split',
       }"
+      :style="noteSplitStyle"
       @wheel.capture="handleWheelZoom"
     >
       <div class="note-tab__source" :class="{ 'note-tab__source--hidden': viewMode === 'preview' }">
-        <textarea
-          ref="textareaRef"
-          class="note-tab__input"
-          :value="content"
-          spellcheck="false"
-          placeholder="Write markdown notes, prompts, and snippets..."
-          @input="handleInput"
-          @select="scheduleSelectionCopy"
-          @pointerup="scheduleSelectionCopy"
-          @keyup="scheduleSelectionCopy"
-        />
+        <div ref="editorRootRef" class="note-tab__editor" />
       </div>
+
+      <div
+        v-if="viewMode === 'split'"
+        class="note-tab__split-divider"
+        :class="{ 'note-tab__split-divider--active': noteSplit.isDragging.value }"
+        role="separator"
+        aria-orientation="vertical"
+        title="Drag to resize • Double-click to reset"
+        @pointerdown="noteSplit.startDrag"
+        @dblclick="noteSplit.reset"
+      />
 
       <div
         ref="previewRef"
@@ -1851,13 +2206,70 @@ defineExpose({
   --code-token-tag: #ffb37f;
   --code-token-punctuation: rgba(226, 234, 242, 0.82);
   --code-token-invalid: #ff9e97;
+  --note-editor-bg: rgba(11, 16, 22, 0.92);
+  --note-editor-text: var(--text-primary);
+  --note-editor-accent: var(--accent-strong);
+  --note-editor-gutter-bg: rgba(13, 19, 26, 0.92);
+  --note-editor-gutter-color: rgba(143, 158, 177, 0.72);
+  --note-editor-active-line-bg: rgba(42, 62, 84, 0.16);
+  --note-editor-active-gutter-bg: rgba(36, 52, 69, 0.92);
+  --note-editor-active-gutter-color: rgba(232, 240, 246, 0.88);
+  --note-editor-selection-bg: rgba(59, 130, 246, 0.3);
   position: relative;
-  display: grid;
-  grid-template-rows: auto auto auto minmax(0, 1fr);
+  display: flex;
+  flex-direction: column;
   gap: 8px;
   height: 100%;
   min-height: 0;
   padding: 10px;
+}
+
+.note-tab[data-editor-theme='light'] {
+  --note-editor-bg: rgba(252, 253, 255, 0.98);
+  --note-editor-text: #182535;
+  --note-editor-accent: #2d7cd8;
+  --note-editor-gutter-bg: rgba(240, 245, 251, 0.98);
+  --note-editor-gutter-color: rgba(103, 118, 135, 0.72);
+  --note-editor-active-line-bg: rgba(86, 143, 214, 0.1);
+  --note-editor-active-gutter-bg: rgba(211, 225, 242, 0.96);
+  --note-editor-active-gutter-color: #1f3a5c;
+  --note-editor-selection-bg: rgba(74, 139, 232, 0.2);
+}
+
+.note-tab[data-editor-theme-id='github-dark'] {
+  --note-editor-bg: #0d1117;
+  --note-editor-text: #c9d1d9;
+  --note-editor-accent: #58a6ff;
+  --note-editor-gutter-bg: #0d1117;
+  --note-editor-gutter-color: #6e7681;
+  --note-editor-active-line-bg: rgba(56, 139, 253, 0.08);
+  --note-editor-active-gutter-bg: rgba(56, 139, 253, 0.12);
+  --note-editor-active-gutter-color: #c9d1d9;
+  --note-editor-selection-bg: rgba(56, 139, 253, 0.28);
+}
+
+.note-tab[data-editor-theme-id='github-light'] {
+  --note-editor-bg: #ffffff;
+  --note-editor-text: #24292f;
+  --note-editor-accent: #0969da;
+  --note-editor-gutter-bg: #f6f8fa;
+  --note-editor-gutter-color: #57606a;
+  --note-editor-active-line-bg: rgba(9, 105, 218, 0.08);
+  --note-editor-active-gutter-bg: rgba(9, 105, 218, 0.12);
+  --note-editor-active-gutter-color: #24292f;
+  --note-editor-selection-bg: rgba(9, 105, 218, 0.18);
+}
+
+.note-tab[data-editor-theme-id='nord'] {
+  --note-editor-bg: #2e3440;
+  --note-editor-text: #d8dee9;
+  --note-editor-accent: #88c0d0;
+  --note-editor-gutter-bg: #3b4252;
+  --note-editor-gutter-color: #7b8799;
+  --note-editor-active-line-bg: rgba(136, 192, 208, 0.12);
+  --note-editor-active-gutter-bg: rgba(136, 192, 208, 0.2);
+  --note-editor-active-gutter-color: #eceff4;
+  --note-editor-selection-bg: rgba(136, 192, 208, 0.3);
 }
 
 .note-tab[data-appearance-theme='bridgegit-light'] {
@@ -2127,6 +2539,12 @@ defineExpose({
   background: var(--note-tab-action-hover-bg);
 }
 
+.note-tab__action--active {
+  border-color: rgba(110, 197, 255, 0.34);
+  background: var(--note-tab-action-active-bg);
+  color: var(--note-tab-action-active-color, var(--text-primary));
+}
+
 .note-tab__action:disabled {
   cursor: not-allowed;
   opacity: 0.48;
@@ -2297,10 +2715,13 @@ defineExpose({
 }
 
 .note-tab__body {
+  flex: 1 1 auto;
   min-height: 0;
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
   gap: 8px;
+  align-items: stretch;
 }
 
 .note-tab__body--source-only,
@@ -2310,7 +2731,11 @@ defineExpose({
 
 .note-tab__source,
 .note-tab__preview {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
   min-height: 0;
+  overflow: hidden;
 }
 
 .note-tab__source--hidden,
@@ -2318,30 +2743,116 @@ defineExpose({
   display: none;
 }
 
-.note-tab__input {
-  width: 100%;
-  height: 100%;
+.note-tab__split-divider {
+  align-self: stretch;
+  cursor: col-resize;
+  background: transparent;
+  position: relative;
+  touch-action: none;
+}
+
+.note-tab__split-divider::before {
+  content: '';
+  position: absolute;
+  inset: 4px 3px;
+  border-radius: 2px;
+  background: var(--border-subtle, rgba(108, 124, 148, 0.32));
+  opacity: 0.55;
+  transition: opacity 120ms ease, background 120ms ease;
+}
+
+.note-tab__split-divider:hover::before {
+  opacity: 0.92;
+  background: rgba(110, 197, 255, 0.5);
+}
+
+.note-tab__split-divider--active::before {
+  opacity: 1;
+  background: rgba(110, 197, 255, 0.78);
+}
+
+.note-tab__editor {
+  box-sizing: border-box;
+  display: flex;
+  flex: 1 1 auto;
   min-height: 0;
-  resize: none;
-  padding: 16px 18px;
   border: 1px solid rgba(108, 124, 148, 0.16);
   border-radius: 14px;
-  background: var(--note-tab-input-bg);
-  color: var(--text-primary);
+  background: var(--note-editor-bg);
+  overflow: hidden;
+}
+
+.note-tab__editor :deep(.cm-editor) {
+  flex: 1 1 auto;
+  min-height: 0;
+  height: 100%;
+  background: var(--note-editor-bg);
+  color: var(--note-editor-text);
   font-family: var(--font-mono), 'Segoe UI Emoji', 'Apple Color Emoji', 'Noto Color Emoji', monospace;
   font-size: calc(var(--note-font-size-px, 14) * 1px);
-  font-weight: 500;
-  line-height: 1.55;
+}
+
+.note-tab__editor :deep(.cm-focused) {
   outline: none;
 }
 
-.note-tab__input:focus {
-  border-color: rgba(110, 197, 255, 0.34);
-  box-shadow: inset 0 0 0 1px rgba(110, 197, 255, 0.14);
+.note-tab__editor :deep(.cm-scroller) {
+  overflow: auto;
+  font-family: inherit;
+  line-height: 1.6;
 }
 
-.note-tab__input::placeholder {
-  color: rgba(173, 184, 197, 0.48);
+.note-tab__editor :deep(.cm-content),
+.note-tab__editor :deep(.cm-gutter) {
+  min-height: 100%;
+}
+
+.note-tab__editor :deep(.cm-content) {
+  padding: 0.95rem 0 1.1rem;
+  caret-color: var(--note-editor-accent);
+}
+
+.note-tab__editor :deep(.cm-line) {
+  padding: 0 1rem;
+}
+
+.note-tab__editor :deep(.cm-gutters) {
+  border-right: 1px solid rgba(108, 124, 148, 0.18);
+  background: var(--note-editor-gutter-bg);
+  color: var(--note-editor-gutter-color);
+}
+
+.note-tab__editor :deep(.cm-gutterElement) {
+  padding: 0 0.8rem 0 0.95rem;
+}
+
+.note-tab__editor :deep(.cm-activeLine) {
+  background: var(--note-editor-active-line-bg);
+}
+
+.note-tab__editor :deep(.cm-activeLineGutter) {
+  background: var(--note-editor-active-gutter-bg);
+  color: var(--note-editor-active-gutter-color);
+}
+
+.note-tab__editor :deep(.cm-selectionBackground),
+.note-tab__editor :deep(.cm-content ::selection),
+.note-tab__editor :deep(.cm-searchMatch.cm-searchMatch-selected) {
+  background: var(--note-editor-selection-bg);
+}
+
+.note-tab__editor :deep(.cm-cursor) {
+  border-left-color: var(--note-editor-accent);
+}
+
+.note-tab__editor :deep(.cm-matchingBracket),
+.note-tab__editor :deep(.cm-nonmatchingBracket) {
+  border-bottom: 1px solid rgba(123, 208, 255, 0.55);
+}
+
+.note-tab__editor:focus-within {
+  border-color: rgba(110, 197, 255, 0.34);
+  box-shadow: inset 0 0 0 1px rgba(110, 197, 255, 0.14);
 }
 
 .note-tab__preview {

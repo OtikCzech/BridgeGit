@@ -66,6 +66,7 @@ export function buildWelcomeNoteTab(workspaceTabDefaults?: WorkspaceTabDefaults)
     content: welcomeNoteContent,
     savedContent: welcomeNoteContent,
     viewMode: 'preview',
+    splitRatio: 0.5,
     fontSize: workspaceTabDefaults?.noteFontSize ?? DEFAULT_NOTE_FONT_SIZE,
   };
 }

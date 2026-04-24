@@ -1,11 +1,12 @@
 <script setup lang="ts">
-import { computed, defineAsyncComponent, onBeforeUnmount, onMounted, ref, watch } from 'vue';
+import { computed, defineAsyncComponent, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import {
   DEFAULT_SESSION_DATA,
   DEFAULT_PANEL_LAYOUT,
   GLOBAL_WORKSPACE_ID,
   GLOBAL_WORKSPACE_SESSION_KEY,
   areRepoPathsEquivalent,
+  cloneClipboardHistoryEntries,
   cloneDismissedWorktreePaths,
   cloneDockerDialogState,
   cloneSeenInfoNoteRevisions,
@@ -26,6 +27,7 @@ import {
   resolveThemeVariant,
   resolveWorkspaceFileTabType,
   type AppAppearance,
+  type ClipboardHistoryEntry,
   type CodeNavigationTarget,
   type EditorTheme,
   type ResolvedEditorTheme,
@@ -67,6 +69,18 @@ import {
   refreshWelcomeNoteTabs,
   upsertWelcomeNoteTab,
 } from './onboarding';
+import {
+  CLIPBOARD_HISTORY_CAPTURE_TARGET_EVENT,
+  CLIPBOARD_HISTORY_CLEAR_TARGET_EVENT,
+  CLIPBOARD_HISTORY_INSERT_EVENT,
+  CLIPBOARD_HISTORY_UPDATED_EVENT,
+  type ClipboardHistoryUpdatedDetail,
+  getClipboardHistoryEntries,
+  listClipboardHistory,
+  readClipboardText as readSharedClipboardText,
+  setClipboardHistoryEntries,
+  syncClipboardHistoryFromSystem,
+} from './clipboard';
 import { SHORTCUTS, matchesCommandSlotShortcut, matchesShortcut } from './shortcuts';
 
 const CommitHistoryDialog = defineAsyncComponent(() => import('./components/CommitHistoryDialog.vue'));
@@ -76,6 +90,7 @@ const ProjectSettingsDialog = defineAsyncComponent(() => import('./components/Pr
 
 const shellRef = ref<HTMLElement | null>(null);
 const contentRef = ref<HTMLElement | null>(null);
+const clipboardHistorySearchInputRef = ref<HTMLInputElement | null>(null);
 const terminalPanelRef = ref<{
   addShellTab: () => void;
   addNoteTab: () => void;
@@ -128,6 +143,7 @@ const projectTitleSaveToast = ref<string | null>(null);
 const isSettingsOpen = ref(false);
 const isCommitHistoryOpen = ref(false);
 const isDockerDialogOpen = ref(false);
+const isClipboardHistoryOpen = ref(false);
 const commitHistorySearchToken = ref(0);
 const commitMessage = ref('');
 const recentRepos = ref<RecentRepoEntry[]>([]);
@@ -158,8 +174,12 @@ const workspaceGitSummaryById = ref<Record<string, WorkspaceGitSummary>>({});
 const gitRepositoryValidityByPath = ref<Record<string, boolean>>({});
 const seenInfoNoteRevisions = ref<string[]>([]);
 const dockerDialogState = ref(cloneDockerDialogState(DEFAULT_SESSION_DATA.dockerDialogState));
+const clipboardHistoryItems = ref<ClipboardHistoryEntry[]>([]);
+const clipboardHistoryQuery = ref('');
+const clipboardHistorySelectedIndex = ref(0);
 const detectedWorktrees = ref<GitWorktreeSummary[]>([]);
 const sessionReady = ref(false);
+const sessionPersistenceEnabled = ref(false);
 const isSwitchingWorkspaceContext = ref(false);
 const isCheckingWorktrees = ref(false);
 const repoToolbarBusyAction = ref<'pull' | 'push' | 'refresh' | null>(null);
@@ -176,7 +196,7 @@ const runtimeInfo = window.bridgegit ?? {
   },
 };
 
-const { session, loadSession, saveSession } = useSession();
+const { session, loadSession, saveSession, saveSessionSync } = useSession();
 const {
   repoPath,
   status,
@@ -256,6 +276,7 @@ let projectTitleSaveToastTimer: number | null = null;
 let inactiveWorkspaceGitSummaryTimer: number | null = null;
 let initialInactiveWorkspaceGitSummaryTimer: number | null = null;
 let worktreeDetectionTimer: number | null = null;
+let removeCloseRequestedListener: (() => void) | null = null;
 let inactiveWorkspaceGitSummaryRefreshInFlight = false;
 const backgroundShellSubscriptions = new Map<string, BackgroundShellSubscription>();
 const backgroundShellActivityTimers = new Map<string, number>();
@@ -674,6 +695,38 @@ function handleWorkspaceRecentActivityUpdate(nextWorkspaceId: string, nextRecent
   }
 }
 
+function handleWorkspaceTabsUpdate(nextTabs: WorkspaceTabState[]) {
+  workspaceTabs.value = nextTabs;
+  if (canPersistSession()) {
+    captureWorkspaceSession(getCurrentWorkspaceId());
+    scheduleSessionSave();
+  }
+}
+
+function handleWorkspaceEditorPaneLayoutUpdate(nextEditorPaneLayout: WorkspaceEditorPaneLayout) {
+  workspaceEditorPaneLayout.value = nextEditorPaneLayout;
+  if (canPersistSession()) {
+    captureWorkspaceSession(getCurrentWorkspaceId());
+    scheduleSessionSave();
+  }
+}
+
+function handleWorkspaceMultiDisplayTabIdsUpdate(nextMultiDisplayTabIds: string[]) {
+  workspaceMultiDisplayTabIds.value = nextMultiDisplayTabIds;
+  if (canPersistSession()) {
+    captureWorkspaceSession(getCurrentWorkspaceId());
+    scheduleSessionSave();
+  }
+}
+
+function handleActiveWorkspaceTabIdUpdate(nextActiveTabId: string | null) {
+  activeWorkspaceTabId.value = nextActiveTabId;
+  if (canPersistSession()) {
+    captureWorkspaceSession(getCurrentWorkspaceId());
+    scheduleSessionSave();
+  }
+}
+
 function handleWorkspaceAttentionUpdate(nextWorkspaceId: string, nextAttention: Record<string, boolean>) {
   workspaceAttentionByWorkspaceId.value = {
     ...workspaceAttentionByWorkspaceId.value,
@@ -1068,7 +1121,8 @@ function buildWorkspaceSessionState(
 function buildPersistedWorkspaceSessions(): WorkspaceSessionsById {
   const nextWorkspaceSessions = cloneWorkspaceSessions(workspaceSessions.value);
   nextWorkspaceSessions[getCurrentWorkspaceId()] = buildWorkspaceSessionState();
-  return nextWorkspaceSessions;
+  workspaceSessions.value = cloneWorkspaceSessions(nextWorkspaceSessions);
+  return cloneWorkspaceSessions(nextWorkspaceSessions);
 }
 
 function applyWorkspaceSession(nextWorkspaceId: string | null) {
@@ -1299,12 +1353,43 @@ function buildSessionSavePayload(
     dismissedWorktreePaths: dismissedWorktreePaths.value,
     soundNotificationsEnabled: soundNotificationsEnabled.value,
     seenInfoNoteRevisions: seenInfoNoteRevisions.value,
+    clipboardHistory: getClipboardHistoryEntries(),
     terminalCommandPresets: terminalCommandPresets.value,
     dockerDialogState: cloneDockerDialogState(dockerDialogState.value),
     workspaceSessions: buildPersistedWorkspaceSessions(),
     panelLayout: buildCurrentPanelLayout(),
     panelLayoutsByWorkspace: buildPersistedPanelLayoutsByWorkspace(),
     workspaceRepoPanelStates: buildPersistedWorkspaceRepoPanelStates(),
+  };
+}
+
+function buildIncrementalSessionSavePayload(
+  options: {
+    activeWorkspaceId?: string | null;
+    lastRepoPath?: string | null;
+  } = {},
+) {
+  const hasExplicitLastRepoPath = Object.prototype.hasOwnProperty.call(options, 'lastRepoPath');
+  const resolvedLastRepoPath = resolvePersistedLastRepoPath(
+    hasExplicitLastRepoPath ? options.lastRepoPath ?? null : repoPath.value,
+  );
+  const resolvedActiveWorkspaceId = options.activeWorkspaceId ?? activeWorkspaceId.value ?? GLOBAL_WORKSPACE_ID;
+  const currentWorkspaceId = getCurrentWorkspaceId();
+
+  return {
+    lastRepoPath: resolvedLastRepoPath,
+    activeWorkspaceId: resolvedActiveWorkspaceId,
+    terminalCwd: resolveWorkspaceDefaultTerminalCwd(resolvedActiveWorkspaceId, resolvedLastRepoPath),
+    workspaceSessions: {
+      [currentWorkspaceId]: buildWorkspaceSessionState(),
+    },
+    panelLayout: buildCurrentPanelLayout(),
+    panelLayoutsByWorkspace: {
+      [currentWorkspaceId]: buildCurrentPanelLayout(),
+    },
+    workspaceRepoPanelStates: {
+      [currentWorkspaceId]: currentWorkspaceRepoPanelStateValue(),
+    },
   };
 }
 
@@ -1616,16 +1701,15 @@ function isTextPasteTarget(target: EventTarget | null): target is HTMLInputEleme
   return !new Set(['button', 'checkbox', 'color', 'file', 'hidden', 'image', 'radio', 'range', 'reset', 'submit']).has(target.type);
 }
 
-async function readClipboardText() {
-  try {
-    if (window.bridgegit?.clipboard) {
-      return await Promise.resolve(window.bridgegit.clipboard.readText());
-    }
-  } catch {
-    // Fall back to the browser clipboard API when the Electron bridge is unavailable.
+function getSelectedTextFromTarget(target: HTMLInputElement | HTMLTextAreaElement) {
+  const selectionStart = target.selectionStart ?? 0;
+  const selectionEnd = target.selectionEnd ?? 0;
+
+  if (selectionEnd <= selectionStart) {
+    return '';
   }
 
-  return navigator.clipboard.readText();
+  return target.value.slice(selectionStart, selectionEnd).replace(/\r\n/g, '\n');
 }
 
 function updateTextFieldValue(target: HTMLInputElement | HTMLTextAreaElement, value: string) {
@@ -1643,26 +1727,11 @@ function updateTextFieldValue(target: HTMLInputElement | HTMLTextAreaElement, va
   target.dispatchEvent(new Event('input', { bubbles: true }));
 }
 
-async function handleGlobalEditableContextMenu(event: MouseEvent) {
-  const target = event.target;
-
-  if (!isTextPasteTarget(target) || target.disabled || target.readOnly) {
-    return;
-  }
-
-  event.preventDefault();
-  event.stopPropagation();
-
-  const clipboardText = (await readClipboardText()).replace(/\r\n/g, '\n');
-
-  if (!clipboardText) {
-    return;
-  }
-
+function insertTextIntoTarget(target: HTMLInputElement | HTMLTextAreaElement, text: string) {
   const selectionStart = target.selectionStart ?? target.value.length;
   const selectionEnd = target.selectionEnd ?? target.value.length;
-  const nextValue = `${target.value.slice(0, selectionStart)}${clipboardText}${target.value.slice(selectionEnd)}`;
-  const nextCursorPosition = selectionStart + clipboardText.length;
+  const nextValue = `${target.value.slice(0, selectionStart)}${text}${target.value.slice(selectionEnd)}`;
+  const nextCursorPosition = selectionStart + text.length;
 
   updateTextFieldValue(target, nextValue);
   target.focus();
@@ -1672,6 +1741,267 @@ async function handleGlobalEditableContextMenu(event: MouseEvent) {
   } catch {
     // Some input types do not support programmatic selection ranges.
   }
+}
+
+async function insertClipboardTextIntoTarget(
+  target: HTMLInputElement | HTMLTextAreaElement,
+  options: {
+    eventText?: string | null;
+  } = {},
+) {
+  const clipboardText = await readSharedClipboardText({
+    eventText: options.eventText,
+    preferPreviousDistinctOf: getSelectedTextFromTarget(target),
+  });
+
+  if (!clipboardText) {
+    return;
+  }
+
+  insertTextIntoTarget(target, clipboardText);
+}
+
+let clipboardHistoryTextTarget: HTMLInputElement | HTMLTextAreaElement | null = null;
+const clipboardHistoryDateTimeFormatter = new Intl.DateTimeFormat(undefined, {
+  dateStyle: 'short',
+  timeStyle: 'short',
+});
+
+const filteredClipboardHistoryItems = computed(() => {
+  const normalizedQuery = clipboardHistoryQuery.value.trim().toLocaleLowerCase();
+
+  if (!normalizedQuery) {
+    return clipboardHistoryItems.value;
+  }
+
+  return clipboardHistoryItems.value.filter((item) => item.text.toLocaleLowerCase().includes(normalizedQuery));
+});
+
+const selectedClipboardHistoryItem = computed(() => (
+  filteredClipboardHistoryItems.value[clipboardHistorySelectedIndex.value] ?? null
+));
+
+async function refreshClipboardHistoryItems() {
+  clipboardHistoryItems.value = await listClipboardHistory();
+  clipboardHistorySelectedIndex.value = 0;
+}
+
+function captureClipboardHistoryTarget() {
+  const activeElement = document.activeElement;
+  clipboardHistoryTextTarget = (
+    isTextPasteTarget(activeElement)
+    && !activeElement.disabled
+    && !activeElement.readOnly
+  )
+    ? activeElement
+    : null;
+
+  window.dispatchEvent(new Event(CLIPBOARD_HISTORY_CAPTURE_TARGET_EVENT));
+}
+
+function clearClipboardHistoryTarget() {
+  clipboardHistoryTextTarget = null;
+  window.dispatchEvent(new Event(CLIPBOARD_HISTORY_CLEAR_TARGET_EVENT));
+}
+
+function formatClipboardHistoryCapturedAt(capturedAt: string) {
+  const parsedDate = new Date(capturedAt);
+
+  if (Number.isNaN(parsedDate.getTime())) {
+    return '';
+  }
+
+  return clipboardHistoryDateTimeFormatter.format(parsedDate);
+}
+
+async function openClipboardHistoryDialog() {
+  captureClipboardHistoryTarget();
+  clipboardHistoryQuery.value = '';
+  await refreshClipboardHistoryItems();
+  isClipboardHistoryOpen.value = true;
+  await nextTick();
+  clipboardHistorySearchInputRef.value?.focus({ preventScroll: true });
+}
+
+function closeClipboardHistoryDialog() {
+  isClipboardHistoryOpen.value = false;
+  clipboardHistoryQuery.value = '';
+  clipboardHistorySelectedIndex.value = 0;
+  clearClipboardHistoryTarget();
+}
+
+async function insertClipboardHistoryItem(text: string) {
+  const normalizedText = text.replace(/\r\n/g, '\n');
+
+  if (!normalizedText) {
+    closeClipboardHistoryDialog();
+    return;
+  }
+
+  let handled = false;
+
+  if (
+    clipboardHistoryTextTarget
+    && document.contains(clipboardHistoryTextTarget)
+    && !clipboardHistoryTextTarget.disabled
+    && !clipboardHistoryTextTarget.readOnly
+  ) {
+    insertTextIntoTarget(clipboardHistoryTextTarget, normalizedText);
+    handled = true;
+  } else {
+    const detail = {
+      handled: false,
+      text: normalizedText,
+    };
+
+    window.dispatchEvent(new CustomEvent(CLIPBOARD_HISTORY_INSERT_EVENT, { detail }));
+    handled = detail.handled;
+  }
+
+  closeClipboardHistoryDialog();
+
+  if (!handled) {
+    return;
+  }
+}
+
+function moveClipboardHistorySelection(direction: -1 | 1) {
+  const itemCount = filteredClipboardHistoryItems.value.length;
+
+  if (itemCount < 1) {
+    clipboardHistorySelectedIndex.value = 0;
+    return;
+  }
+
+  clipboardHistorySelectedIndex.value = (
+    clipboardHistorySelectedIndex.value + direction + itemCount
+  ) % itemCount;
+}
+
+function handleClipboardHistoryKeydown(event: KeyboardEvent) {
+  if (event.key === 'Escape') {
+    event.preventDefault();
+    closeClipboardHistoryDialog();
+    return;
+  }
+
+  if (event.key === 'ArrowDown') {
+    event.preventDefault();
+    moveClipboardHistorySelection(1);
+    return;
+  }
+
+  if (event.key === 'ArrowUp') {
+    event.preventDefault();
+    moveClipboardHistorySelection(-1);
+    return;
+  }
+
+  if (event.key !== 'Enter') {
+    return;
+  }
+
+  const selectedItem = selectedClipboardHistoryItem.value;
+
+  if (!selectedItem) {
+    return;
+  }
+
+  event.preventDefault();
+  void insertClipboardHistoryItem(selectedItem.text);
+}
+
+function handleClipboardHistoryUpdated(event: Event) {
+  const customEvent = event as CustomEvent<ClipboardHistoryUpdatedDetail>;
+  clipboardHistoryItems.value = cloneClipboardHistoryEntries(customEvent.detail.entries);
+
+  if (sessionReady.value) {
+    scheduleSessionSave();
+  }
+}
+
+function handleWindowFocus() {
+  void syncClipboardHistoryFromSystem().catch(() => {
+    // Ignore clipboard read failures triggered by the OS or temporary focus transitions.
+  });
+}
+
+function flushPendingEditorState() {
+  window.dispatchEvent(new CustomEvent('bridgegit:flush-editor-state'));
+}
+
+function clearPendingSessionSaveTimer() {
+  if (!persistTimer) {
+    return;
+  }
+
+  window.clearTimeout(persistTimer);
+  persistTimer = null;
+}
+
+function canPersistSession() {
+  return sessionReady.value && sessionPersistenceEnabled.value && !isSwitchingWorkspaceContext.value;
+}
+
+function persistCurrentSessionSync() {
+  if (!canPersistSession()) {
+    return session.value;
+  }
+
+  flushPendingEditorState();
+  clearPendingSessionSaveTimer();
+  return saveSessionSync(buildIncrementalSessionSavePayload());
+}
+
+async function persistCurrentSession() {
+  if (!canPersistSession()) {
+    return session.value;
+  }
+
+  clearPendingSessionSaveTimer();
+  return saveSession(buildIncrementalSessionSavePayload());
+}
+
+function handleWindowBeforeUnload() {
+  if (!sessionReady.value) {
+    return;
+  }
+
+  persistCurrentSessionSync();
+}
+
+function handleMainCloseRequested() {
+  if (sessionReady.value) {
+    persistCurrentSessionSync();
+  }
+
+  window.bridgegit?.session?.notifyCloseReady();
+}
+
+async function handleGlobalEditableContextMenu(event: MouseEvent) {
+  const target = event.target;
+
+  if (!isTextPasteTarget(target) || target.disabled || target.readOnly) {
+    return;
+  }
+
+  event.preventDefault();
+  event.stopPropagation();
+  await insertClipboardTextIntoTarget(target);
+}
+
+async function handleGlobalEditablePaste(event: ClipboardEvent) {
+  const target = event.target;
+
+  if (!isTextPasteTarget(target) || target.disabled || target.readOnly) {
+    return;
+  }
+
+  event.preventDefault();
+  event.stopPropagation();
+  await insertClipboardTextIntoTarget(target, {
+    eventText: event.clipboardData?.getData('text/plain') ?? '',
+  });
 }
 
 function getSidebarResizeBounds() {
@@ -1763,7 +2093,7 @@ function stopResize() {
 }
 
 function scheduleSessionSave() {
-  if (!sessionReady.value || isSwitchingWorkspaceContext.value) {
+  if (!canPersistSession()) {
     return;
   }
 
@@ -1772,7 +2102,8 @@ function scheduleSessionSave() {
   }
 
   persistTimer = window.setTimeout(() => {
-    void saveSession(buildSessionSavePayload());
+    persistTimer = null;
+    void persistCurrentSession();
   }, 180);
 }
 
@@ -2636,7 +2967,20 @@ async function handleUpdateHistoryCommitMessage(payload: { commitHash: string; m
 }
 
 function handleGlobalKeydown(event: KeyboardEvent) {
+  const isReplaceInFilesShortcut = matchesShortcut(event, SHORTCUTS.workspaceReplaceInFiles);
+  const isClipboardHistoryShortcut = matchesShortcut(event, SHORTCUTS.clipboardHistoryOpen);
+
+  if (isReplaceInFilesShortcut || isClipboardHistoryShortcut) {
+    event.preventDefault();
+  }
+
   if (event.key === 'Escape') {
+    if (isClipboardHistoryOpen.value) {
+      event.preventDefault();
+      closeClipboardHistoryDialog();
+      return;
+    }
+
     if (isCommitHistoryOpen.value) {
       event.preventDefault();
       isCommitHistoryOpen.value = false;
@@ -2661,6 +3005,10 @@ function handleGlobalKeydown(event: KeyboardEvent) {
   }
 
   if (isDockerDialogOpen.value) {
+    return;
+  }
+
+  if (isClipboardHistoryOpen.value) {
     return;
   }
 
@@ -2766,7 +3114,7 @@ function handleGlobalKeydown(event: KeyboardEvent) {
   }
 
   if (
-    matchesShortcut(event, SHORTCUTS.workspaceReplaceInFiles)
+    isReplaceInFilesShortcut
     && sessionReady.value
     && !isSettingsOpen.value
     && !isCommitHistoryOpen.value
@@ -2779,6 +3127,17 @@ function handleGlobalKeydown(event: KeyboardEvent) {
     }
 
     terminalPanelRef.value?.openFindInFilesDialogInMode('replace');
+    return;
+  }
+
+  if (
+    isClipboardHistoryShortcut
+    && sessionReady.value
+    && !isSettingsOpen.value
+    && !isCommitHistoryOpen.value
+  ) {
+    event.preventDefault();
+    void openClipboardHistoryDialog();
     return;
   }
 
@@ -3210,6 +3569,10 @@ watch(repoPath, () => {
 });
 
 watch([recentRepos, workspaceOrder, appAppearance, editorTheme, workspaceIndicatorVisibility, workspaceTabDefaults, soundNotificationsEnabled, terminalCommandPresets, dockerDialogState, workspaceTabs, workspaceEditorPaneLayout, workspaceMultiDisplayTabIds, activeWorkspaceTabId, workspaceRepoPanelStates], () => {
+  if (canPersistSession()) {
+    captureWorkspaceSession(getCurrentWorkspaceId());
+  }
+
   scheduleSessionSave();
 }, { deep: true });
 
@@ -3276,12 +3639,30 @@ watch([workspaceTabs, activeWorkspaceTabId], () => {
   markInfoNoteAsSeenWhenActive();
 }, { deep: true });
 
+watch(filteredClipboardHistoryItems, (items) => {
+  if (items.length < 1) {
+    clipboardHistorySelectedIndex.value = 0;
+    return;
+  }
+
+  if (clipboardHistorySelectedIndex.value >= items.length) {
+    clipboardHistorySelectedIndex.value = items.length - 1;
+  }
+});
+
 onMounted(async () => {
   window.addEventListener('keydown', handleGlobalKeydown, true);
+  window.addEventListener('focus', handleWindowFocus);
+  window.addEventListener('paste', handleGlobalEditablePaste, true);
   window.addEventListener('contextmenu', handleGlobalEditableContextMenu, true);
+  window.addEventListener(CLIPBOARD_HISTORY_UPDATED_EVENT, handleClipboardHistoryUpdated as EventListener);
+  window.addEventListener('beforeunload', handleWindowBeforeUnload);
+  removeCloseRequestedListener = window.bridgegit?.session?.onCloseRequested(handleMainCloseRequested) ?? null;
   applyAppTheme(appAppearance.value);
 
   let initialSession = await loadSession();
+  setClipboardHistoryEntries(initialSession.clipboardHistory, { emit: false });
+  clipboardHistoryItems.value = cloneClipboardHistoryEntries(getClipboardHistoryEntries());
 
   if (!hasWorkspaceTabs(initialSession.workspaceSessions)) {
     const onboardingCwd = initialSession.lastRepoPath
@@ -3327,6 +3708,7 @@ onMounted(async () => {
   dockerDialogState.value = cloneDockerDialogState(initialSession.dockerDialogState);
   workspaceSessions.value = cloneWorkspaceSessions(initialSession.workspaceSessions);
   seenInfoNoteRevisions.value = cloneSeenInfoNoteRevisions(initialSession.seenInfoNoteRevisions);
+  clipboardHistoryItems.value = cloneClipboardHistoryEntries(getClipboardHistoryEntries());
   sidebarWidth.value = initialSession.panelLayout.sidebarWidth;
   applyWorkspaceSession(initialSession.activeWorkspaceId ?? GLOBAL_WORKSPACE_ID);
   workspaceRecentActivityByTabId.value = {
@@ -3387,17 +3769,27 @@ onMounted(async () => {
   startInactiveWorkspaceGitSummaryPolling();
   scheduleInitialInactiveWorkspaceGitSummaryLoad();
   startWorktreeDetectionPolling();
+  await nextTick();
+  flushPendingEditorState();
+  await nextTick();
+  captureWorkspaceSession(initialSession.activeWorkspaceId ?? GLOBAL_WORKSPACE_ID);
+  sessionPersistenceEnabled.value = true;
 });
 
 onBeforeUnmount(() => {
   stopResize();
   dispose();
+  clearClipboardHistoryTarget();
   window.removeEventListener('keydown', handleGlobalKeydown, true);
+  window.removeEventListener('focus', handleWindowFocus);
+  window.removeEventListener('paste', handleGlobalEditablePaste, true);
   window.removeEventListener('contextmenu', handleGlobalEditableContextMenu, true);
+  window.removeEventListener(CLIPBOARD_HISTORY_UPDATED_EVENT, handleClipboardHistoryUpdated as EventListener);
+  window.removeEventListener('beforeunload', handleWindowBeforeUnload);
+  removeCloseRequestedListener?.();
+  removeCloseRequestedListener = null;
 
-  if (persistTimer) {
-    window.clearTimeout(persistTimer);
-  }
+  clearPendingSessionSaveTimer();
 
   if (projectTitleSaveToastTimer) {
     window.clearTimeout(projectTitleSaveToastTimer);
@@ -3566,10 +3958,10 @@ onBeforeUnmount(() => {
             :can-collapse="canCollapseTerminal"
             :collapse-shortcut-display="SHORTCUTS.panelTerminalToggle.display"
             :collapsed="terminalCollapsed"
-            @update:tabs="workspaceTabs = $event"
-            @update:editor-pane-layout="workspaceEditorPaneLayout = $event"
-            @update:multi-display-tab-ids="workspaceMultiDisplayTabIds = $event"
-            @update:active-tab-id="activeWorkspaceTabId = $event"
+            @update:tabs="handleWorkspaceTabsUpdate"
+            @update:editor-pane-layout="handleWorkspaceEditorPaneLayoutUpdate"
+            @update:multi-display-tab-ids="handleWorkspaceMultiDisplayTabIdsUpdate"
+            @update:active-tab-id="handleActiveWorkspaceTabIdUpdate"
             @update:recent-activity="handleWorkspaceRecentActivityUpdate($event.workspaceId, $event.recentActivity)"
           @update:attention="handleWorkspaceAttentionUpdate($event.workspaceId, $event.attention)"
           @reveal-in-all-files="handleRevealInAllFiles"
@@ -3673,6 +4065,86 @@ onBeforeUnmount(() => {
       @open-preview-target="handleOpenHistoryPreviewTarget"
       @close-preview-diff="clearHistoryPreviewDiffState"
     />
+
+    <div
+      v-if="isClipboardHistoryOpen"
+      class="app__dialog-backdrop"
+      role="presentation"
+      @click.self="closeClipboardHistoryDialog"
+    >
+      <section
+        class="app__clipboard-history"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="clipboard-history-title"
+      >
+        <header class="app__clipboard-history-header">
+          <div class="app__clipboard-history-heading">
+            <p class="app__clipboard-history-eyebrow">Clipboard</p>
+            <h2 id="clipboard-history-title" class="app__clipboard-history-title">Clipboard History</h2>
+            <p class="app__clipboard-history-meta">Recent unique entries from copy and selection.</p>
+          </div>
+
+          <button
+            class="app__clipboard-history-close"
+            type="button"
+            aria-label="Close clipboard history"
+            @click="closeClipboardHistoryDialog"
+          >
+            ×
+          </button>
+        </header>
+
+        <div class="app__clipboard-history-toolbar">
+          <label class="app__clipboard-history-search">
+            <span class="app__clipboard-history-search-label">
+              Search
+              <span class="app__clipboard-history-shortcut">{{ SHORTCUTS.clipboardHistoryOpen.display }}</span>
+            </span>
+            <input
+              ref="clipboardHistorySearchInputRef"
+              v-model="clipboardHistoryQuery"
+              class="app__clipboard-history-search-input"
+              type="search"
+              placeholder="Filter clipboard history"
+              @keydown="handleClipboardHistoryKeydown"
+            >
+          </label>
+        </div>
+
+        <div class="app__clipboard-history-body">
+          <ul v-if="filteredClipboardHistoryItems.length" class="app__clipboard-history-list">
+            <li
+              v-for="(item, index) in filteredClipboardHistoryItems"
+              :key="`${index}-${item.text.slice(0, 32)}-${item.capturedAt}`"
+              class="app__clipboard-history-item"
+              :class="{ 'app__clipboard-history-item--selected': index === clipboardHistorySelectedIndex }"
+            >
+              <button
+                class="app__clipboard-history-item-button"
+                type="button"
+                @mouseenter="clipboardHistorySelectedIndex = index"
+                @click="insertClipboardHistoryItem(item.text)"
+              >
+                <span class="app__clipboard-history-item-header">
+                  <span class="app__clipboard-history-item-labels">
+                    <span class="app__clipboard-history-item-index">#{{ index + 1 }}</span>
+                    <span v-if="index === 0" class="app__clipboard-history-item-badge">latest</span>
+                  </span>
+                  <span class="app__clipboard-history-item-time">{{ formatClipboardHistoryCapturedAt(item.capturedAt) }}</span>
+                </span>
+                <span class="app__clipboard-history-item-copy">{{ item.text }}</span>
+              </button>
+            </li>
+          </ul>
+
+          <div v-else class="app__clipboard-history-empty">
+            <p class="app__clipboard-history-empty-title">Clipboard history is empty</p>
+            <p class="app__clipboard-history-empty-copy">Copy or select some text first.</p>
+          </div>
+        </div>
+      </section>
+    </div>
 
     <transition name="app-toast">
       <div v-if="projectTitleSaveToast" class="app__toast">
@@ -3813,6 +4285,209 @@ onBeforeUnmount(() => {
   margin: 0;
   color: var(--text-muted);
   line-height: 1.5;
+}
+
+.app__dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 140;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(5, 8, 12, 0.56);
+  backdrop-filter: blur(10px);
+}
+
+.app__clipboard-history {
+  width: min(860px, calc(100vw - 48px));
+  height: min(760px, calc(100vh - 48px));
+  max-height: min(760px, calc(100vh - 48px));
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  border: 1px solid var(--border-strong);
+  border-radius: 18px;
+  background: var(--panel-bg);
+  box-shadow: var(--shadow-panel);
+  overflow: hidden;
+}
+
+.app__clipboard-history-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 20px 22px 14px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.app__clipboard-history-heading {
+  display: grid;
+  gap: 6px;
+}
+
+.app__clipboard-history-eyebrow {
+  margin: 0;
+  color: var(--text-dim);
+  font-size: 0.72rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.app__clipboard-history-title {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: 1.1rem;
+}
+
+.app__clipboard-history-meta {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 0.88rem;
+  line-height: 1.45;
+}
+
+.app__clipboard-history-close {
+  border: 1px solid var(--border-subtle);
+  border-radius: 10px;
+  background: var(--button-secondary-bg);
+  color: var(--text-primary);
+  font-size: 1.2rem;
+  line-height: 1;
+  width: 34px;
+  height: 34px;
+}
+
+.app__clipboard-history-toolbar {
+  padding: 14px 22px 18px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.app__clipboard-history-search {
+  display: grid;
+  gap: 8px;
+}
+
+.app__clipboard-history-search-label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--text-muted);
+  font-size: 0.82rem;
+}
+
+.app__clipboard-history-shortcut {
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--button-secondary-bg);
+  color: var(--text-dim);
+  font-size: 0.75rem;
+}
+
+.app__clipboard-history-search-input {
+  width: 100%;
+  border: 1px solid var(--border-strong);
+  border-radius: 12px;
+  background: var(--input-bg);
+  color: var(--text-primary);
+  padding: 11px 13px;
+  font: inherit;
+}
+
+.app__clipboard-history-body {
+  min-height: 0;
+  overflow: auto;
+}
+
+.app__clipboard-history-list {
+  list-style: none;
+  margin: 0;
+  padding: 10px;
+  display: grid;
+  gap: 8px;
+}
+
+.app__clipboard-history-item {
+  margin: 0;
+}
+
+.app__clipboard-history-item-button {
+  width: 100%;
+  display: grid;
+  gap: 10px;
+  text-align: left;
+  border: 1px solid var(--border-subtle);
+  border-radius: 14px;
+  background: transparent;
+  color: inherit;
+  padding: 12px 14px;
+}
+
+.app__clipboard-history-item--selected .app__clipboard-history-item-button,
+.app__clipboard-history-item-button:hover,
+.app__clipboard-history-item-button:focus-visible {
+  border-color: rgba(105, 178, 255, 0.42);
+  background: rgba(105, 178, 255, 0.1);
+}
+
+.app__clipboard-history-item-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.app__clipboard-history-item-labels {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.app__clipboard-history-item-index {
+  color: var(--text-dim);
+  font-size: 0.76rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.app__clipboard-history-item-badge {
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: rgba(105, 178, 255, 0.18);
+  color: var(--text-primary);
+  font-size: 0.72rem;
+}
+
+.app__clipboard-history-item-time {
+  color: var(--text-dim);
+  font-size: 0.75rem;
+  white-space: nowrap;
+}
+
+.app__clipboard-history-item-copy {
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 0.84rem;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.app__clipboard-history-empty {
+  display: grid;
+  gap: 8px;
+  justify-items: center;
+  padding: 36px 24px;
+  text-align: center;
+}
+
+.app__clipboard-history-empty-title,
+.app__clipboard-history-empty-copy {
+  margin: 0;
+}
+
+.app__clipboard-history-empty-copy {
+  color: var(--text-muted);
 }
 
 .app__toast {

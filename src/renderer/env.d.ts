@@ -44,6 +44,9 @@ declare global {
         electron: string;
         node: string;
       };
+      app: {
+        setTerminalFocusState: (focused: boolean) => void;
+      };
       dialog: {
         openRepo: (defaultPath?: string | null) => Promise<string | null>;
       };
@@ -66,6 +69,9 @@ declare global {
       session: {
         load: () => Promise<SessionData>;
         save: (session: Partial<SessionData>) => Promise<SessionData>;
+        saveSync: (session: Partial<SessionData>) => SessionData | null;
+        onCloseRequested: (callback: () => void) => () => void;
+        notifyCloseReady: () => void;
       };
       git: {
         isRepository: (repoPath: string) => Promise<boolean>;

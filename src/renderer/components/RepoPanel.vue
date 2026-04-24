@@ -281,7 +281,7 @@ const currentWorkspaceFamilyLabel = computed(() => (
 ));
 const visibleWorkspaceItems = computed(() => (
   isWorkspaceFamilyFocus.value && currentWorkspaceItem.value
-    ? [currentWorkspaceItem.value]
+    ? currentWorkspaceFamilyItems.value
     : props.workspaceItems
 ));
 const shouldShowWorkspaceFamilySwitcher = computed(() => (
@@ -2183,41 +2183,8 @@ function openWorkspaceMenuAtPosition(x: number, y: number, workspace: WorkspaceO
   };
 }
 
-function handleCurrentWorkspaceMenuButtonClick(event: MouseEvent) {
-  if (!currentWorkspaceItem.value) {
-    return;
-  }
-
-  const target = event.currentTarget as HTMLElement | null;
-  const bounds = target?.getBoundingClientRect();
-  openWorkspaceMenuAtPosition(bounds?.left ?? event.clientX, bounds?.bottom ?? event.clientY, currentWorkspaceItem.value);
-}
-
 function handleWorkspaceFamilyFocusToggle() {
   isWorkspaceFamilyFocus.value = !isWorkspaceFamilyFocus.value;
-}
-
-function compactWorkspaceLabel(workspace: WorkspaceOverviewItem) {
-  const branchLabel = workspace.branch ?? 'branch unknown';
-  const normalizedTitle = workspace.title.trim();
-  const familyTitle = currentWorkspaceItem.value ? workspaceFamilyLabel(currentWorkspaceItem.value) : '';
-
-  if (!normalizedTitle || normalizedTitle === workspace.repoName || normalizedTitle === familyTitle) {
-    return branchLabel;
-  }
-
-  return `${branchLabel} - ${normalizedTitle}`;
-}
-
-function handleWorkspaceFamilySelect(event: Event) {
-  const target = event.target as HTMLSelectElement | null;
-  const workspaceId = target?.value ?? '';
-
-  if (!workspaceId) {
-    return;
-  }
-
-  handleWorkspaceSelect(workspaceId);
 }
 
 function closeWorkspaceMenu() {
@@ -3037,34 +3004,6 @@ onBeforeUnmount(() => {
           <span class="repo-panel__workspace-family-name">{{ currentWorkspaceFamilyLabel }}</span>
           <span class="repo-panel__workspace-family-count">{{ currentWorkspaceFamilyItems.length }} repos</span>
         </div>
-
-        <div class="repo-panel__workspace-family-controls">
-          <select
-            class="repo-panel__workspace-family-select"
-            :value="currentWorkspaceItem?.workspaceId ?? ''"
-            @change="handleWorkspaceFamilySelect"
-          >
-            <option
-              v-for="workspace in currentWorkspaceFamilyItems"
-              :key="workspace.workspaceId"
-              :value="workspace.workspaceId"
-            >
-              {{ compactWorkspaceLabel(workspace) }}
-            </option>
-          </select>
-
-          <button
-            class="repo-panel__mini-action repo-panel__mini-action--icon"
-            type="button"
-            aria-label="Open current workspace menu"
-            title="Workspace actions"
-            @click="handleCurrentWorkspaceMenuButtonClick"
-          >
-            <svg viewBox="0 0 24 24" aria-hidden="true">
-              <path d="M12 6.75a1.25 1.25 0 1 0 0-2.5 1.25 1.25 0 0 0 0 2.5Zm0 6.5a1.25 1.25 0 1 0 0-2.5 1.25 1.25 0 0 0 0 2.5Zm0 6.5a1.25 1.25 0 1 0 0-2.5 1.25 1.25 0 0 0 0 2.5Z" />
-            </svg>
-          </button>
-        </div>
       </div>
 
       <div ref="workspaceListRef" class="repo-panel__workspace-list">
@@ -3097,9 +3036,6 @@ onBeforeUnmount(() => {
               </span>
             </span>
             <span class="repo-panel__workspace-subline">
-              <span class="repo-panel__workspace-branch">
-                {{ workspace.branch ?? 'branch unknown' }}
-              </span>
               <span class="repo-panel__workspace-dots" :title="workspacePanelsTitle(workspace)">
                 <span
                   v-if="workspaceIndicatorVisibility.repo"
@@ -4376,25 +4312,6 @@ onBeforeUnmount(() => {
   font-family: var(--font-mono);
   font-size: calc(0.72rem * var(--repo-panel-scale));
   white-space: nowrap;
-}
-
-.repo-panel__workspace-family-controls {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 8px;
-  align-items: center;
-}
-
-.repo-panel__workspace-family-select {
-  width: 100%;
-  min-width: 0;
-  padding: 0.58rem 0.72rem;
-  border: 1px solid var(--border-subtle);
-  border-radius: 10px;
-  background: var(--repo-panel-input-bg);
-  color: var(--text-primary);
-  font-family: var(--font-mono);
-  font-size: calc(0.76rem * var(--repo-panel-scale));
 }
 
 .repo-panel__workspace-list {

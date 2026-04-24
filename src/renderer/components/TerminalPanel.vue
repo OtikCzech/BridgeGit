@@ -24,6 +24,7 @@ import type {
   WorkspaceEditorPaneLayout,
   WorkspaceEditorPaneState,
   WorkspaceExternalFileChangeState,
+  WorkspaceEditorCursorState,
   WorkspaceNoteTabState,
   WorkspaceShellTabState,
   WorkspaceTabDefaults,
@@ -34,6 +35,7 @@ import {
   normalizeNoteFontSize,
   resolveWorkspaceFileTabType,
 } from '../../shared/bridgegit';
+import { useColumnSplitter } from '../composables/useColumnSplitter';
 import { SHORTCUTS, formatCommandSlotShortcut } from '../shortcuts';
 import { playNotificationBeep } from '../utils/notification-audio';
 import AppConfirmDialog from './AppConfirmDialog.vue';
@@ -258,6 +260,11 @@ const multiDisplayTabs = computed(() => {
 });
 const isMultiDisplayMode = computed(() => multiDisplayTabs.value.length === 2);
 const multiDisplayTabIdSet = computed(() => new Set(multiDisplayTabs.value.map((tab) => tab.id)));
+const multiDisplaySplit = useColumnSplitter({ storageKey: 'multi-display' });
+const multiDisplayStyle = computed(() => ({
+  gridTemplateColumns: multiDisplaySplit.gridTemplate.value,
+  gap: '0',
+}));
 const usesEditorPaneLayout = computed(() => (
   !isMultiDisplayMode.value
   && Boolean(activeWorkspaceTab.value && isPaneTab(activeWorkspaceTab.value))
@@ -278,15 +285,31 @@ const visibleEditorPanes = computed(() => {
     })
     .filter((entry): entry is { pane: WorkspaceEditorPaneState; tab: WorkspaceCodeTabState | WorkspaceNoteTabState } => Boolean(entry));
 });
-const editorPaneGridStyle = computed(() => {
-  const hasSecondColumn = visibleEditorPanes.value.some((entry) => entry.pane.col === 1);
-  const hasSecondRow = visibleEditorPanes.value.some((entry) => entry.pane.row === 1);
+const editorPanesHasSecondColumn = computed(() => (
+  visibleEditorPanes.value.some((entry) => entry.pane.col === 1)
+));
+const editorPanesHasSecondRow = computed(() => (
+  visibleEditorPanes.value.some((entry) => entry.pane.row === 1)
+));
+const editorPanesColumnSplit = useColumnSplitter({ storageKey: 'editor-panes-column', axis: 'x' });
+const editorPanesRowSplit = useColumnSplitter({ storageKey: 'editor-panes-row', axis: 'y' });
 
-  return {
-    gridTemplateColumns: hasSecondColumn ? 'minmax(0, 1fr) minmax(0, 1fr)' : 'minmax(0, 1fr)',
-    gridTemplateRows: hasSecondRow ? 'minmax(0, 1fr) minmax(0, 1fr)' : 'minmax(0, 1fr)',
-  };
-});
+const editorPaneGridStyle = computed(() => ({
+  gridTemplateColumns: editorPanesHasSecondColumn.value
+    ? editorPanesColumnSplit.gridTemplate.value
+    : 'minmax(0, 1fr)',
+  gridTemplateRows: editorPanesHasSecondRow.value
+    ? editorPanesRowSplit.gridTemplate.value
+    : 'minmax(0, 1fr)',
+  gap: '0',
+}));
+
+function editorPaneGridColumn(col: number): string {
+  return String(editorPanesHasSecondColumn.value ? 2 * col + 1 : col + 1);
+}
+function editorPaneGridRow(row: number): string {
+  return String(editorPanesHasSecondRow.value ? 2 * row + 1 : row + 1);
+}
 const collapseButtonTitle = computed(() => (
   props.canCollapse
     ? `Collapse tabs panel ${props.collapseShortcutDisplay}`
@@ -1419,6 +1442,7 @@ function buildNoteTab(): WorkspaceNoteTabState {
     content,
     savedContent: content,
     viewMode: 'split',
+    splitRatio: 0.5,
     fontSize: props.workspaceTabDefaults.noteFontSize,
   };
 }
@@ -1482,9 +1506,60 @@ function setTabRef(
   tabRefs.set(tabId, tabElement);
 }
 
-function setActiveTabDirect(tabId: string) {
-  activeTabId.value = tabId;
-  emit('update:active-tab-id', tabId);
+function activateTab(tabId: string) {
+  const targetTab = getTabById(tabId);
+
+  if (!targetTab) {
+    return;
+  }
+
+  const nextTabs = tabs.value;
+  const staysInMultiDisplay = multiDisplayTabIdSet.value.has(tabId);
+  const nextMultiDisplayTabIds = staysInMultiDisplay
+    ? multiDisplayTabIds.value
+    : [];
+  const willUseMultiDisplay = nextMultiDisplayTabIds.length === 2;
+
+  let nextLayout = editorPaneLayout.value;
+  let layoutChanged = false;
+
+  if (!willUseMultiDisplay && isPaneTab(targetTab)) {
+    const normalizedLayout = normalizeEditorPaneLayout(editorPaneLayout.value, nextTabs, tabId);
+    const activePane = getActiveEditorPane(normalizedLayout) ?? normalizedLayout.panes[0] ?? null;
+
+    if (activePane) {
+      const updatedPanes = normalizedLayout.panes.map((pane) => (
+        pane.id === activePane.id && pane.tabId !== tabId
+          ? { ...pane, tabId }
+          : pane
+      ));
+      nextLayout = {
+        panes: updatedPanes,
+        activePaneId: activePane.id,
+      };
+    } else {
+      nextLayout = normalizedLayout;
+    }
+
+    layoutChanged = nextLayout !== editorPaneLayout.value;
+  }
+
+  const multiDisplayChanged = nextMultiDisplayTabIds !== multiDisplayTabIds.value;
+  if (multiDisplayChanged) {
+    multiDisplayTabIds.value = nextMultiDisplayTabIds;
+    emit('update:multi-display-tab-ids', [...nextMultiDisplayTabIds]);
+  }
+
+  if (layoutChanged) {
+    editorPaneLayout.value = nextLayout;
+    emit('update:editor-pane-layout', cloneEditorPaneLayoutState(nextLayout));
+  }
+
+  if (activeTabId.value !== tabId) {
+    activeTabId.value = tabId;
+    emit('update:active-tab-id', tabId);
+  }
+
   clearTabActivity(tabId);
   clearTabAttention(tabId);
   tabMenu.value = null;
@@ -1494,28 +1569,12 @@ function setActiveTabDirect(tabId: string) {
   markShellTabAsStarted(tabId);
 }
 
-function setActiveTab(tabId: string) {
-  const targetTab = getTabById(tabId);
-
-  if (targetTab && isPaneTab(targetTab)) {
-    assignTabToActiveEditorPane(tabId);
-    clearTabActivity(tabId);
-    clearTabAttention(tabId);
-    tabMenu.value = null;
-    creationMenu.value = null;
-    commandMenuOpen.value = false;
-    return;
-  }
-
-  setActiveTabDirect(tabId);
-}
-
 function activateMultiDisplayTab(tabId: string) {
   if (!multiDisplayTabIdSet.value.has(tabId)) {
     return false;
   }
 
-  setActiveTabDirect(tabId);
+  activateTab(tabId);
   return true;
 }
 
@@ -1528,7 +1587,7 @@ function toggleMultiDisplayTab(tabId: string) {
 
   if (multiDisplayTabIdSet.value.has(tabId)) {
     updateMultiDisplayTabIds([]);
-    setActiveTabDirect(tabId);
+    activateTab(tabId);
     return true;
   }
 
@@ -1544,7 +1603,7 @@ function toggleMultiDisplayTab(tabId: string) {
     return false;
   }
 
-  setActiveTabDirect(tabId);
+  activateTab(tabId);
   return true;
 }
 
@@ -1610,22 +1669,12 @@ function handleTabClick(tabId: string, event?: MouseEvent) {
     return;
   }
 
-  if (isMultiDisplayMode.value) {
-    if (activateMultiDisplayTab(tabId)) {
-      return;
-    }
-
-    updateMultiDisplayTabIds([]);
-    setActiveTabDirect(tabId);
-    return;
-  }
-
-  setActiveTab(tabId);
+  activateTab(tabId);
 }
 
 function handleTerminalViewActivate(tabId: string) {
   if (multiDisplayTabIdSet.value.has(tabId)) {
-    setActiveTabDirect(tabId);
+    activateTab(tabId);
   }
 
   markShellTabAsStarted(tabId);
@@ -2244,7 +2293,41 @@ function activateExistingWorkspaceFileTab<T extends WorkspaceNoteTabState | Work
     }
   }
 
-  setActiveTab(tab.id);
+  activateTab(tab.id);
+  return tab;
+}
+
+function openNewWorkspacePaneTab<T extends WorkspaceNoteTabState | WorkspaceCodeTabState>(
+  tab: T,
+  targetTabId?: string | null,
+): T {
+  const nextTabs = [...tabs.value, tab];
+  const normalizedLayout = normalizeEditorPaneLayout(editorPaneLayout.value, nextTabs, tab.id);
+  const targetPane = targetTabId
+    ? findEditorPaneByTabId(targetTabId, normalizedLayout)
+    : null;
+  const activePane = targetPane ?? getActiveEditorPane(normalizedLayout);
+
+  if (!activePane) {
+    syncState(nextTabs, tab.id, normalizedLayout);
+    return tab;
+  }
+
+  syncState(
+    nextTabs,
+    tab.id,
+    {
+      panes: normalizedLayout.panes.map((pane) => (
+        pane.id === activePane.id
+          ? {
+              ...pane,
+              tabId: tab.id,
+            }
+          : pane
+      )),
+      activePaneId: activePane.id,
+    },
+  );
   return tab;
 }
 
@@ -2257,6 +2340,7 @@ function buildFileBackedNoteTab(filePath: string, content: string): WorkspaceNot
     content,
     savedContent: content,
     viewMode: 'split',
+    splitRatio: 0.5,
     fontSize: props.workspaceTabDefaults.noteFontSize,
   };
 }
@@ -2345,6 +2429,28 @@ function getActiveEditorPane(sourceLayout = editorPaneLayout.value) {
   return getEditorPaneById(sourceLayout.activePaneId, sourceLayout)
     ?? sourceLayout.panes[0]
     ?? null;
+}
+
+function syncEditorPaneLayoutWithActiveTab() {
+  const normalizedLayout = normalizeEditorPaneLayout(editorPaneLayout.value, tabs.value, activeTabId.value);
+  const activeTab = activeTabId.value ? getTabById(activeTabId.value) : null;
+
+  if (activeTab && isPaneTab(activeTab)) {
+    const activePane = getActiveEditorPane(normalizedLayout);
+
+    if (activePane && activePane.tabId !== activeTabId.value) {
+      editorPaneLayout.value = {
+        panes: normalizedLayout.panes.map((pane) => (
+          pane.id === activePane.id ? { ...pane, tabId: activeTabId.value } : pane
+        )),
+        activePaneId: activePane.id,
+      };
+      return true;
+    }
+  }
+
+  editorPaneLayout.value = normalizedLayout;
+  return false;
 }
 
 function setActiveEditorPane(paneId: string) {
@@ -2822,7 +2928,7 @@ function selectAdjacentTab(direction: -1 | 1) {
   const nextTabId = tabs.value[nextIndex]?.id ?? null;
 
   if (nextTabId) {
-    setActiveTab(nextTabId);
+    activateTab(nextTabId);
   }
 }
 
@@ -2835,7 +2941,10 @@ function addShellTab() {
 
 function addNoteTab() {
   const nextTab = buildNoteTab();
-  syncState([...tabs.value, nextTab], nextTab.id);
+  const activeTab = activeTabId.value ? getTabById(activeTabId.value) : null;
+  const targetTabId = activeTab && isPaneTab(activeTab) ? activeTab.id : null;
+
+  openNewWorkspacePaneTab(nextTab, targetTabId);
   creationMenu.value = null;
   return nextTab;
 }
@@ -2913,12 +3022,12 @@ function openResolvedWorkspaceFile(
         savedContent: openedFile.content,
       });
       seedTrackedFileState(targetTab.id, openedFile);
-      setActiveTab(targetTab.id);
+      activateTab(targetTab.id);
       return targetTab;
     }
 
     const nextNoteTab = buildFileBackedNoteTab(openedFile.path, openedFile.content);
-    syncState([...tabs.value, nextNoteTab], nextNoteTab.id);
+    openNewWorkspacePaneTab(nextNoteTab, targetTabId);
     seedTrackedFileState(nextNoteTab.id, openedFile);
     return nextNoteTab;
   }
@@ -2930,7 +3039,7 @@ function openResolvedWorkspaceFile(
   }
 
   const nextCodeTab = buildFileBackedCodeTab(openedFile.path, openedFile.content);
-  syncState([...tabs.value, nextCodeTab], nextCodeTab.id);
+  openNewWorkspacePaneTab(nextCodeTab, targetTabId);
   seedTrackedFileState(nextCodeTab.id, openedFile);
   return nextCodeTab;
 }
@@ -3000,8 +3109,8 @@ async function openWorkspaceFilePath(filePath: string, targetTabId?: string | nu
   }
 }
 
-async function openCodeNavigationTarget(target: CodeNavigationTarget) {
-  const openedTab = await openWorkspaceFilePath(target.filePath);
+async function openCodeNavigationTarget(target: CodeNavigationTarget, targetTabId?: string | null) {
+  const openedTab = await openWorkspaceFilePath(target.filePath, targetTabId);
 
   if (!openedTab) {
     return null;
@@ -3985,15 +4094,7 @@ function activateSelectedAllTabsItem() {
 }
 
 function activateAllTabsItem(tabId: string) {
-  if (isMultiDisplayMode.value) {
-    if (!activateMultiDisplayTab(tabId)) {
-      updateMultiDisplayTabIds([]);
-      setActiveTabDirect(tabId);
-    }
-  } else {
-    setActiveTab(tabId);
-  }
-
+  activateTab(tabId);
   closeAllTabsDialog();
 }
 
@@ -4401,12 +4502,24 @@ function updateNoteContent(tabId: string, content: string) {
   updateNoteTabState(tabId, { content });
 }
 
+function updateNoteCursor(tabId: string, cursor: WorkspaceEditorCursorState) {
+  updateNoteTabState(tabId, { cursor });
+}
+
 function updateCodeContent(tabId: string, content: string) {
   updateCodeTabState(tabId, { content });
 }
 
+function updateCodeCursor(tabId: string, cursor: WorkspaceEditorCursorState) {
+  updateCodeTabState(tabId, { cursor });
+}
+
 function updateNoteViewMode(tabId: string, viewMode: WorkspaceNoteTabState['viewMode']) {
   updateNoteTabState(tabId, { viewMode });
+}
+
+function updateNoteSplitRatio(tabId: string, splitRatio: number) {
+  updateNoteTabState(tabId, { splitRatio });
 }
 
 function updateNoteFontSize(tabId: string, fontSize: number) {
@@ -4845,7 +4958,7 @@ async function runPreset(preset: TerminalCommandPreset) {
     const nextTab = addShellTab();
     targetTabId = nextTab.id;
   } else {
-    setActiveTab(targetTabId);
+    activateTab(targetTabId);
   }
 
   if (!targetTabId) {
@@ -5180,7 +5293,9 @@ watch(
       emit('update:multi-display-tab-ids', []);
       multiDisplayTabIds.value = [];
     }
-    editorPaneLayout.value = normalizeEditorPaneLayout(editorPaneLayout.value, tabs.value, activeTabId.value);
+    if (syncEditorPaneLayoutWithActiveTab()) {
+      emit('update:editor-pane-layout', cloneEditorPaneLayoutState(editorPaneLayout.value));
+    }
 
     if (activeTabId.value) {
       markShellTabAsStarted(activeTabId.value);
@@ -5217,8 +5332,9 @@ watch(
 
 onMounted(async () => {
   tabs.value = cloneTabs(props.tabs);
-  editorPaneLayout.value = normalizeEditorPaneLayout(props.editorPaneLayout, props.tabs, props.activeTabId ?? props.tabs[0]?.id ?? null);
   activeTabId.value = props.activeTabId ?? props.tabs[0]?.id ?? null;
+  editorPaneLayout.value = normalizeEditorPaneLayout(props.editorPaneLayout, props.tabs, activeTabId.value);
+  syncEditorPaneLayoutWithActiveTab();
   multiDisplayTabIds.value = normalizeMultiDisplayTabIds(props.multiDisplayTabIds, props.tabs);
   if (activeTabId.value) {
     markShellTabAsStarted(activeTabId.value);
@@ -5485,10 +5601,14 @@ defineExpose({
           :project-root="props.projectRoot"
           :appearance-theme="props.appearanceTheme"
           :appearance-theme-variant="props.appearanceThemeVariant"
+          :editor-theme="props.editorTheme"
+          :theme-variant="props.editorThemeVariant"
           :is-dirty="tab.content !== tab.savedContent"
           :external-change="externalFileChangeByTabId[tab.id] ?? null"
           :view-mode="tab.viewMode"
+          :split-ratio="tab.splitRatio"
           :font-size="tab.fontSize"
+          :cursor="tab.cursor"
           @focus-previous-tab="selectAdjacentTab(-1)"
           @focus-next-tab="selectAdjacentTab(1)"
           @open-file="openWorkspaceFile(tab.id)"
@@ -5499,8 +5619,10 @@ defineExpose({
           @save-file-as="saveNoteFileAs(tab.id)"
           @dismiss-external-change="dismissExternalFileChange(tab.id)"
           @update:content="updateNoteContent(tab.id, $event)"
+          @update:cursor="updateNoteCursor(tab.id, $event)"
           @update:font-size="updateNoteFontSize(tab.id, $event)"
           @update:view-mode="updateNoteViewMode(tab.id, $event)"
+          @update:split-ratio="updateNoteSplitRatio(tab.id, $event)"
         />
 
         <CodeTabView
@@ -5519,27 +5641,40 @@ defineExpose({
           :is-dirty="tab.content !== tab.savedContent"
           :external-change="externalFileChangeByTabId[tab.id] ?? null"
           :font-size="tab.fontSize"
+          :cursor="tab.cursor"
           @focus-previous-tab="selectAdjacentTab(-1)"
           @focus-next-tab="selectAdjacentTab(1)"
           @open-file="openWorkspaceFile(tab.id)"
-          @open-navigation-target="openCodeNavigationTarget($event)"
+          @open-navigation-target="openCodeNavigationTarget($event, tab.id)"
           @reveal-in-all-files="revealWorkspaceFileInAllFiles(tab.filePath)"
           @reload-from-disk="reloadEditableTabFromDisk(tab.id)"
           @save-file="saveCodeFile(tab.id)"
           @save-file-as="saveCodeFileAs(tab.id)"
           @dismiss-external-change="dismissExternalFileChange(tab.id)"
           @update:content="updateCodeContent(tab.id, $event)"
+          @update:cursor="updateCodeCursor(tab.id, $event)"
           @update:font-size="updateCodeFontSize(tab.id, $event)"
         />
       </template>
 
       <div
         v-if="isMultiDisplayMode"
+        :ref="(el) => { multiDisplaySplit.containerRef.value = el as HTMLElement | null; }"
         class="terminal-panel__multi-display"
+        :style="multiDisplayStyle"
       >
+        <template v-for="(tab, index) in multiDisplayTabs" :key="`multi-display:${tab.id}`">
+          <div
+            v-if="index === 1"
+            class="terminal-panel__multi-display-divider"
+            :class="{ 'terminal-panel__multi-display-divider--active': multiDisplaySplit.isDragging.value }"
+            role="separator"
+            aria-orientation="vertical"
+            title="Drag to resize • Double-click to reset"
+            @pointerdown="multiDisplaySplit.startDrag"
+            @dblclick="multiDisplaySplit.reset"
+          />
         <section
-          v-for="tab in multiDisplayTabs"
-          :key="`multi-display:${tab.id}`"
           class="terminal-panel__multi-display-pane"
           :class="{ 'terminal-panel__multi-display-pane--active': tab.id === activeTabId }"
           @pointerdown.capture="activateMultiDisplayTab(tab.id)"
@@ -5577,10 +5712,14 @@ defineExpose({
             :project-root="props.projectRoot"
             :appearance-theme="props.appearanceTheme"
             :appearance-theme-variant="props.appearanceThemeVariant"
+            :editor-theme="props.editorTheme"
+            :theme-variant="props.editorThemeVariant"
             :is-dirty="tab.content !== tab.savedContent"
             :external-change="externalFileChangeByTabId[tab.id] ?? null"
             :view-mode="tab.viewMode"
+            :split-ratio="tab.splitRatio"
             :font-size="tab.fontSize"
+            :cursor="tab.cursor"
             @focus-previous-tab="selectAdjacentTab(-1)"
             @focus-next-tab="selectAdjacentTab(1)"
             @open-file="openWorkspaceFile(tab.id)"
@@ -5591,8 +5730,10 @@ defineExpose({
             @save-file-as="saveNoteFileAs(tab.id)"
             @dismiss-external-change="dismissExternalFileChange(tab.id)"
             @update:content="updateNoteContent(tab.id, $event)"
+            @update:cursor="updateNoteCursor(tab.id, $event)"
             @update:font-size="updateNoteFontSize(tab.id, $event)"
             @update:view-mode="updateNoteViewMode(tab.id, $event)"
+            @update:split-ratio="updateNoteSplitRatio(tab.id, $event)"
           />
 
           <CodeTabView
@@ -5610,34 +5751,63 @@ defineExpose({
             :is-dirty="tab.content !== tab.savedContent"
             :external-change="externalFileChangeByTabId[tab.id] ?? null"
             :font-size="tab.fontSize"
+            :cursor="tab.cursor"
             @focus-previous-tab="selectAdjacentTab(-1)"
             @focus-next-tab="selectAdjacentTab(1)"
             @open-file="openWorkspaceFile(tab.id)"
-            @open-navigation-target="openCodeNavigationTarget($event)"
+            @open-navigation-target="openCodeNavigationTarget($event, tab.id)"
             @reveal-in-all-files="revealWorkspaceFileInAllFiles(tab.filePath)"
             @reload-from-disk="reloadEditableTabFromDisk(tab.id)"
             @save-file="saveCodeFile(tab.id)"
             @save-file-as="saveCodeFileAs(tab.id)"
             @dismiss-external-change="dismissExternalFileChange(tab.id)"
             @update:content="updateCodeContent(tab.id, $event)"
+            @update:cursor="updateCodeCursor(tab.id, $event)"
             @update:font-size="updateCodeFontSize(tab.id, $event)"
           />
         </section>
+        </template>
       </div>
 
       <div
         v-else-if="usesEditorPaneLayout && visibleEditorPanes.length"
+        :ref="(el) => {
+          editorPanesColumnSplit.containerRef.value = el as HTMLElement | null;
+          editorPanesRowSplit.containerRef.value = el as HTMLElement | null;
+        }"
         class="terminal-panel__editor-panes"
         :style="editorPaneGridStyle"
       >
+        <div
+          v-if="editorPanesHasSecondColumn"
+          class="terminal-panel__editor-panes-divider terminal-panel__editor-panes-divider--column"
+          :class="{ 'terminal-panel__editor-panes-divider--active': editorPanesColumnSplit.isDragging.value }"
+          :style="{ gridColumn: '2', gridRow: '1 / -1' }"
+          role="separator"
+          aria-orientation="vertical"
+          title="Drag to resize • Double-click to reset"
+          @pointerdown="editorPanesColumnSplit.startDrag"
+          @dblclick="editorPanesColumnSplit.reset"
+        />
+        <div
+          v-if="editorPanesHasSecondRow"
+          class="terminal-panel__editor-panes-divider terminal-panel__editor-panes-divider--row"
+          :class="{ 'terminal-panel__editor-panes-divider--active': editorPanesRowSplit.isDragging.value }"
+          :style="{ gridRow: '2', gridColumn: '1 / -1' }"
+          role="separator"
+          aria-orientation="horizontal"
+          title="Drag to resize • Double-click to reset"
+          @pointerdown="editorPanesRowSplit.startDrag"
+          @dblclick="editorPanesRowSplit.reset"
+        />
         <section
           v-for="entry in visibleEditorPanes"
           :key="`${entry.pane.id}:${entry.tab.id}`"
           class="terminal-panel__editor-pane"
           :class="{ 'terminal-panel__editor-pane--active': entry.pane.id === editorPaneLayout.activePaneId }"
           :style="{
-            gridColumn: String(entry.pane.col + 1),
-            gridRow: String(entry.pane.row + 1),
+            gridColumn: editorPaneGridColumn(entry.pane.col),
+            gridRow: editorPaneGridRow(entry.pane.row),
           }"
           @pointerdown="setActiveEditorPane(entry.pane.id)"
         >
@@ -5707,10 +5877,14 @@ defineExpose({
             :project-root="props.projectRoot"
             :appearance-theme="props.appearanceTheme"
             :appearance-theme-variant="props.appearanceThemeVariant"
+            :editor-theme="props.editorTheme"
+            :theme-variant="props.editorThemeVariant"
             :is-dirty="entry.tab.content !== entry.tab.savedContent"
             :external-change="externalFileChangeByTabId[entry.tab.id] ?? null"
             :view-mode="entry.tab.viewMode"
+            :split-ratio="entry.tab.splitRatio"
             :font-size="entry.tab.fontSize"
+            :cursor="entry.tab.cursor"
             @focus-previous-tab="selectAdjacentTab(-1)"
             @focus-next-tab="selectAdjacentTab(1)"
             @open-file="openWorkspaceFile(entry.tab.id)"
@@ -5721,8 +5895,10 @@ defineExpose({
             @save-file-as="saveNoteFileAs(entry.tab.id)"
             @dismiss-external-change="dismissExternalFileChange(entry.tab.id)"
             @update:content="updateNoteContent(entry.tab.id, $event)"
+            @update:cursor="updateNoteCursor(entry.tab.id, $event)"
             @update:font-size="updateNoteFontSize(entry.tab.id, $event)"
             @update:view-mode="updateNoteViewMode(entry.tab.id, $event)"
+            @update:split-ratio="updateNoteSplitRatio(entry.tab.id, $event)"
           />
 
           <CodeTabView
@@ -5740,16 +5916,18 @@ defineExpose({
             :is-dirty="entry.tab.content !== entry.tab.savedContent"
             :external-change="externalFileChangeByTabId[entry.tab.id] ?? null"
             :font-size="entry.tab.fontSize"
+            :cursor="entry.tab.cursor"
             @focus-previous-tab="selectAdjacentTab(-1)"
             @focus-next-tab="selectAdjacentTab(1)"
             @open-file="openWorkspaceFile(entry.tab.id)"
-            @open-navigation-target="openCodeNavigationTarget($event)"
+            @open-navigation-target="openCodeNavigationTarget($event, entry.tab.id)"
             @reveal-in-all-files="revealWorkspaceFileInAllFiles(entry.tab.filePath)"
             @reload-from-disk="reloadEditableTabFromDisk(entry.tab.id)"
             @save-file="saveCodeFile(entry.tab.id)"
             @save-file-as="saveCodeFileAs(entry.tab.id)"
             @dismiss-external-change="dismissExternalFileChange(entry.tab.id)"
             @update:content="updateCodeContent(entry.tab.id, $event)"
+            @update:cursor="updateCodeCursor(entry.tab.id, $event)"
             @update:font-size="updateCodeFontSize(entry.tab.id, $event)"
           />
         </section>
@@ -6820,6 +6998,34 @@ defineExpose({
   box-shadow: inset 0 0 0 1px rgba(110, 197, 255, 0.12);
 }
 
+.terminal-panel__multi-display-divider {
+  align-self: stretch;
+  cursor: col-resize;
+  background: transparent;
+  position: relative;
+  touch-action: none;
+}
+
+.terminal-panel__multi-display-divider::before {
+  content: '';
+  position: absolute;
+  inset: 6px 3px;
+  border-radius: 2px;
+  background: var(--border-subtle, rgba(108, 124, 148, 0.32));
+  opacity: 0.55;
+  transition: opacity 120ms ease, background 120ms ease;
+}
+
+.terminal-panel__multi-display-divider:hover::before {
+  opacity: 0.92;
+  background: rgba(110, 197, 255, 0.5);
+}
+
+.terminal-panel__multi-display-divider--active::before {
+  opacity: 1;
+  background: rgba(110, 197, 255, 0.78);
+}
+
 .terminal-panel__multi-display-view {
   width: 100%;
   height: 100%;
@@ -6848,6 +7054,47 @@ defineExpose({
 .terminal-panel__editor-pane--active {
   border-color: rgba(110, 197, 255, 0.34);
   box-shadow: inset 0 0 0 1px rgba(110, 197, 255, 0.12);
+}
+
+.terminal-panel__editor-panes-divider {
+  background: transparent;
+  position: relative;
+  touch-action: none;
+}
+
+.terminal-panel__editor-panes-divider--column {
+  cursor: col-resize;
+}
+
+.terminal-panel__editor-panes-divider--row {
+  cursor: row-resize;
+}
+
+.terminal-panel__editor-panes-divider::before {
+  content: '';
+  position: absolute;
+  border-radius: 2px;
+  background: var(--border-subtle, rgba(108, 124, 148, 0.32));
+  opacity: 0.55;
+  transition: opacity 120ms ease, background 120ms ease;
+}
+
+.terminal-panel__editor-panes-divider--column::before {
+  inset: 6px 3px;
+}
+
+.terminal-panel__editor-panes-divider--row::before {
+  inset: 3px 6px;
+}
+
+.terminal-panel__editor-panes-divider:hover::before {
+  opacity: 0.92;
+  background: rgba(110, 197, 255, 0.5);
+}
+
+.terminal-panel__editor-panes-divider--active::before {
+  opacity: 1;
+  background: rgba(110, 197, 255, 0.78);
 }
 
 .terminal-panel__editor-pane-header {

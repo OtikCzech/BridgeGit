@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.7.0 - 2026-04-24
+
+Workspace follow-up release focused on a stronger notes editor, smarter clipboard flow and calmer multi-repo behavior.
+
+- Replaced the notes textarea with a CodeMirror 6 editor, aligned its theming with code tabs and added a persisted line-numbers toggle
+- Added persistent clipboard history with smarter paste behavior for shell and editor flows
+- Hardened workspace and session restore, including tab persistence, active-pane recovery and synchronous save on app close
+- Added resizable split dividers across note split, multi-display and editor pane layouts
+- Polished repo-family focus and keyboard handling, including safer global refresh blocking while keeping terminal history search intact
+
 ## v0.6.0 - 2026-04-17
 
 Workspace expansion release focused on comparing more context at once and bringing Docker runtime control directly into the app.

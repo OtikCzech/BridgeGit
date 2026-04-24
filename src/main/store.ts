@@ -1,8 +1,10 @@
 import {
+  CLIPBOARD_HISTORY_LIMIT,
   DEFAULT_SESSION_DATA,
   DEFAULT_PANEL_LAYOUT,
   GLOBAL_WORKSPACE_ID,
   GLOBAL_WORKSPACE_SESSION_KEY,
+  type ClipboardHistoryEntry,
   getDefaultTerminalCommandPresets,
   normalizeAppAppearance,
   normalizeEditorTheme,
@@ -61,6 +63,11 @@ interface PartialWorkspaceShellTabState {
   launcherProfileId?: string | null;
 }
 
+interface PartialWorkspaceEditorCursorState {
+  anchor?: number;
+  head?: number;
+}
+
 interface PartialWorkspaceNoteTabState {
   id?: string;
   type?: 'note';
@@ -69,7 +76,9 @@ interface PartialWorkspaceNoteTabState {
   content?: string;
   savedContent?: string;
   viewMode?: 'source' | 'split' | 'preview';
+  splitRatio?: number;
   fontSize?: number;
+  cursor?: PartialWorkspaceEditorCursorState;
 }
 
 interface PartialWorkspaceCodeTabState {
@@ -80,6 +89,7 @@ interface PartialWorkspaceCodeTabState {
   content?: string;
   savedContent?: string;
   fontSize?: number;
+  cursor?: PartialWorkspaceEditorCursorState;
 }
 
 interface PartialWorkspaceSearchTabState {
@@ -166,6 +176,7 @@ interface SessionStore {
 }
 
 let storePromise: Promise<SessionStore> | null = null;
+let storeInstance: SessionStore | null = null;
 
 function getRepoName(repoPath: string): string {
   const parts = repoPath.split(/[\\/]/).filter(Boolean);
@@ -495,6 +506,7 @@ function normalizeWorkspaceTabs(
       const filePath = normalizeStoredPath(tab.filePath);
       const content = tab.content ?? '';
       const savedContent = tab.savedContent ?? content;
+      const noteCursor = normalizeEditorCursor(tab.cursor);
 
       normalizedTabs.push({
         id,
@@ -504,7 +516,9 @@ function normalizeWorkspaceTabs(
         content,
         savedContent,
         viewMode: normalizeNoteTabViewMode(tab.viewMode),
+        splitRatio: normalizeNoteSplitRatio(tab.splitRatio),
         fontSize: normalizeNoteFontSize(tab.fontSize ?? workspaceTabDefaults.noteFontSize),
+        ...(noteCursor ? { cursor: noteCursor } : {}),
       });
       continue;
     }
@@ -518,6 +532,7 @@ function normalizeWorkspaceTabs(
 
       const content = tab.content ?? '';
       const savedContent = tab.savedContent ?? content;
+      const codeCursor = normalizeEditorCursor(tab.cursor);
 
       normalizedTabs.push({
         id,
@@ -527,6 +542,7 @@ function normalizeWorkspaceTabs(
         content,
         savedContent,
         fontSize: normalizeNoteFontSize(tab.fontSize ?? workspaceTabDefaults.noteFontSize),
+        ...(codeCursor ? { cursor: codeCursor } : {}),
       });
       continue;
     }
@@ -722,6 +738,34 @@ function normalizeNoteTabViewMode(mode: 'source' | 'split' | 'preview' | undefin
   }
 
   return 'split';
+}
+
+function normalizeNoteSplitRatio(splitRatio: number | undefined): number {
+  if (typeof splitRatio !== 'number' || !Number.isFinite(splitRatio)) {
+    return 0.5;
+  }
+
+  return Math.min(0.85, Math.max(0.15, splitRatio));
+}
+
+function normalizeEditorCursor(
+  cursor: PartialWorkspaceEditorCursorState | undefined,
+): { anchor: number; head: number } | undefined {
+  if (!cursor || typeof cursor !== 'object') {
+    return undefined;
+  }
+
+  const anchor = cursor.anchor;
+  const head = cursor.head;
+
+  if (!Number.isFinite(anchor) || !Number.isFinite(head)) {
+    return undefined;
+  }
+
+  return {
+    anchor: Math.max(0, Math.floor(anchor as number)),
+    head: Math.max(0, Math.floor(head as number)),
+  };
 }
 
 function normalizeShortcutSlot(slot: number | null | undefined): number | null {
@@ -1022,7 +1066,45 @@ function normalizeDockerDialogState(
   };
 }
 
+function normalizeClipboardHistoryEntries(
+  clipboardHistory: Array<string | Partial<ClipboardHistoryEntry>> | undefined,
+): ClipboardHistoryEntry[] {
+  const normalizedEntries: ClipboardHistoryEntry[] = [];
+  const seenTexts = new Set<string>();
+
+  for (const entry of clipboardHistory ?? []) {
+    const rawText = typeof entry === 'string' ? entry : entry?.text;
+    const normalizedText = typeof rawText === 'string'
+      ? rawText.replace(/\r\n/g, '\n')
+      : '';
+
+    if (!normalizedText || seenTexts.has(normalizedText)) {
+      continue;
+    }
+
+    const rawCapturedAt = typeof entry === 'string' ? null : entry?.capturedAt;
+    const normalizedCapturedAt = typeof rawCapturedAt === 'string' && !Number.isNaN(Date.parse(rawCapturedAt))
+      ? rawCapturedAt
+      : new Date(0).toISOString();
+
+    normalizedEntries.push({
+      text: normalizedText,
+      capturedAt: normalizedCapturedAt,
+    });
+    seenTexts.add(normalizedText);
+
+    if (normalizedEntries.length >= CLIPBOARD_HISTORY_LIMIT) {
+      break;
+    }
+  }
+
+  return normalizedEntries;
+}
+
 function normalizeSession(session: LegacySessionData): SessionData {
+  const persistenceRevision = typeof session.persistenceRevision === 'number' && Number.isFinite(session.persistenceRevision)
+    ? Math.max(0, Math.floor(session.persistenceRevision))
+    : DEFAULT_SESSION_DATA.persistenceRevision;
   const lastRepoPath = normalizeStoredPath(session.lastRepoPath ?? DEFAULT_SESSION_DATA.lastRepoPath);
   const fallbackCwd = normalizeTerminalCwd(session.terminalCwd, lastRepoPath);
   const recentRepos = normalizeRecentRepos(
@@ -1089,6 +1171,7 @@ function normalizeSession(session: LegacySessionData): SessionData {
   };
 
   return {
+    persistenceRevision,
     lastRepoPath,
     activeWorkspaceId,
     recentRepos,
@@ -1113,6 +1196,9 @@ function normalizeSession(session: LegacySessionData): SessionData {
       session.seenInfoNoteRevisions,
       session.infoNoteLastSeenRevision,
     ),
+    clipboardHistory: normalizeClipboardHistoryEntries(
+      session.clipboardHistory as Array<string | Partial<ClipboardHistoryEntry>> | undefined,
+    ),
     terminalCommandPresets,
     dockerDialogState: normalizeDockerDialogState(session.dockerDialogState),
     workspaceSessions,
@@ -1134,11 +1220,22 @@ async function createStore(): Promise<SessionStore> {
 }
 
 async function getStore(): Promise<SessionStore> {
+  if (storeInstance) {
+    return storeInstance;
+  }
+
   if (!storePromise) {
-    storePromise = createStore();
+    storePromise = createStore().then((store) => {
+      storeInstance = store;
+      return store;
+    });
   }
 
   return storePromise;
+}
+
+export function getStoreSync(): SessionStore | null {
+  return storeInstance;
 }
 
 export async function loadSession(): Promise<SessionData> {
@@ -1148,11 +1245,25 @@ export async function loadSession(): Promise<SessionData> {
   return normalizedSession;
 }
 
-export async function saveSession(session: Partial<SessionData>): Promise<SessionData> {
-  const store = await getStore();
+function persistSession(store: SessionStore, session: Partial<SessionData>): SessionData {
+  const currentRevision = typeof store.get('persistenceRevision') === 'number'
+    ? Math.max(0, Math.floor(store.get('persistenceRevision') as number))
+    : DEFAULT_SESSION_DATA.persistenceRevision;
+  const incomingRevision = typeof session.persistenceRevision === 'number' && Number.isFinite(session.persistenceRevision)
+    ? Math.max(0, Math.floor(session.persistenceRevision))
+    : currentRevision;
+
+  if (incomingRevision < currentRevision) {
+    return normalizeSession(store.store as LegacySessionData);
+  }
+
   const nextSession = normalizeSession({
     ...(store.store as LegacySessionData),
     ...session,
+    workspaceSessions: {
+      ...((store.get('workspaceSessions') ?? {}) as Record<string, PartialWorkspaceSessionState>),
+      ...(session.workspaceSessions as Record<string, PartialWorkspaceSessionState> | undefined),
+    },
     panelLayout: normalizePanelLayout({
       ...(store.get('panelLayout') ?? {}),
       ...session.panelLayout,
@@ -1170,4 +1281,20 @@ export async function saveSession(session: Partial<SessionData>): Promise<Sessio
   store.set(nextSession);
 
   return nextSession;
+}
+
+export async function saveSession(session: Partial<SessionData>): Promise<SessionData> {
+  const store = await getStore();
+  return persistSession(store, session);
+}
+
+export function saveSessionSync(session: Partial<SessionData>): SessionData | null {
+  const store = getStoreSync();
+
+  if (!store) {
+    console.error('[bridgegit] saveSessionSync called before store initialized');
+    return null;
+  }
+
+  return persistSession(store, session);
 }

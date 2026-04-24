@@ -344,6 +344,11 @@ export interface WorkspaceShellTabState {
   launcherProfileId?: string | null;
 }
 
+export interface WorkspaceEditorCursorState {
+  anchor: number;
+  head: number;
+}
+
 export interface WorkspaceNoteTabState {
   id: string;
   type: 'note';
@@ -352,7 +357,9 @@ export interface WorkspaceNoteTabState {
   content: string;
   savedContent: string;
   viewMode: 'source' | 'split' | 'preview';
+  splitRatio: number;
   fontSize: number;
+  cursor?: WorkspaceEditorCursorState;
 }
 
 export interface WorkspaceCodeTabState {
@@ -363,6 +370,7 @@ export interface WorkspaceCodeTabState {
   content: string;
   savedContent: string;
   fontSize: number;
+  cursor?: WorkspaceEditorCursorState;
 }
 
 export interface WorkspaceEditorPaneState {
@@ -632,6 +640,7 @@ export interface TerminalCommandPreset {
 export type ProjectTitleMode = 'auto' | 'custom';
 
 export interface SessionData {
+  persistenceRevision: number;
   lastRepoPath: string | null;
   activeWorkspaceId: string | null;
   recentRepos: RecentRepoEntry[];
@@ -653,10 +662,18 @@ export interface SessionData {
   dismissedWorktreePaths: string[];
   soundNotificationsEnabled: boolean;
   seenInfoNoteRevisions: string[];
+  clipboardHistory: ClipboardHistoryEntry[];
   terminalCommandPresets: TerminalCommandPreset[];
   dockerDialogState: DockerDialogState;
   workspaceSessions: WorkspaceSessionsById;
 }
+
+export interface ClipboardHistoryEntry {
+  text: string;
+  capturedAt: string;
+}
+
+export const CLIPBOARD_HISTORY_LIMIT = 30;
 
 export interface ProjectSettingsFormData {
   projectTitle: string;
@@ -688,6 +705,10 @@ export function cloneDismissedWorktreePaths(dismissedWorktreePaths: string[]): s
 
 export function cloneSeenInfoNoteRevisions(seenInfoNoteRevisions: string[]): string[] {
   return [...seenInfoNoteRevisions];
+}
+
+export function cloneClipboardHistoryEntries(clipboardHistory: ClipboardHistoryEntry[]): ClipboardHistoryEntry[] {
+  return clipboardHistory.map((entry) => ({ ...entry }));
 }
 
 export function cloneDockerDialogState(dockerDialogState: DockerDialogState): DockerDialogState {
@@ -935,6 +956,7 @@ export const DEFAULT_PANEL_LAYOUT: PanelLayout = {
 };
 
 export const DEFAULT_SESSION_DATA: SessionData = {
+  persistenceRevision: 0,
   lastRepoPath: null,
   activeWorkspaceId: GLOBAL_WORKSPACE_ID,
   recentRepos: [],
@@ -971,6 +993,7 @@ export const DEFAULT_SESSION_DATA: SessionData = {
   dismissedWorktreePaths: [],
   soundNotificationsEnabled: true,
   seenInfoNoteRevisions: [],
+  clipboardHistory: [],
   terminalCommandPresets: getDefaultTerminalCommandPresets(),
   dockerDialogState: {
     activeView: 'containers',

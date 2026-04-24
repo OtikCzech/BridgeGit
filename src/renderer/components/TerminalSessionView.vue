@@ -11,6 +11,12 @@ import {
   type TerminalCommandPreset,
   type ThemeVariant,
 } from '../../shared/bridgegit';
+import {
+  readClipboardText as readSharedClipboardText,
+  rememberClipboardText,
+  writeClipboardText as writeSharedClipboardText,
+} from '../clipboard';
+import { useClipboardHistoryTarget } from '../composables/useClipboardHistoryTarget';
 import CopyableErrorNotice from './CopyableErrorNotice.vue';
 import { SHORTCUTS, matchesCommandSlotShortcut, matchesShortcut } from '../shortcuts';
 import { useTerminal } from '../composables/useTerminal';
@@ -71,6 +77,8 @@ let terminalFileLinkProviderDisposable: { dispose(): void } | null = null;
 let copySelectionTimer: number | null = null;
 let toastTimer: number | null = null;
 let lastCopiedSelection: string | null = null;
+let selectionPointerActive = false;
+let selectionCopyPendingAfterPointer = false;
 let copyInterruptGuardActive = false;
 let suppressActivityUntilInput = true;
 let plainTextBuffer = '';
@@ -676,32 +684,14 @@ function showToast(message: string) {
 }
 
 async function writeClipboard(text: string) {
-  try {
-    if (window.bridgegit?.clipboard) {
-      await Promise.resolve(window.bridgegit.clipboard.writeText(text));
-      return;
-    }
-  } catch {
-    // Fall back to the browser clipboard API when the Electron bridge is unavailable.
-  }
-
-  await navigator.clipboard.writeText(text);
+  await writeSharedClipboardText(text);
 }
 
-async function readClipboardText() {
-  try {
-    if (window.bridgegit?.clipboard) {
-      return await Promise.resolve(window.bridgegit.clipboard.readText());
-    }
-  } catch {
-    // Fall back to the browser clipboard API when the Electron bridge is unavailable.
-  }
-
-  return navigator.clipboard.readText();
-}
-
-async function pasteTextFromClipboard(text?: string) {
-  const resolvedText = (text ?? await readClipboardText()).replace(/\r\n/g, '\n');
+async function pasteTextFromClipboard(eventText?: string | null) {
+  const resolvedText = await readSharedClipboardText({
+    eventText,
+    preferPreviousDistinctOf: normalizeCopiedTerminalSelection(terminal?.getSelection() ?? ''),
+  });
 
   if (!resolvedText) {
     return;
@@ -711,7 +701,16 @@ async function pasteTextFromClipboard(text?: string) {
   terminal?.focus();
 }
 
+function normalizeCopiedTerminalSelection(value: string) {
+  return value.replace(/[ \t]+(?=\r?\n|$)/g, '');
+}
+
 function scheduleSelectionCopy() {
+  if (selectionPointerActive) {
+    selectionCopyPendingAfterPointer = true;
+    return;
+  }
+
   if (!terminal) {
     return;
   }
@@ -732,7 +731,7 @@ function scheduleSelectionCopy() {
   }
 
   copySelectionTimer = window.setTimeout(async () => {
-    const selection = terminal?.getSelection() ?? '';
+    const selection = normalizeCopiedTerminalSelection(terminal?.getSelection() ?? '');
 
     if (!selection || selection === lastCopiedSelection) {
       return;
@@ -747,6 +746,32 @@ function scheduleSelectionCopy() {
     }
   }, 90);
 }
+
+function handleTerminalCopy(event: ClipboardEvent) {
+  const selection = normalizeCopiedTerminalSelection(terminal?.getSelection() ?? '');
+
+  if (!selection || !event.clipboardData) {
+    return;
+  }
+
+  event.preventDefault();
+  event.clipboardData.setData('text/plain', selection);
+  rememberClipboardText(selection);
+  lastCopiedSelection = selection;
+  showToast('Copied');
+}
+
+useClipboardHistoryTarget({
+  isTargetActive: () => props.active && Boolean(terminal),
+  insertText: (text) => {
+    if (!text) {
+      return;
+    }
+
+    sendInput(text.replace(/\r\n/g, '\n'));
+    terminal?.focus();
+  },
+});
 
 function handleWheelZoom(event: WheelEvent) {
   if (!event.ctrlKey) {
@@ -852,12 +877,42 @@ function handleTerminalPointerdown(event: PointerEvent) {
     return;
   }
 
+  selectionPointerActive = true;
+  selectionCopyPendingAfterPointer = false;
+
   if (copyInterruptGuardActive) {
     clearCopyInterruptGuard();
     return;
   }
 
   armCopyInterruptGuard();
+}
+
+function handleTerminalPointerup() {
+  if (!selectionPointerActive) {
+    return;
+  }
+
+  selectionPointerActive = false;
+
+  if (!selectionCopyPendingAfterPointer) {
+    return;
+  }
+
+  selectionCopyPendingAfterPointer = false;
+  scheduleSelectionCopy();
+}
+
+function setTerminalRefreshShortcutEnabled(enabled: boolean) {
+  window.bridgegit?.app.setTerminalFocusState(enabled);
+}
+
+function handleTerminalFocusIn() {
+  setTerminalRefreshShortcutEnabled(true);
+}
+
+function handleTerminalFocusOut() {
+  setTerminalRefreshShortcutEnabled(false);
 }
 
 async function waitForPrompt(
@@ -1104,12 +1159,15 @@ function initializeTerminal() {
 
   resizeObserver.observe(terminalRoot.value);
   terminalRoot.value.addEventListener('pointerdown', handleTerminalPointerdown, true);
-  terminalRoot.value.addEventListener('pointerup', scheduleSelectionCopy);
+  document.addEventListener('pointerup', handleTerminalPointerup);
   terminalRoot.value.addEventListener('keyup', scheduleSelectionCopy);
   terminalRoot.value.addEventListener('keydown', handleTerminalKeydown, true);
   terminalRoot.value.addEventListener('wheel', handleWheelZoom, terminalWheelListenerOptions);
   terminalRoot.value.addEventListener('paste', handleTerminalPaste);
+  terminalRoot.value.addEventListener('copy', handleTerminalCopy);
   terminalRoot.value.addEventListener('contextmenu', handleContextMenuPaste);
+  terminalRoot.value.addEventListener('focusin', handleTerminalFocusIn);
+  terminalRoot.value.addEventListener('focusout', handleTerminalFocusOut);
 }
 
 onMounted(async () => {
@@ -1214,13 +1272,17 @@ onBeforeUnmount(() => {
     window.clearTimeout(toastTimer);
   }
 
-  terminalRoot.value?.removeEventListener('pointerup', scheduleSelectionCopy);
+  document.removeEventListener('pointerup', handleTerminalPointerup);
   terminalRoot.value?.removeEventListener('pointerdown', handleTerminalPointerdown, true);
   terminalRoot.value?.removeEventListener('keyup', scheduleSelectionCopy);
   terminalRoot.value?.removeEventListener('keydown', handleTerminalKeydown, true);
   terminalRoot.value?.removeEventListener('wheel', handleWheelZoom, terminalWheelListenerOptions);
   terminalRoot.value?.removeEventListener('paste', handleTerminalPaste);
+  terminalRoot.value?.removeEventListener('copy', handleTerminalCopy);
   terminalRoot.value?.removeEventListener('contextmenu', handleContextMenuPaste);
+  terminalRoot.value?.removeEventListener('focusin', handleTerminalFocusIn);
+  terminalRoot.value?.removeEventListener('focusout', handleTerminalFocusOut);
+  setTerminalRefreshShortcutEnabled(false);
   terminalFileLinkProviderDisposable?.dispose();
   terminalFileLinkProviderDisposable = null;
   resizeObserver?.disconnect();

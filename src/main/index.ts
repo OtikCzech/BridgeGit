@@ -1,4 +1,5 @@
 import { app, BrowserWindow, clipboard, dialog, ipcMain, nativeImage, shell } from 'electron';
+import type { IpcMainEvent } from 'electron';
 import type { OpenDialogOptions, SaveDialogOptions } from 'electron';
 import { execFile } from 'node:child_process';
 import { existsSync } from 'node:fs';
@@ -9,7 +10,7 @@ import { registerDockerIpcHandlers } from './docker';
 import { registerGitIpcHandlers } from './git';
 import { normalizeStoredPath, parseWindowsWslPath } from './path-utils';
 import { cleanupPtysForWebContents, registerPtyIpcHandlers } from './pty';
-import { loadSession, saveSession } from './store';
+import { loadSession, saveSession, saveSessionSync } from './store';
 import type { NoteFileHandle, NoteFileStat, SessionData } from '../shared/bridgegit';
 
 let mainWindow: BrowserWindow | null = null;
@@ -305,6 +306,7 @@ async function resolveExistingNoteLink(baseFilePath: string | null, rawHref: str
 
 async function createMainWindow() {
   const windowIcon = nativeImage.createFromPath(getWindowIconPath());
+  let allowTerminalRefreshShortcut = false;
 
   mainWindow = new BrowserWindow({
     width: 1520,
@@ -329,6 +331,17 @@ async function createMainWindow() {
     return { action: 'deny' };
   });
 
+  mainWindow.webContents.on('before-input-event', (event, input) => {
+    const isRefreshShortcut = (input.control || input.meta)
+      && !input.shift
+      && !input.alt
+      && input.key.toLowerCase() === 'r';
+
+    if (isRefreshShortcut && !allowTerminalRefreshShortcut) {
+      event.preventDefault();
+    }
+  });
+
   mainWindow.once('ready-to-show', () => {
     if (!windowIcon.isEmpty()) {
       mainWindow?.setIcon(windowIcon);
@@ -342,8 +355,75 @@ async function createMainWindow() {
   });
 
   const activeWebContentsId = mainWindow.webContents.id;
+  let closeAfterSessionFlush = false;
+  let closeFlushTimer: NodeJS.Timeout | null = null;
+
+  function clearCloseFlushTimer() {
+    if (!closeFlushTimer) {
+      return;
+    }
+
+    clearTimeout(closeFlushTimer);
+    closeFlushTimer = null;
+  }
+
+  function finishCloseAfterSessionFlush() {
+    clearCloseFlushTimer();
+    closeAfterSessionFlush = true;
+
+    if (!mainWindow || mainWindow.isDestroyed()) {
+      return;
+    }
+
+    mainWindow.close();
+  }
+
+  const handleCloseReady = (event: IpcMainEvent) => {
+    if (event.sender.id !== activeWebContentsId) {
+      return;
+    }
+
+    finishCloseAfterSessionFlush();
+  };
+
+  const handleTerminalFocusState = (event: IpcMainEvent, focused: boolean) => {
+    if (event.sender.id !== activeWebContentsId) {
+      return;
+    }
+
+    allowTerminalRefreshShortcut = focused;
+  };
+
+  ipcMain.on('app:closeReady', handleCloseReady);
+  ipcMain.on('app:setTerminalFocusState', handleTerminalFocusState);
+
+  mainWindow.on('blur', () => {
+    allowTerminalRefreshShortcut = false;
+  });
+
+  mainWindow.on('close', (event) => {
+    if (closeAfterSessionFlush || !mainWindow || mainWindow.isDestroyed()) {
+      return;
+    }
+
+    event.preventDefault();
+
+    if (closeFlushTimer) {
+      return;
+    }
+
+    mainWindow.webContents.send('app:closeRequested');
+    closeFlushTimer = setTimeout(() => {
+      clearCloseFlushTimer();
+      closeAfterSessionFlush = true;
+      mainWindow?.destroy();
+    }, 1500);
+  });
 
   mainWindow.on('closed', () => {
+    clearCloseFlushTimer();
+    ipcMain.removeListener('app:closeReady', handleCloseReady);
+    ipcMain.removeListener('app:setTerminalFocusState', handleTerminalFocusState);
     cleanupPtysForWebContents(activeWebContentsId);
     mainWindow = null;
   });
@@ -472,6 +552,9 @@ function registerCoreIpcHandlers() {
   ipcMain.handle('session:save', async (_event, session: Partial<SessionData>) =>
     saveSession(session),
   );
+  ipcMain.on('session:saveSync', (event, session: Partial<SessionData>) => {
+    event.returnValue = saveSessionSync(session);
+  });
 }
 
 app.whenReady().then(async () => {
@@ -480,6 +563,7 @@ app.whenReady().then(async () => {
   }
 
   registerCoreIpcHandlers();
+  await loadSession();
   await createMainWindow();
 
   app.on('activate', async () => {

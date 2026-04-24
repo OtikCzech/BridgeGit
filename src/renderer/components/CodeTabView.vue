@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { Compartment, EditorState, StateEffect, StateField } from '@codemirror/state';
+import { Compartment, EditorSelection, EditorState, StateEffect, StateField } from '@codemirror/state';
 import {
   Decoration,
   EditorView,
@@ -32,6 +32,7 @@ import {
   normalizeNoteFontSize,
   type ResolvedEditorTheme,
   type ThemeVariant,
+  type WorkspaceEditorCursorState,
   type WorkspaceExternalFileChangeState,
 } from '../../shared/bridgegit';
 import {
@@ -42,12 +43,17 @@ import {
   isCodeEditorLargeFile,
 } from '../codemirror/codeEditor';
 import {
+  readClipboardText as readSharedClipboardText,
+  writeClipboardText as writeSharedClipboardText,
+} from '../clipboard';
+import {
   clearCodeNavigationCaches,
   filterCodeReferenceSearchMatches,
   getCodeNavigationSymbolAtOffset,
   resolveCodeNavigationAtOffset,
   resolveCodeNavigationResolutionAtOffset,
 } from '../navigation/codeNavigation';
+import { useClipboardHistoryTarget } from '../composables/useClipboardHistoryTarget';
 import { SHORTCUTS, matchesShortcut } from '../shortcuts';
 
 interface Props {
@@ -62,6 +68,7 @@ interface Props {
   navigationRequest: CodeNavigationRequest | null;
   editorTheme: ResolvedEditorTheme;
   themeVariant: ThemeVariant;
+  cursor?: WorkspaceEditorCursorState;
 }
 
 const props = defineProps<Props>();
@@ -77,6 +84,7 @@ const emit = defineEmits<{
   'save-file': [];
   'save-file-as': [];
   'update:content': [content: string];
+  'update:cursor': [cursor: WorkspaceEditorCursorState];
   'update:font-size': [fontSize: number];
 }>();
 
@@ -120,6 +128,13 @@ const linkHoverField = StateField.define<DecorationSet>({
 let editorView: EditorView | null = null;
 let suppressContentSync = false;
 let copyToastTimer: number | null = null;
+let copySelectionTimer: number | null = null;
+let lastCopiedSelection: string | null = null;
+let selectionPointerActive = false;
+let selectionCopyPendingAfterPointer = false;
+let selectionKeyboardActive = false;
+let selectionCopyPendingAfterKeyboard = false;
+let selectionKeyboardMode: 'range' | 'select-all' | null = null;
 let linkHoverRequestId = 0;
 let modifierPressed = false;
 let referencesSearchToken = 0;
@@ -364,16 +379,7 @@ function showCopyToast(message: string) {
 }
 
 async function writeClipboard(text: string) {
-  try {
-    if (window.bridgegit?.clipboard) {
-      await Promise.resolve(window.bridgegit.clipboard.writeText(text));
-      return;
-    }
-  } catch {
-    // Fall back to the browser clipboard API when the Electron bridge is unavailable.
-  }
-
-  await navigator.clipboard.writeText(text);
+  await writeSharedClipboardText(text);
 }
 
 async function copyFilePathText(text: string, successMessage: string) {
@@ -593,6 +599,11 @@ async function findReferencesAtCursor() {
 }
 
 function handleDocumentPointerDown(event: PointerEvent) {
+  if (event.button === 0 && rootRef.value?.contains(event.target as Node | null)) {
+    selectionPointerActive = true;
+    selectionCopyPendingAfterPointer = false;
+  }
+
   if (!filePathMenu.value) {
     return;
   }
@@ -606,16 +617,175 @@ function handleDocumentPointerDown(event: PointerEvent) {
   closeFilePathMenu();
 }
 
-function handleEditorUpdate(update: ViewUpdate) {
-  if (!update.docChanged || suppressContentSync) {
+function handleDocumentPointerUp() {
+  if (!selectionPointerActive) {
     return;
   }
 
-  dismissReferencesPanel();
-  const nextContent = update.state.doc.toString();
+  selectionPointerActive = false;
 
-  if (nextContent !== props.content) {
-    emit('update:content', nextContent);
+  if (!selectionCopyPendingAfterPointer) {
+    return;
+  }
+
+  selectionCopyPendingAfterPointer = false;
+  scheduleSelectionCopy();
+}
+
+function clearPendingSelectionCopy() {
+  if (copySelectionTimer) {
+    window.clearTimeout(copySelectionTimer);
+    copySelectionTimer = null;
+  }
+}
+
+function getSelectedCodeText(view: EditorView | null = editorView) {
+  if (!view || !props.active) {
+    return null;
+  }
+
+  const selection = view.state.selection.main;
+
+  if (selection.empty) {
+    return null;
+  }
+
+  return view.state.sliceDoc(selection.from, selection.to);
+}
+
+function scheduleSelectionCopy(view: EditorView | null = editorView) {
+  if (selectionKeyboardActive) {
+    selectionCopyPendingAfterKeyboard = true;
+    return;
+  }
+
+  if (selectionPointerActive) {
+    selectionCopyPendingAfterPointer = true;
+    return;
+  }
+
+  const selection = getSelectedCodeText(view);
+
+  if (!selection) {
+    lastCopiedSelection = null;
+    clearPendingSelectionCopy();
+    return;
+  }
+
+  clearPendingSelectionCopy();
+  copySelectionTimer = window.setTimeout(async () => {
+    const currentSelection = getSelectedCodeText(view);
+
+    if (!currentSelection || currentSelection === lastCopiedSelection) {
+      return;
+    }
+
+    try {
+      await writeClipboard(currentSelection);
+      lastCopiedSelection = currentSelection;
+      showCopyToast('Copied');
+    } catch {
+      showCopyToast('Copy failed');
+    }
+  }, 90);
+}
+
+async function pasteClipboardIntoEditor(view: EditorView, eventText?: string | null) {
+  const clipboardText = await readSharedClipboardText({
+    eventText,
+    preferPreviousDistinctOf: getSelectedCodeText(view),
+  });
+
+  if (!clipboardText) {
+    return;
+  }
+
+  insertTextIntoEditor(view, clipboardText);
+}
+
+function insertTextIntoEditor(view: EditorView, text: string) {
+  view.dispatch(view.state.replaceSelection(text));
+  view.focus();
+}
+
+useClipboardHistoryTarget({
+  isTargetActive: () => props.active && Boolean(editorView),
+  insertText: (text) => {
+    if (!editorView) {
+      return;
+    }
+
+    insertTextIntoEditor(editorView, text);
+  },
+});
+
+const CURSOR_EMIT_DEBOUNCE_MS = 250;
+let cursorEmitTimer: number | null = null;
+
+function flushCursorEmit() {
+  if (cursorEmitTimer !== null) {
+    window.clearTimeout(cursorEmitTimer);
+    cursorEmitTimer = null;
+  }
+
+  if (!editorView) {
+    return;
+  }
+
+  const mainSelection = editorView.state.selection.main;
+  const nextAnchor = mainSelection.anchor;
+  const nextHead = mainSelection.head;
+
+  if (props.cursor?.anchor === nextAnchor && props.cursor?.head === nextHead) {
+    return;
+  }
+
+  emit('update:cursor', { anchor: nextAnchor, head: nextHead });
+}
+
+function scheduleCursorEmit() {
+  if (cursorEmitTimer !== null) {
+    window.clearTimeout(cursorEmitTimer);
+  }
+
+  cursorEmitTimer = window.setTimeout(() => {
+    cursorEmitTimer = null;
+    flushCursorEmit();
+  }, CURSOR_EMIT_DEBOUNCE_MS);
+}
+
+function buildInitialSelection(docLength: number) {
+  const cursor = props.cursor;
+
+  if (!cursor) {
+    return undefined;
+  }
+
+  const anchor = Math.min(Math.max(0, Math.floor(cursor.anchor)), docLength);
+  const head = Math.min(Math.max(0, Math.floor(cursor.head)), docLength);
+  return EditorSelection.single(anchor, head);
+}
+
+function handleEditorUpdate(update: ViewUpdate) {
+  if (update.selectionSet) {
+    scheduleSelectionCopy(update.view);
+  }
+
+  if (suppressContentSync) {
+    return;
+  }
+
+  if (update.docChanged) {
+    dismissReferencesPanel();
+    const nextContent = update.state.doc.toString();
+
+    if (nextContent !== props.content) {
+      emit('update:content', nextContent);
+    }
+  }
+
+  if (update.selectionSet) {
+    scheduleCursorEmit();
   }
 }
 
@@ -648,6 +818,7 @@ function createEditor() {
 
   const state = EditorState.create({
     doc: props.content,
+    selection: buildInitialSelection(props.content.length),
     extensions: [
       EditorState.tabSize.of(2),
       lineNumbers(),
@@ -706,6 +877,18 @@ function createEditor() {
           clearHoveredLink();
           return false;
         },
+        contextmenu: (event, view) => {
+          event.preventDefault();
+          event.stopPropagation();
+          void pasteClipboardIntoEditor(view);
+          return true;
+        },
+        paste: (event, view) => {
+          event.preventDefault();
+          event.stopPropagation();
+          void pasteClipboardIntoEditor(view, event.clipboardData?.getData('text/plain') ?? '');
+          return true;
+        },
       }),
       EditorView.updateListener.of((update) => {
         handleEditorUpdate(update);
@@ -721,6 +904,12 @@ function createEditor() {
     state,
     parent: editorRootRef.value,
   });
+
+  if (props.cursor) {
+    editorView.dispatch({
+      effects: EditorView.scrollIntoView(editorView.state.selection.main, { y: 'center' }),
+    });
+  }
 
   if (props.active) {
     void nextTick(() => {
@@ -775,6 +964,17 @@ function openSearch() {
   openSearchPanel(editorView);
 }
 
+function isSelectionRangeKeyboardShortcut(event: KeyboardEvent) {
+  return (
+    event.shiftKey
+    && ['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End', 'PageUp', 'PageDown'].includes(event.key)
+  );
+}
+
+function isSelectAllKeyboardShortcut(event: KeyboardEvent) {
+  return (event.ctrlKey || event.metaKey) && !event.altKey && event.key.toLowerCase() === 'a';
+}
+
 function handleWheel(event: WheelEvent) {
   if (!props.active || (!event.ctrlKey && !event.metaKey)) {
     return;
@@ -794,6 +994,14 @@ function handleDocumentKeydown(event: KeyboardEvent) {
 
   if (!props.active) {
     return;
+  }
+
+  if (isSelectionRangeKeyboardShortcut(event)) {
+    selectionKeyboardActive = true;
+    selectionKeyboardMode = 'range';
+  } else if (isSelectAllKeyboardShortcut(event)) {
+    selectionKeyboardActive = true;
+    selectionKeyboardMode = 'select-all';
   }
 
   if (filePathMenu.value && event.key === 'Escape') {
@@ -840,6 +1048,30 @@ function handleDocumentKeydown(event: KeyboardEvent) {
 }
 
 function handleDocumentKeyup(event: KeyboardEvent) {
+  if (selectionKeyboardActive) {
+    const shouldFinalizeRangeSelection = (
+      selectionKeyboardMode === 'range'
+      && (
+        event.key === 'Shift'
+        || (
+          !event.shiftKey
+          && ['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End', 'PageUp', 'PageDown'].includes(event.key)
+        )
+      )
+    );
+    const shouldFinalizeSelectAll = selectionKeyboardMode === 'select-all' && isSelectAllKeyboardShortcut(event);
+
+    if (shouldFinalizeRangeSelection || shouldFinalizeSelectAll) {
+      selectionKeyboardActive = false;
+      selectionKeyboardMode = null;
+
+      if (selectionCopyPendingAfterKeyboard) {
+        selectionCopyPendingAfterKeyboard = false;
+        scheduleSelectionCopy();
+      }
+    }
+  }
+
   const nextModifierPressed = event.ctrlKey || event.metaKey;
 
   if (nextModifierPressed === modifierPressed) {
@@ -855,6 +1087,9 @@ watch(
   (nextActive) => {
     if (!nextActive) {
       clearHoveredLink();
+      selectionKeyboardActive = false;
+      selectionKeyboardMode = null;
+      selectionCopyPendingAfterKeyboard = false;
       return;
     }
 
@@ -903,23 +1138,33 @@ watch(
   },
 );
 
+const handleFlushEditorState = () => {
+  flushCursorEmit();
+};
+
 onMounted(() => {
   createEditor();
   document.addEventListener('keydown', handleDocumentKeydown);
   document.addEventListener('keyup', handleDocumentKeyup);
   document.addEventListener('pointerdown', handleDocumentPointerDown);
+  document.addEventListener('pointerup', handleDocumentPointerUp);
+  window.addEventListener('bridgegit:flush-editor-state', handleFlushEditorState);
 });
 
 onBeforeUnmount(() => {
   document.removeEventListener('keydown', handleDocumentKeydown);
   document.removeEventListener('keyup', handleDocumentKeyup);
   document.removeEventListener('pointerdown', handleDocumentPointerDown);
+  document.removeEventListener('pointerup', handleDocumentPointerUp);
+  window.removeEventListener('bridgegit:flush-editor-state', handleFlushEditorState);
+  clearPendingSelectionCopy();
 
   if (copyToastTimer) {
     window.clearTimeout(copyToastTimer);
     copyToastTimer = null;
   }
 
+  flushCursorEmit();
   editorView?.destroy();
   editorView = null;
 });

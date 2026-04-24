@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref } from 'vue';
+import { writeClipboardText as writeSharedClipboardText } from '../clipboard';
 
 interface Props {
   message: string;
@@ -42,12 +43,7 @@ function showCopyToast(message: string) {
 }
 
 async function writeClipboardText(text: string) {
-  if (window.bridgegit?.clipboard) {
-    await Promise.resolve(window.bridgegit.clipboard.writeText(text));
-    return;
-  }
-
-  await navigator.clipboard.writeText(text);
+  await writeSharedClipboardText(text);
 }
 
 async function copyError() {
