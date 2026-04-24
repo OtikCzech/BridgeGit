@@ -2,7 +2,7 @@
 
 BridgeGit is an Electron desktop app that combines Git workflows, an integrated terminal workspace, notes and a code editor in one window.
 
-Current release: `v0.7.0`
+Current release: `v0.7.1`
 
 It is built for day-to-day repository work where you want Git status, history, diffs, shell sessions and file editing to stay in the same context.
 

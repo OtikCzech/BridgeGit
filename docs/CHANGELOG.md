@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.7.1 - 2026-04-24
+
+Patch release focused on restoring a small but visible repo-panel detail after the 0.7.0 handoff.
+
+- Restored the branch label inside the pinned workspace/repository button, with a subtle placeholder when the branch is not known, while keeping the simplified repo-family focus header
+
 ## v0.7.0 - 2026-04-24
 
 Workspace follow-up release focused on a stronger notes editor, smarter clipboard flow and calmer multi-repo behavior.

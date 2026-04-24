@@ -3036,6 +3036,9 @@ onBeforeUnmount(() => {
               </span>
             </span>
             <span class="repo-panel__workspace-subline">
+              <span class="repo-panel__workspace-branch">
+                {{ workspace.branch || '...' }}
+              </span>
               <span class="repo-panel__workspace-dots" :title="workspacePanelsTitle(workspace)">
                 <span
                   v-if="workspaceIndicatorVisibility.repo"
@@ -4494,6 +4497,7 @@ onBeforeUnmount(() => {
   align-items: center;
   gap: 6px;
   flex: 0 0 auto;
+  margin-left: auto;
 }
 
 .repo-panel__workspace-dot {
