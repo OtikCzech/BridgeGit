@@ -1,4 +1,7 @@
 import {
+  existsSync,
+} from 'node:fs';
+import {
   CLIPBOARD_HISTORY_LIMIT,
   DEFAULT_SESSION_DATA,
   DEFAULT_PANEL_LAYOUT,
@@ -17,6 +20,7 @@ import {
   type RepoPanelSectionId,
   type RepoPanelSectionState,
   type SessionData,
+  type ShortcutOverride,
   type TerminalCommandPreset,
   type TerminalCommandStep,
   type WorktreeDetectionInterval,
@@ -29,6 +33,16 @@ import {
   type WorkspaceSessionsById,
 } from '../shared/bridgegit';
 import { normalizeStoredPath, normalizeTerminalCwd } from './path-utils';
+
+function normalizeExistingStoredPath(pathValue: string | null | undefined): string | null {
+  const normalizedPath = normalizeStoredPath(pathValue);
+
+  if (!normalizedPath) {
+    return null;
+  }
+
+  return existsSync(normalizedPath) ? normalizedPath : null;
+}
 
 interface PartialTerminalCommandStep {
   id?: string;
@@ -45,6 +59,15 @@ interface PartialTerminalCommandPreset {
   target?: TerminalCommandPreset['target'];
   shortcutSlot?: number | null;
   steps?: PartialTerminalCommandStep[];
+}
+
+interface PartialShortcutOverride {
+  key?: string;
+  code?: string | null;
+  display?: string;
+  alt?: boolean;
+  shift?: boolean;
+  ctrlOrMeta?: boolean;
 }
 
 interface LegacyTerminalTabState {
@@ -144,6 +167,7 @@ interface PartialWorkspaceRepoPanelFilesState {
   expanded?: boolean;
   viewMode?: RepoPanelFileListMode;
   showAll?: boolean;
+  showHidden?: boolean;
   collapsedSections?: Partial<Record<RepoPanelSectionId, boolean>>;
   expandedDirectories?: string[];
 }
@@ -153,6 +177,7 @@ interface PartialWorkspaceRepoPanelState {
   historyOpen?: boolean;
   workspaceDetailExpanded?: boolean;
   workspaceFamilyFocus?: boolean;
+  pinnedWorkspaceIds?: string[];
   files?: PartialWorkspaceRepoPanelFilesState;
 }
 
@@ -269,7 +294,7 @@ function normalizeRecentRepos(
   const repoMap = new Map<string, RecentRepoEntry>();
 
   for (const item of recentRepos ?? []) {
-    const repoPath = normalizeStoredPath(typeof item === 'string' ? item : item.path);
+    const repoPath = normalizeExistingStoredPath(typeof item === 'string' ? item : item.path);
 
     if (!repoPath) {
       continue;
@@ -400,7 +425,7 @@ function normalizeWorkspaceDescriptors(
 
     const kind = workspaceDescriptor.kind === 'global' ? 'global' : 'project';
     const repoPath = kind === 'project'
-      ? normalizeStoredPath(workspaceDescriptor.repoPath)
+      ? normalizeExistingStoredPath(workspaceDescriptor.repoPath)
       : null;
 
     if (kind === 'global' || !repoPath || repoPath.startsWith('workspace:')) {
@@ -432,7 +457,11 @@ function normalizeWorkspaceDescriptors(
 
       const contextKey = normalizeWorkspaceContextKey(rawContextKey);
 
-      if (contextKey === GLOBAL_WORKSPACE_SESSION_KEY || contextKey.startsWith('workspace:')) {
+      if (
+        contextKey === GLOBAL_WORKSPACE_SESSION_KEY
+        || contextKey.startsWith('workspace:')
+        || !normalizeExistingStoredPath(contextKey)
+      ) {
         continue;
       }
 
@@ -914,6 +943,14 @@ function normalizeRepoPanelSectionState(
 function normalizeWorkspaceRepoPanelState(
   workspaceRepoPanelState: PartialWorkspaceRepoPanelState | undefined,
 ): WorkspaceRepoPanelState {
+  const pinnedWorkspaceIds = Array.isArray(workspaceRepoPanelState?.pinnedWorkspaceIds)
+    ? [...new Set(
+      workspaceRepoPanelState.pinnedWorkspaceIds
+        .filter((workspaceId): workspaceId is string => typeof workspaceId === 'string')
+        .map((workspaceId) => workspaceId.trim())
+        .filter(Boolean),
+    )]
+    : [];
   const expandedDirectories = Array.isArray(workspaceRepoPanelState?.files?.expandedDirectories)
     ? [...new Set(
       workspaceRepoPanelState.files.expandedDirectories
@@ -928,10 +965,12 @@ function normalizeWorkspaceRepoPanelState(
     historyOpen: workspaceRepoPanelState?.historyOpen ?? false,
     workspaceDetailExpanded: workspaceRepoPanelState?.workspaceDetailExpanded ?? true,
     workspaceFamilyFocus: workspaceRepoPanelState?.workspaceFamilyFocus ?? false,
+    pinnedWorkspaceIds,
     files: {
       expanded: workspaceRepoPanelState?.files?.expanded ?? true,
       viewMode: workspaceRepoPanelState?.files?.viewMode === 'tree' ? 'tree' : 'list',
       showAll: workspaceRepoPanelState?.files?.showAll ?? false,
+      showHidden: workspaceRepoPanelState?.files?.showHidden ?? false,
       collapsedSections: normalizeRepoPanelSectionState(workspaceRepoPanelState?.files?.collapsedSections),
       expandedDirectories,
     },
@@ -941,11 +980,37 @@ function normalizeWorkspaceRepoPanelState(
 function normalizeWorkspaceRepoPanelStates(
   workspaceRepoPanelStates: Record<string, PartialWorkspaceRepoPanelState> | undefined,
   workspaceDescriptors: WorkspaceDescriptorsById,
+  activeWorkspaceId: string,
 ): Record<string, WorkspaceRepoPanelState> {
-  return Object.fromEntries(
+  const normalizedWorkspaceRepoPanelStates = Object.fromEntries(
     Object.keys(workspaceDescriptors).map((workspaceId) => (
       [workspaceId, normalizeWorkspaceRepoPanelState(workspaceRepoPanelStates?.[workspaceId])]
     )),
+  );
+
+  const sourceWorkspaceRepoPanelState = normalizedWorkspaceRepoPanelStates[activeWorkspaceId]
+    ?? Object.values(normalizedWorkspaceRepoPanelStates).find((workspaceRepoPanelState) => (
+      workspaceRepoPanelState.workspaceFamilyFocus || workspaceRepoPanelState.pinnedWorkspaceIds.length > 0
+    ))
+    ?? null;
+
+  if (!sourceWorkspaceRepoPanelState) {
+    return normalizedWorkspaceRepoPanelStates;
+  }
+
+  const allowedWorkspaceIds = new Set(Object.keys(workspaceDescriptors));
+  const globalPinnedWorkspaceIds = sourceWorkspaceRepoPanelState.pinnedWorkspaceIds
+    .filter((workspaceId) => allowedWorkspaceIds.has(workspaceId));
+
+  return Object.fromEntries(
+    Object.entries(normalizedWorkspaceRepoPanelStates).map(([workspaceId, workspaceRepoPanelState]) => [
+      workspaceId,
+      {
+        ...workspaceRepoPanelState,
+        workspaceFamilyFocus: sourceWorkspaceRepoPanelState.workspaceFamilyFocus,
+        pinnedWorkspaceIds: [...globalPinnedWorkspaceIds],
+      },
+    ]),
   );
 }
 
@@ -1009,12 +1074,42 @@ function normalizeProjectTitlesByContext(
   return Object.fromEntries(normalizedTitles.entries());
 }
 
+function normalizeShortcutOverrides(
+  shortcutOverrides: Record<string, PartialShortcutOverride> | undefined,
+): SessionData['shortcutOverrides'] {
+  const normalizedOverrides = new Map<string, ShortcutOverride>();
+
+  for (const [rawShortcutId, rawOverride] of Object.entries(shortcutOverrides ?? {})) {
+    const shortcutId = rawShortcutId.trim();
+    const key = rawOverride?.key?.trim();
+    const display = rawOverride?.display?.trim();
+    const code = rawOverride?.code?.trim();
+
+    if (!shortcutId || !key || !display) {
+      continue;
+    }
+
+    normalizedOverrides.set(shortcutId, {
+      key,
+      code: code || undefined,
+      display,
+      alt: rawOverride?.alt === true ? true : undefined,
+      shift: rawOverride?.shift === true ? true : undefined,
+      ctrlOrMeta: rawOverride?.ctrlOrMeta === true ? true : undefined,
+    });
+  }
+
+  return Object.fromEntries(normalizedOverrides.entries());
+}
+
 function normalizeWorkspaceTabDefaults(
   workspaceTabDefaults: Partial<WorkspaceTabDefaults> | undefined,
 ): WorkspaceTabDefaults {
   return {
     shellFontSize: normalizeShellFontSize(workspaceTabDefaults?.shellFontSize),
     noteFontSize: normalizeNoteFontSize(workspaceTabDefaults?.noteFontSize),
+    noteViewMode: normalizeNoteTabViewMode(workspaceTabDefaults?.noteViewMode),
+    noteLineNumbers: workspaceTabDefaults?.noteLineNumbers !== false,
   };
 }
 
@@ -1105,8 +1200,9 @@ function normalizeSession(session: LegacySessionData): SessionData {
   const persistenceRevision = typeof session.persistenceRevision === 'number' && Number.isFinite(session.persistenceRevision)
     ? Math.max(0, Math.floor(session.persistenceRevision))
     : DEFAULT_SESSION_DATA.persistenceRevision;
-  const lastRepoPath = normalizeStoredPath(session.lastRepoPath ?? DEFAULT_SESSION_DATA.lastRepoPath);
-  const fallbackCwd = normalizeTerminalCwd(session.terminalCwd, lastRepoPath);
+  const lastRepoPath = normalizeExistingStoredPath(session.lastRepoPath ?? DEFAULT_SESSION_DATA.lastRepoPath);
+  const fallbackCwd = normalizeExistingStoredPath(session.terminalCwd)
+    ?? normalizeTerminalCwd(null, lastRepoPath);
   const recentRepos = normalizeRecentRepos(
     session.recentRepos as Array<string | Partial<RecentRepoEntry>> | undefined,
     lastRepoPath,
@@ -1163,6 +1259,7 @@ function normalizeSession(session: LegacySessionData): SessionData {
   const workspaceRepoPanelStates = normalizeWorkspaceRepoPanelStates(
     session.workspaceRepoPanelStates,
     workspaceDescriptors,
+    activeWorkspaceId,
   );
   const workspaceIndicatorVisibility = {
     repo: session.workspaceIndicatorVisibility?.repo ?? DEFAULT_SESSION_DATA.workspaceIndicatorVisibility.repo,
@@ -1187,6 +1284,7 @@ function normalizeSession(session: LegacySessionData): SessionData {
     projectTitlesByContext,
     appAppearance: normalizeAppAppearance(session.appAppearance),
     editorTheme: normalizeEditorTheme(session.editorTheme),
+    shortcutOverrides: normalizeShortcutOverrides(session.shortcutOverrides as Record<string, PartialShortcutOverride> | undefined),
     workspaceIndicatorVisibility,
     workspaceTabDefaults,
     worktreeDetectionIntervalMs: normalizeWorktreeDetectionInterval(session.worktreeDetectionIntervalMs),

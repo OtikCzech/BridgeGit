@@ -8,7 +8,7 @@ import type {
   GitLogEntry,
   GitLogScope,
 } from '../../shared/bridgegit';
-import { SHORTCUTS, matchesShortcut } from '../shortcuts';
+import { SHORTCUTS, matchesShortcut, shortcutBindingsRevision } from '../shortcuts';
 import AppConfirmDialog from './AppConfirmDialog.vue';
 import DiffViewer from './DiffViewer.vue';
 import GitHistoryGraph from './GitHistoryGraph.vue';
@@ -43,6 +43,7 @@ interface Props {
 }
 
 const props = defineProps<Props>();
+const shortcutBindingsVersion = shortcutBindingsRevision;
 
 const emit = defineEmits<{
   'update:modelValue': [value: boolean];
@@ -812,7 +813,12 @@ watch(
 
 <template>
   <teleport to="body">
-    <div v-if="modelValue" class="commit-history-dialog" role="presentation">
+    <div
+      v-if="modelValue"
+      class="commit-history-dialog"
+      :data-shortcut-bindings-version="shortcutBindingsVersion"
+      role="presentation"
+    >
       <section
         class="commit-history-dialog__panel"
         :class="{ 'commit-history-dialog__panel--sidebar-right': sidebarSide === 'right' }"

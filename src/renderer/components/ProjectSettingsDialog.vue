@@ -4,6 +4,8 @@ import type {
   AppAppearance,
   EditorTheme,
   ResolvedEditorTheme,
+  ShortcutOverrides,
+  WorkspaceNoteViewMode,
   WorkspaceTabDefaults,
   PanelLayout,
   ProjectSettingsFormData,
@@ -17,10 +19,18 @@ import {
   MAX_SHELL_FONT_SIZE,
   MIN_NOTE_FONT_SIZE,
   MIN_SHELL_FONT_SIZE,
+  cloneShortcutOverrides,
   normalizeNoteFontSize,
   normalizeShellFontSize,
 } from '../../shared/bridgegit';
-import { SETTINGS_SHORTCUT_GROUPS, formatCommandSlotShortcut } from '../shortcuts';
+import {
+  buildSettingsShortcutGroups,
+  captureShortcutOverride,
+  findShortcutConflicts,
+  formatCommandSlotShortcut,
+  getDefaultShortcutDefinition,
+  isShortcutOverrideRedundant,
+} from '../shortcuts';
 import { playNotificationBeep } from '../utils/notification-audio';
 
 type SettingsSectionId = 'general' | 'shortcuts' | 'commands' | 'layout';
@@ -35,6 +45,7 @@ interface Props {
   diffPlacement: PanelLayout['diffPlacement'];
   appAppearance: AppAppearance;
   editorTheme: EditorTheme;
+  shortcutOverrides: ShortcutOverrides;
   workspacePanelFontSize: number;
   workspaceIndicatorVisibility: WorkspaceIndicatorVisibilitySettings;
   workspaceTabDefaults: WorkspaceTabDefaults;
@@ -57,6 +68,12 @@ interface WorktreeDetectionIntervalOption {
 
 interface ThemeOption<TValue extends string> {
   value: TValue;
+  label: string;
+  copy: string;
+}
+
+interface NoteViewModeOption {
+  value: WorkspaceNoteViewMode;
   label: string;
   copy: string;
 }
@@ -109,6 +126,12 @@ const EDITOR_THEME_OPTIONS: ThemeOption<EditorTheme>[] = [
   { value: 'nord', label: 'Nord', copy: 'Cool dark editor palette with softer blues and lower glare.' },
 ];
 
+const NOTE_VIEW_MODE_OPTIONS: NoteViewModeOption[] = [
+  { value: 'source', label: 'Edit', copy: 'Open notes directly in the editor.' },
+  { value: 'split', label: 'Edit + preview', copy: 'Keep editor and preview visible together.' },
+  { value: 'preview', label: 'Preview', copy: 'Open notes in preview-first mode.' },
+];
+
 const props = defineProps<Props>();
 
 const emit = defineEmits<{
@@ -123,6 +146,7 @@ const draftSidebarSide = ref<PanelLayout['sidebarSide']>(props.sidebarSide);
 const draftDiffPlacement = ref<PanelLayout['diffPlacement']>(props.diffPlacement);
 const draftAppAppearance = ref<AppAppearance>(props.appAppearance);
 const draftEditorTheme = ref<EditorTheme>(props.editorTheme);
+const draftShortcutOverrides = ref<ShortcutOverrides>(cloneShortcutOverrides(props.shortcutOverrides));
 const draftWorkspacePanelFontSize = ref(normalizeNoteFontSize(props.workspacePanelFontSize));
 const draftWorkspaceIndicatorVisibility = ref<WorkspaceIndicatorVisibilitySettings>({ ...props.workspaceIndicatorVisibility });
 const draftWorkspaceTabDefaults = ref<WorkspaceTabDefaults>({ ...props.workspaceTabDefaults });
@@ -130,6 +154,7 @@ const draftWorktreeDetectionIntervalMs = ref<string>(serializeWorktreeDetectionI
 const draftSoundNotificationsEnabled = ref(props.soundNotificationsEnabled);
 const draftCommandPresets = ref<TerminalCommandPreset[]>(cloneTerminalCommandPresets(props.terminalCommandPresets));
 const expandedCommandPresetId = ref<string | null>(props.terminalCommandPresets[0]?.id ?? null);
+const recordingShortcutId = ref<string | null>(null);
 const WORKSPACE_TAB_FONT_SIZE_MIN = Math.max(MIN_SHELL_FONT_SIZE, MIN_NOTE_FONT_SIZE);
 const WORKSPACE_TAB_FONT_SIZE_MAX = Math.min(MAX_SHELL_FONT_SIZE, MAX_NOTE_FONT_SIZE);
 const WORKSPACE_PANEL_FONT_SIZE_MIN = MIN_NOTE_FONT_SIZE;
@@ -219,6 +244,7 @@ function resetDraft() {
   draftDiffPlacement.value = props.diffPlacement;
   draftAppAppearance.value = props.appAppearance;
   draftEditorTheme.value = props.editorTheme;
+  draftShortcutOverrides.value = cloneShortcutOverrides(props.shortcutOverrides);
   draftWorkspacePanelFontSize.value = normalizeNoteFontSize(props.workspacePanelFontSize);
   draftWorkspaceIndicatorVisibility.value = { ...props.workspaceIndicatorVisibility };
   draftWorkspaceTabDefaults.value = { ...props.workspaceTabDefaults };
@@ -226,6 +252,7 @@ function resetDraft() {
   draftSoundNotificationsEnabled.value = props.soundNotificationsEnabled;
   draftCommandPresets.value = cloneTerminalCommandPresets(props.terminalCommandPresets);
   expandedCommandPresetId.value = props.terminalCommandPresets[0]?.id ?? null;
+  recordingShortcutId.value = null;
   activeSection.value = 'general';
 }
 
@@ -261,6 +288,13 @@ const workspaceTabsPreviewStyle = computed(() => ({
 const resolvedPreviewEditorTheme = computed<ResolvedEditorTheme>(() => (
   draftEditorTheme.value === 'follow-app' ? draftAppAppearance.value : draftEditorTheme.value
 ));
+const draftShortcutGroups = computed(() => buildSettingsShortcutGroups(draftShortcutOverrides.value));
+const draftShortcutConflicts = computed(() => findShortcutConflicts(draftShortcutOverrides.value));
+const draftShortcutConflictIds = computed(() => (
+  new Set(draftShortcutConflicts.value.flatMap((conflict) => conflict.shortcuts.map((shortcut) => shortcut.id)))
+));
+const hasShortcutConflicts = computed(() => draftShortcutConflicts.value.length > 0);
+const hasShortcutOverrides = computed(() => Object.keys(draftShortcutOverrides.value).length > 0);
 
 const draftUnifiedWorkspaceTabFontSize = computed({
   get() {
@@ -333,6 +367,16 @@ watch(
 );
 
 watch(
+  () => props.shortcutOverrides,
+  (value) => {
+    if (!props.modelValue) {
+      draftShortcutOverrides.value = cloneShortcutOverrides(value);
+    }
+  },
+  { deep: true },
+);
+
+watch(
   () => props.workspacePanelFontSize,
   (value) => {
     if (!props.modelValue) {
@@ -402,22 +446,45 @@ function closeDialog() {
   emit('update:modelValue', false);
 }
 
+function handleDialogKeydown(event: KeyboardEvent) {
+  if (event.key !== 'Escape') {
+    return;
+  }
+
+  event.preventDefault();
+
+  if (recordingShortcutId.value) {
+    stopShortcutRecording(recordingShortcutId.value);
+    return;
+  }
+
+  closeDialog();
+}
+
 async function previewNotificationSound() {
   await playNotificationBeep();
 }
 
 function handleSubmit() {
+  if (hasShortcutConflicts.value) {
+    activeSection.value = 'shortcuts';
+    return;
+  }
+
   emit('save', {
     projectTitle: draftTitle.value.trim(),
     sidebarSide: draftSidebarSide.value,
     diffPlacement: draftDiffPlacement.value,
     appAppearance: draftAppAppearance.value,
     editorTheme: draftEditorTheme.value,
+    shortcutOverrides: cloneShortcutOverrides(draftShortcutOverrides.value),
     workspacePanelFontSize: normalizeNoteFontSize(draftWorkspacePanelFontSize.value),
     workspaceIndicatorVisibility: { ...draftWorkspaceIndicatorVisibility.value },
     workspaceTabDefaults: {
       shellFontSize: normalizeShellFontSize(draftWorkspaceTabDefaults.value.shellFontSize),
       noteFontSize: normalizeNoteFontSize(draftWorkspaceTabDefaults.value.noteFontSize),
+      noteViewMode: draftWorkspaceTabDefaults.value.noteViewMode,
+      noteLineNumbers: draftWorkspaceTabDefaults.value.noteLineNumbers !== false,
     },
     worktreeDetectionIntervalMs: parseWorktreeDetectionInterval(draftWorktreeDetectionIntervalMs.value),
     soundNotificationsEnabled: draftSoundNotificationsEnabled.value,
@@ -488,6 +555,92 @@ function formatPresetTarget(target: TerminalCommandPreset['target']): string {
   return target === 'new-tab' ? 'New shell tab' : 'Active shell tab';
 }
 
+function hasShortcutOverride(shortcutId: string): boolean {
+  return Object.prototype.hasOwnProperty.call(draftShortcutOverrides.value, shortcutId);
+}
+
+function startShortcutRecording(shortcutId: string) {
+  recordingShortcutId.value = shortcutId;
+}
+
+function stopShortcutRecording(shortcutId?: string) {
+  if (!shortcutId || recordingShortcutId.value === shortcutId) {
+    recordingShortcutId.value = null;
+  }
+}
+
+function clearShortcutOverride(shortcutId: string) {
+  if (!hasShortcutOverride(shortcutId)) {
+    return;
+  }
+
+  const nextShortcutOverrides = cloneShortcutOverrides(draftShortcutOverrides.value);
+  delete nextShortcutOverrides[shortcutId];
+  draftShortcutOverrides.value = nextShortcutOverrides;
+  stopShortcutRecording(shortcutId);
+}
+
+function resetAllShortcutOverrides() {
+  draftShortcutOverrides.value = {};
+  recordingShortcutId.value = null;
+}
+
+function getShortcutDefaultDisplay(shortcutId: string): string {
+  return getDefaultShortcutDefinition(shortcutId)?.display ?? '';
+}
+
+function getShortcutConflictCopy(shortcutId: string): string {
+  const conflict = draftShortcutConflicts.value.find((entry) => (
+    entry.shortcuts.some((shortcut) => shortcut.id === shortcutId)
+  ));
+
+  if (!conflict) {
+    return '';
+  }
+
+  const otherLabels = conflict.shortcuts
+    .filter((shortcut) => shortcut.id !== shortcutId)
+    .map((shortcut) => shortcut.label);
+
+  return otherLabels.length ? `Conflicts with ${otherLabels.join(', ')}.` : '';
+}
+
+function handleShortcutCapture(shortcutId: string, event: KeyboardEvent) {
+  if (recordingShortcutId.value !== shortcutId) {
+    return;
+  }
+
+  event.preventDefault();
+  event.stopPropagation();
+
+  if (event.key === 'Escape') {
+    stopShortcutRecording(shortcutId);
+    return;
+  }
+
+  if (event.key === 'Backspace' || event.key === 'Delete') {
+    clearShortcutOverride(shortcutId);
+    return;
+  }
+
+  const override = captureShortcutOverride(event);
+
+  if (!override) {
+    return;
+  }
+
+  const nextShortcutOverrides = cloneShortcutOverrides(draftShortcutOverrides.value);
+
+  if (isShortcutOverrideRedundant(shortcutId, override)) {
+    delete nextShortcutOverrides[shortcutId];
+  } else {
+    nextShortcutOverrides[shortcutId] = override;
+  }
+
+  draftShortcutOverrides.value = nextShortcutOverrides;
+  stopShortcutRecording(shortcutId);
+}
+
 </script>
 
 <template>
@@ -504,6 +657,7 @@ function formatPresetTarget(target: TerminalCommandPreset['target']): string {
         role="dialog"
         aria-modal="true"
         aria-label="Project settings"
+        @keydown.capture="handleDialogKeydown"
       >
         <header class="settings-dialog__header">
           <div class="settings-dialog__header-copy">
@@ -674,7 +828,7 @@ function formatPresetTarget(target: TerminalCommandPreset['target']): string {
                   <h3 class="settings-dialog__section-title">Keyboard shortcuts</h3>
                 </div>
                 <p class="settings-dialog__section-copy">
-                  Current global bindings available in the app.
+                  Default bindings stay in place until you override them here.
                 </p>
               </header>
 
@@ -685,9 +839,36 @@ function formatPresetTarget(target: TerminalCommandPreset['target']): string {
                 </p>
               </div>
 
+              <div class="settings-dialog__section-actions">
+                <p class="settings-dialog__section-note">
+                  Click <code>Record</code>, press the new shortcut, use <code>Backspace</code> to clear, or <code>Esc</code> to cancel recording.
+                </p>
+                <button
+                  class="settings-dialog__button settings-dialog__button--ghost"
+                  type="button"
+                  :disabled="!hasShortcutOverrides"
+                  @click="resetAllShortcutOverrides"
+                >
+                  Reset all
+                </button>
+              </div>
+
+              <div v-if="hasShortcutConflicts" class="settings-dialog__hint-card settings-dialog__hint-card--danger">
+                <span class="settings-dialog__hint-label">Shortcut conflicts</span>
+                <div class="settings-dialog__conflict-list">
+                  <p
+                    v-for="conflict in draftShortcutConflicts"
+                    :key="conflict.signature"
+                    class="settings-dialog__hint-copy"
+                  >
+                    {{ conflict.shortcuts.map((shortcut) => `${shortcut.label} ${shortcut.display}`).join(' · ') }}
+                  </p>
+                </div>
+              </div>
+
               <div class="settings-dialog__shortcut-groups">
                 <section
-                  v-for="group in SETTINGS_SHORTCUT_GROUPS"
+                  v-for="group in draftShortcutGroups"
                   :key="group.id"
                   class="settings-dialog__shortcut-group"
                 >
@@ -700,9 +881,55 @@ function formatPresetTarget(target: TerminalCommandPreset['target']): string {
                       v-for="shortcut in group.shortcuts"
                       :key="shortcut.id"
                       class="settings-dialog__shortcut"
+                      :class="{
+                        'settings-dialog__shortcut--custom': hasShortcutOverride(shortcut.id),
+                        'settings-dialog__shortcut--conflict': draftShortcutConflictIds.has(shortcut.id),
+                      }"
                     >
-                      <span class="settings-dialog__shortcut-label">{{ shortcut.label }}</span>
-                      <code class="settings-dialog__shortcut-keys">{{ shortcut.display }}</code>
+                      <div class="settings-dialog__shortcut-copy">
+                        <span class="settings-dialog__shortcut-label">{{ shortcut.label }}</span>
+                        <span class="settings-dialog__shortcut-meta">
+                          <span v-if="hasShortcutOverride(shortcut.id)">
+                            Custom · default {{ getShortcutDefaultDisplay(shortcut.id) }}
+                          </span>
+                          <span v-else>
+                            Default
+                          </span>
+                          <span
+                            v-if="draftShortcutConflictIds.has(shortcut.id)"
+                            class="settings-dialog__shortcut-conflict"
+                          >
+                            {{ getShortcutConflictCopy(shortcut.id) }}
+                          </span>
+                        </span>
+                      </div>
+
+                      <div class="settings-dialog__shortcut-actions">
+                        <button
+                          class="settings-dialog__button"
+                          :class="recordingShortcutId === shortcut.id
+                            ? 'settings-dialog__button--primary'
+                            : 'settings-dialog__button--ghost'"
+                          type="button"
+                          :title="recordingShortcutId === shortcut.id
+                            ? 'Press the new shortcut now'
+                            : `Record shortcut for ${shortcut.label}`"
+                          @click="startShortcutRecording(shortcut.id)"
+                          @keydown="handleShortcutCapture(shortcut.id, $event)"
+                          @blur="stopShortcutRecording(shortcut.id)"
+                        >
+                          {{ recordingShortcutId === shortcut.id ? 'Press keys…' : shortcut.display }}
+                        </button>
+
+                        <button
+                          class="settings-dialog__button settings-dialog__button--ghost"
+                          type="button"
+                          :disabled="!hasShortcutOverride(shortcut.id)"
+                          @click="clearShortcutOverride(shortcut.id)"
+                        >
+                          Reset
+                        </button>
+                      </div>
                     </div>
                   </div>
                 </section>
@@ -1124,6 +1351,32 @@ function formatPresetTarget(target: TerminalCommandPreset['target']): string {
               </div>
 
               <div class="settings-dialog__hint-card">
+                <span class="settings-dialog__hint-label">Notes</span>
+                <label class="settings-dialog__field">
+                  <span class="settings-dialog__label">Default note open mode</span>
+                  <select v-model="draftWorkspaceTabDefaults.noteViewMode" class="settings-dialog__select">
+                    <option
+                      v-for="option in NOTE_VIEW_MODE_OPTIONS"
+                      :key="option.value"
+                      :value="option.value"
+                    >
+                      {{ option.label }}
+                    </option>
+                  </select>
+                </label>
+                <p class="settings-dialog__hint-copy">
+                  {{ NOTE_VIEW_MODE_OPTIONS.find((option) => option.value === draftWorkspaceTabDefaults.noteViewMode)?.copy }}
+                </p>
+                <label class="settings-dialog__checkbox">
+                  <input v-model="draftWorkspaceTabDefaults.noteLineNumbers" type="checkbox">
+                  <span>Show line numbers in notes by default</span>
+                </label>
+                <p class="settings-dialog__hint-copy">
+                  New notes tabs use this open mode. The line-number toggle also applies to currently open notes editors.
+                </p>
+              </div>
+
+              <div class="settings-dialog__hint-card">
                 <span class="settings-dialog__hint-label">Workspace panel</span>
                 <label class="settings-dialog__field">
                   <span class="settings-dialog__label">Workspace panel font size</span>
@@ -1164,7 +1417,11 @@ function formatPresetTarget(target: TerminalCommandPreset['target']): string {
             <button class="settings-dialog__button settings-dialog__button--ghost" type="button" @click="closeDialog">
               Cancel
             </button>
-            <button class="settings-dialog__button settings-dialog__button--primary" type="submit">
+            <button
+              class="settings-dialog__button settings-dialog__button--primary"
+              type="submit"
+              :disabled="hasShortcutConflicts"
+            >
               Save
             </button>
           </footer>
@@ -1961,14 +2218,30 @@ function formatPresetTarget(target: TerminalCommandPreset['target']): string {
 }
 
 .settings-dialog__shortcut {
-  display: grid;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
   gap: 6px;
   padding: 0.8rem 0;
   border-bottom: 1px solid rgba(108, 124, 148, 0.16);
 }
 
+.settings-dialog__shortcut--custom {
+  background: rgba(45, 124, 216, 0.04);
+}
+
+.settings-dialog__shortcut--conflict {
+  background: rgba(201, 87, 87, 0.08);
+}
+
 .settings-dialog__shortcut:first-child {
   border-top: 1px solid rgba(108, 124, 148, 0.16);
+}
+
+.settings-dialog__shortcut-copy {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
 }
 
 .settings-dialog__shortcut-label {
@@ -1976,15 +2249,44 @@ function formatPresetTarget(target: TerminalCommandPreset['target']): string {
   font-size: 0.84rem;
 }
 
-.settings-dialog__shortcut-keys {
-  justify-self: start;
-  padding: 0.18rem 0.45rem;
-  border: 1px solid rgba(108, 124, 148, 0.18);
-  border-radius: 8px;
-  background: var(--settings-key-bg);
-  color: var(--text-primary);
-  font-family: var(--font-mono);
+.settings-dialog__shortcut-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  color: var(--text-dim);
   font-size: 0.74rem;
+  line-height: 1.4;
+}
+
+.settings-dialog__shortcut-conflict {
+  color: #ffb5b5;
+}
+
+.settings-dialog__shortcut-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.settings-dialog__conflict-list {
+  display: grid;
+  gap: 6px;
+}
+
+.settings-dialog__hint-card--danger {
+  border-color: rgba(201, 87, 87, 0.34);
+  background: rgba(201, 87, 87, 0.08);
+}
+
+@media (max-width: 880px) {
+  .settings-dialog__shortcut {
+    display: grid;
+  }
+
+  .settings-dialog__shortcut-actions {
+    justify-content: flex-start;
+    flex-wrap: wrap;
+  }
 }
 
 .settings-dialog__empty,

@@ -9,6 +9,7 @@ import {
   cloneClipboardHistoryEntries,
   cloneDismissedWorktreePaths,
   cloneDockerDialogState,
+  cloneShortcutOverrides,
   cloneSeenInfoNoteRevisions,
   clonePanelLayoutsByWorkspace,
   cloneProjectTitlesByContext,
@@ -41,6 +42,7 @@ import {
   type ProjectSettingsFormData,
   type RepoPanelSectionState,
   type RecentRepoEntry,
+  type ShortcutOverrides,
   type TerminalCommandPreset,
   type WorktreeDetectionInterval,
   type WorkspaceEditorPaneLayout,
@@ -81,7 +83,13 @@ import {
   setClipboardHistoryEntries,
   syncClipboardHistoryFromSystem,
 } from './clipboard';
-import { SHORTCUTS, matchesCommandSlotShortcut, matchesShortcut } from './shortcuts';
+import {
+  SHORTCUTS,
+  applyShortcutOverrides,
+  matchesCommandSlotShortcut,
+  matchesShortcut,
+  shortcutBindingsRevision,
+} from './shortcuts';
 
 const CommitHistoryDialog = defineAsyncComponent(() => import('./components/CommitHistoryDialog.vue'));
 const DockerDialog = defineAsyncComponent(() => import('./components/DockerDialog.vue'));
@@ -126,6 +134,7 @@ const repoPanelFontSize = ref(DEFAULT_SESSION_DATA.repoPanelFontSize);
 const projectTitlesByContext = ref<Record<string, string>>({});
 const appAppearance = ref<AppAppearance>(DEFAULT_SESSION_DATA.appAppearance);
 const editorTheme = ref<EditorTheme>(DEFAULT_SESSION_DATA.editorTheme);
+const shortcutOverrides = ref<ShortcutOverrides>(cloneShortcutOverrides(DEFAULT_SESSION_DATA.shortcutOverrides));
 const workspaceIndicatorVisibility = ref<WorkspaceIndicatorVisibilitySettings>(
   cloneWorkspaceIndicatorVisibilitySettings(DEFAULT_SESSION_DATA.workspaceIndicatorVisibility),
 );
@@ -186,6 +195,7 @@ const repoToolbarBusyAction = ref<'pull' | 'push' | 'refresh' | null>(null);
 const repoOperationStatus = ref<string | null>(null);
 const revealInAllFilesPath = ref<string | null>(null);
 const revealInAllFilesToken = ref(0);
+const shortcutBindingsVersion = shortcutBindingsRevision;
 
 const runtimeInfo = window.bridgegit ?? {
   platform: 'unknown',
@@ -306,6 +316,7 @@ const resolvedEditorThemeVariant = computed(() => (
   resolveThemeVariant(resolvedEditorTheme.value)
 ));
 const collapsedPanels = computed(() => {
+  shortcutBindingsRevision.value;
   const panels: Array<{ id: PanelId; label: string; shortcut: string }> = [];
 
   if (sidebarCollapsed.value) {
@@ -1167,10 +1178,12 @@ function buildDefaultWorkspaceRepoPanelState(): WorkspaceRepoPanelState {
     historyOpen: false,
     workspaceDetailExpanded: true,
     workspaceFamilyFocus: false,
+    pinnedWorkspaceIds: [],
     files: {
       expanded: true,
       viewMode: 'list',
       showAll: false,
+      showHidden: false,
       collapsedSections: buildDefaultRepoPanelSectionState(),
       expandedDirectories: [],
     },
@@ -1347,6 +1360,7 @@ function buildSessionSavePayload(
     projectTitlesByContext: projectTitlesByContext.value,
     appAppearance: appAppearance.value,
     editorTheme: editorTheme.value,
+    shortcutOverrides: shortcutOverrides.value,
     workspaceIndicatorVisibility: workspaceIndicatorVisibility.value,
     workspaceTabDefaults: workspaceTabDefaults.value,
     worktreeDetectionIntervalMs: worktreeDetectionIntervalMs.value,
@@ -1447,6 +1461,49 @@ function captureWorkspaceRepoPanelState(nextWorkspaceId: string | null) {
   };
 }
 
+function areWorkspaceIdListsEqual(left: string[], right: string[]) {
+  if (left.length !== right.length) {
+    return false;
+  }
+
+  return left.every((workspaceId, index) => workspaceId === right[index]);
+}
+
+function syncGlobalWorkspaceRepoPanelFilters(
+  sourceWorkspaceId: string,
+  nextWorkspaceRepoPanelState: WorkspaceRepoPanelState,
+) {
+  const nextWorkspaceRepoPanelStates = Object.fromEntries(
+    Object.keys(workspaceDescriptors.value).map((workspaceId) => {
+      const baseWorkspaceRepoPanelState = cloneWorkspaceRepoPanelState(
+        workspaceRepoPanelStates.value[workspaceId]
+        ?? buildDefaultWorkspaceRepoPanelState(),
+      );
+
+      return [workspaceId, cloneWorkspaceRepoPanelState({
+        ...baseWorkspaceRepoPanelState,
+        workspaceFamilyFocus: nextWorkspaceRepoPanelState.workspaceFamilyFocus,
+        pinnedWorkspaceIds: [...nextWorkspaceRepoPanelState.pinnedWorkspaceIds],
+      })];
+    }),
+  );
+
+  nextWorkspaceRepoPanelStates[sourceWorkspaceId] = nextWorkspaceRepoPanelState;
+  workspaceRepoPanelStates.value = nextWorkspaceRepoPanelStates;
+}
+
+function removeWorkspaceIdFromRepoPanelPins(workspaceId: string) {
+  return Object.fromEntries(
+    Object.entries(workspaceRepoPanelStates.value).map(([entryWorkspaceId, workspaceRepoPanelState]) => [
+      entryWorkspaceId,
+      cloneWorkspaceRepoPanelState({
+        ...workspaceRepoPanelState,
+        pinnedWorkspaceIds: workspaceRepoPanelState.pinnedWorkspaceIds.filter((pinnedWorkspaceId) => pinnedWorkspaceId !== workspaceId),
+      }),
+    ]),
+  );
+}
+
 function shouldLoadDetailedGitStatus(repoPanelState: WorkspaceRepoPanelState): boolean {
   return repoPanelState.workspaceDetailExpanded
     && repoPanelState.files.expanded
@@ -1484,19 +1541,13 @@ async function updateCurrentWorkspaceRepoPanelState(nextRepoPanelState: Workspac
   const currentWorkspaceRepoPanelState = workspaceRepoPanelStates.value[currentWorkspaceId]
     ?? buildDefaultWorkspaceRepoPanelState();
   const focusModeChanged = currentWorkspaceRepoPanelState.workspaceFamilyFocus !== nextWorkspaceRepoPanelState.workspaceFamilyFocus;
+  const pinnedWorkspaceIdsChanged = !areWorkspaceIdListsEqual(
+    currentWorkspaceRepoPanelState.pinnedWorkspaceIds,
+    nextWorkspaceRepoPanelState.pinnedWorkspaceIds,
+  );
 
-  if (focusModeChanged) {
-    const nextWorkspaceRepoPanelStates = cloneWorkspaceRepoPanelStates(workspaceRepoPanelStates.value);
-
-    Object.keys(nextWorkspaceRepoPanelStates).forEach((workspaceId) => {
-      nextWorkspaceRepoPanelStates[workspaceId] = cloneWorkspaceRepoPanelState({
-        ...nextWorkspaceRepoPanelStates[workspaceId],
-        workspaceFamilyFocus: nextWorkspaceRepoPanelState.workspaceFamilyFocus,
-      });
-    });
-
-    nextWorkspaceRepoPanelStates[currentWorkspaceId] = nextWorkspaceRepoPanelState;
-    workspaceRepoPanelStates.value = nextWorkspaceRepoPanelStates;
+  if (focusModeChanged || pinnedWorkspaceIdsChanged) {
+    syncGlobalWorkspaceRepoPanelFilters(currentWorkspaceId, nextWorkspaceRepoPanelState);
   } else {
     workspaceRepoPanelStates.value = {
       ...workspaceRepoPanelStates.value,
@@ -1504,7 +1555,13 @@ async function updateCurrentWorkspaceRepoPanelState(nextRepoPanelState: Workspac
     };
   }
 
-  if (repoPath.value && shouldLoadDetailedGitStatus(nextRepoPanelState) && !status.value && !isLoading.value) {
+  if (
+    repoPath.value
+    && currentRepoIsGitRepository.value
+    && shouldLoadDetailedGitStatus(nextRepoPanelState)
+    && !status.value
+    && !isLoading.value
+  ) {
     void ensureFullStatus();
   }
 }
@@ -2295,6 +2352,10 @@ function markInfoNoteAsSeenWhenActive() {
   seenInfoNoteRevisions.value = [...seenInfoNoteRevisions.value, CURRENT_INFO_NOTE_REVISION];
 }
 
+function handleWorkspaceTabDefaultsChange(nextWorkspaceTabDefaults: WorkspaceTabDefaults) {
+  workspaceTabDefaults.value = cloneWorkspaceTabDefaults(nextWorkspaceTabDefaults);
+}
+
 async function handleSaveSettings(nextSettings: ProjectSettingsFormData) {
   const trimmedTitle = nextSettings.projectTitle.trim();
   const nextProjectTitlesByContext = repoPath.value
@@ -2325,6 +2386,8 @@ async function handleSaveSettings(nextSettings: ProjectSettingsFormData) {
   workspaceTabDefaults.value = cloneWorkspaceTabDefaults(nextSettings.workspaceTabDefaults);
   worktreeDetectionIntervalMs.value = nextSettings.worktreeDetectionIntervalMs;
   soundNotificationsEnabled.value = nextSettings.soundNotificationsEnabled;
+  shortcutOverrides.value = cloneShortcutOverrides(nextSettings.shortcutOverrides);
+  applyShortcutOverrides(shortcutOverrides.value);
   terminalCommandPresets.value = nextSettings.terminalCommandPresets;
 
   const savedSession = await saveSession({
@@ -2334,6 +2397,7 @@ async function handleSaveSettings(nextSettings: ProjectSettingsFormData) {
     projectTitlesByContext: nextProjectTitlesByContext,
     appAppearance: nextSettings.appAppearance,
     editorTheme: nextSettings.editorTheme,
+    shortcutOverrides: nextSettings.shortcutOverrides,
     workspaceIndicatorVisibility: nextSettings.workspaceIndicatorVisibility,
     workspaceTabDefaults: nextSettings.workspaceTabDefaults,
     worktreeDetectionIntervalMs: nextSettings.worktreeDetectionIntervalMs,
@@ -2352,6 +2416,8 @@ async function handleSaveSettings(nextSettings: ProjectSettingsFormData) {
   appAppearance.value = savedSession.appAppearance;
   editorTheme.value = savedSession.editorTheme;
   applyAppTheme(savedSession.appAppearance);
+  shortcutOverrides.value = cloneShortcutOverrides(savedSession.shortcutOverrides);
+  applyShortcutOverrides(shortcutOverrides.value);
   workspaceIndicatorVisibility.value = cloneWorkspaceIndicatorVisibilitySettings(savedSession.workspaceIndicatorVisibility);
   workspaceTabDefaults.value = cloneWorkspaceTabDefaults(savedSession.workspaceTabDefaults);
   worktreeDetectionIntervalMs.value = savedSession.worktreeDetectionIntervalMs;
@@ -2500,7 +2566,7 @@ async function handleRemoveWorkspace(workspaceId: string) {
   const nextWorkspaceOrder = workspaceOrder.value.filter((entryWorkspaceId) => entryWorkspaceId !== workspaceId);
   const nextWorkspaceSessions = omitRecordEntry(workspaceSessions.value, workspaceId);
   const nextPanelLayoutsByWorkspace = omitRecordEntry(panelLayoutsByWorkspace.value, workspaceId);
-  const nextWorkspaceRepoPanelStates = omitRecordEntry(workspaceRepoPanelStates.value, workspaceId);
+  const nextWorkspaceRepoPanelStates = omitRecordEntry(removeWorkspaceIdFromRepoPanelPins(workspaceId), workspaceId);
   const nextWorkspaceGitSummaryById = omitRecordEntry(workspaceGitSummaryById.value, workspaceId);
   const nextWorkspaceRecentActivityByWorkspaceId = omitRecordEntry(workspaceRecentActivityByWorkspaceId.value, workspaceId);
   const nextWorkspaceAttentionByWorkspaceId = omitRecordEntry(workspaceAttentionByWorkspaceId.value, workspaceId);
@@ -2967,6 +3033,10 @@ async function handleUpdateHistoryCommitMessage(payload: { commitHash: string; m
 }
 
 function handleGlobalKeydown(event: KeyboardEvent) {
+  if (isSettingsOpen.value) {
+    return;
+  }
+
   const isReplaceInFilesShortcut = matchesShortcut(event, SHORTCUTS.workspaceReplaceInFiles);
   const isClipboardHistoryShortcut = matchesShortcut(event, SHORTCUTS.clipboardHistoryOpen);
 
@@ -2997,11 +3067,6 @@ function handleGlobalKeydown(event: KeyboardEvent) {
       return;
     }
 
-    if (isSettingsOpen.value) {
-      event.preventDefault();
-      isSettingsOpen.value = false;
-      return;
-    }
   }
 
   if (isDockerDialogOpen.value) {
@@ -3568,7 +3633,7 @@ watch(repoPath, () => {
   scheduleSessionSave();
 });
 
-watch([recentRepos, workspaceOrder, appAppearance, editorTheme, workspaceIndicatorVisibility, workspaceTabDefaults, soundNotificationsEnabled, terminalCommandPresets, dockerDialogState, workspaceTabs, workspaceEditorPaneLayout, workspaceMultiDisplayTabIds, activeWorkspaceTabId, workspaceRepoPanelStates], () => {
+watch([recentRepos, workspaceOrder, appAppearance, editorTheme, shortcutOverrides, workspaceIndicatorVisibility, workspaceTabDefaults, soundNotificationsEnabled, terminalCommandPresets, dockerDialogState, workspaceTabs, workspaceEditorPaneLayout, workspaceMultiDisplayTabIds, activeWorkspaceTabId, workspaceRepoPanelStates], () => {
   if (canPersistSession()) {
     captureWorkspaceSession(getCurrentWorkspaceId());
   }
@@ -3693,6 +3758,8 @@ onMounted(async () => {
   appAppearance.value = initialSession.appAppearance;
   editorTheme.value = initialSession.editorTheme;
   applyAppTheme(initialSession.appAppearance);
+  shortcutOverrides.value = cloneShortcutOverrides(initialSession.shortcutOverrides);
+  applyShortcutOverrides(shortcutOverrides.value);
   workspaceIndicatorVisibility.value = cloneWorkspaceIndicatorVisibilitySettings(initialSession.workspaceIndicatorVisibility);
   workspaceTabDefaults.value = cloneWorkspaceTabDefaults(initialSession.workspaceTabDefaults);
   worktreeDetectionIntervalMs.value = initialSession.worktreeDetectionIntervalMs;
@@ -3816,7 +3883,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="app" :style="appStyle">
+  <div class="app" :data-shortcut-bindings-version="shortcutBindingsVersion" :style="appStyle">
     <div ref="shellRef" class="app__shell">
       <aside v-if="!sidebarCollapsed" class="app__sidebar">
         <RepoPanel
@@ -3958,6 +4025,7 @@ onBeforeUnmount(() => {
             :can-collapse="canCollapseTerminal"
             :collapse-shortcut-display="SHORTCUTS.panelTerminalToggle.display"
             :collapsed="terminalCollapsed"
+            @update:workspace-tab-defaults="handleWorkspaceTabDefaultsChange"
             @update:tabs="handleWorkspaceTabsUpdate"
             @update:editor-pane-layout="handleWorkspaceEditorPaneLayoutUpdate"
             @update:multi-display-tab-ids="handleWorkspaceMultiDisplayTabIdsUpdate"
@@ -4006,6 +4074,7 @@ onBeforeUnmount(() => {
       :diff-placement="diffPlacement"
       :app-appearance="appAppearance"
       :editor-theme="editorTheme"
+      :shortcut-overrides="shortcutOverrides"
       :workspace-panel-font-size="repoPanelFontSize"
       :workspace-indicator-visibility="workspaceIndicatorVisibility"
       :workspace-tab-defaults="workspaceTabDefaults"

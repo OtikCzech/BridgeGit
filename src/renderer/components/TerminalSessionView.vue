@@ -38,6 +38,7 @@ const emit = defineEmits<{
   activity: [];
   attention: [];
   activate: [];
+  exit: [exitCode: number];
   input: [data: string];
   'open-navigation-target': [target: CodeNavigationTarget];
   'update:font-size': [fontSize: number];
@@ -690,7 +691,6 @@ async function writeClipboard(text: string) {
 async function pasteTextFromClipboard(eventText?: string | null) {
   const resolvedText = await readSharedClipboardText({
     eventText,
-    preferPreviousDistinctOf: normalizeCopiedTerminalSelection(terminal?.getSelection() ?? ''),
   });
 
   if (!resolvedText) {
@@ -1186,6 +1186,7 @@ onMounted(async () => {
     onExit: ({ exitCode: code }) => {
       rejectPromptWaiters(`Terminal session exited with code ${code}.`);
       writeStatusLine(`[process exited with code ${code}]`);
+      emit('exit', code);
     },
   });
 

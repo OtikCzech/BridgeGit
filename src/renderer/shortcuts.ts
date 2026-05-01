@@ -1,8 +1,12 @@
+import { ref } from 'vue';
+import type { ShortcutOverride, ShortcutOverrides } from '../shared/bridgegit';
+
 export interface ShortcutDefinition {
   id: string;
   label: string;
   display: string;
   key: string;
+  scope?: string;
   keys?: string[];
   codes?: string[];
   alt?: boolean;
@@ -17,19 +21,34 @@ export interface ShortcutGroupDefinition {
   shortcuts: ShortcutDefinition[];
 }
 
-export const SHORTCUTS = {
+export interface ShortcutConflict {
+  signature: string;
+  shortcuts: ShortcutDefinition[];
+}
+
+const SHORTCUT_SCOPE_GLOBAL = 'global';
+const SHORTCUT_SCOPE_HISTORY = 'history-dialog';
+const SHORTCUT_SCOPE_CREATION_MENU = 'creation-menu';
+const SHORTCUT_SCOPE_NOTE = 'note-tab';
+const SHORTCUT_SCOPE_CODE = 'code-tab';
+const SHORTCUT_SCOPE_DIFF = 'diff-panel';
+const SHORTCUT_SCOPE_REPO_PANEL = 'repo-panel';
+
+const DEFAULT_SHORTCUTS = {
   historyOpen: {
     id: 'history-open',
     label: 'Open git history',
     display: '[Ctrl+H]',
     key: 'h',
+    scope: SHORTCUT_SCOPE_GLOBAL,
     ctrlOrMeta: true,
   },
   historySearch: {
     id: 'history-search',
-    label: 'History search',
+    label: 'Search in history dialog',
     display: '[Ctrl+Shift+F]',
     key: 'f',
+    scope: SHORTCUT_SCOPE_HISTORY,
     shift: true,
     ctrlOrMeta: true,
   },
@@ -38,6 +57,7 @@ export const SHORTCUTS = {
     label: 'Toggle repository panel',
     display: '[Ctrl+1]',
     key: '1',
+    scope: SHORTCUT_SCOPE_GLOBAL,
     keys: ['+', '1'],
     codes: ['Digit1'],
     ctrlOrMeta: true,
@@ -48,6 +68,7 @@ export const SHORTCUTS = {
     label: 'Toggle diff panel',
     display: '[Ctrl+2]',
     key: '2',
+    scope: SHORTCUT_SCOPE_GLOBAL,
     keys: ['ě', '2'],
     codes: ['Digit2'],
     ctrlOrMeta: true,
@@ -58,6 +79,7 @@ export const SHORTCUTS = {
     label: 'Toggle workspace panel',
     display: '[Ctrl+3]',
     key: '3',
+    scope: SHORTCUT_SCOPE_GLOBAL,
     keys: ['š', '3'],
     codes: ['Digit3'],
     ctrlOrMeta: true,
@@ -68,6 +90,7 @@ export const SHORTCUTS = {
     label: 'Open Docker dialog',
     display: '[Ctrl+Shift+D]',
     key: 'd',
+    scope: SHORTCUT_SCOPE_GLOBAL,
     shift: true,
     ctrlOrMeta: true,
   },
@@ -76,12 +99,14 @@ export const SHORTCUTS = {
     label: 'Open settings',
     display: '[F1]',
     key: 'F1',
+    scope: SHORTCUT_SCOPE_GLOBAL,
   },
   diffPrevious: {
     id: 'diff-previous',
     label: 'Previous diff',
     display: '[Alt+Up]',
     key: 'ArrowUp',
+    scope: SHORTCUT_SCOPE_DIFF,
     alt: true,
   },
   diffNext: {
@@ -89,6 +114,7 @@ export const SHORTCUTS = {
     label: 'Next diff',
     display: '[Alt+Down]',
     key: 'ArrowDown',
+    scope: SHORTCUT_SCOPE_DIFF,
     alt: true,
   },
   diffStageAndContinue: {
@@ -96,6 +122,7 @@ export const SHORTCUTS = {
     label: 'Stage current and continue',
     display: '[Alt+Enter]',
     key: 'Enter',
+    scope: SHORTCUT_SCOPE_DIFF,
     alt: true,
   },
   workspaceNewTabMenu: {
@@ -103,31 +130,36 @@ export const SHORTCUTS = {
     label: 'Open new tab menu',
     display: '[Ctrl+N]',
     key: 'n',
+    scope: SHORTCUT_SCOPE_GLOBAL,
     ctrlOrMeta: true,
   },
   terminalNewTab: {
     id: 'terminal-new-tab',
     label: 'New shell tab',
     display: '[Ctrl+N, S]',
-    key: 'n',
+    key: 's',
+    scope: SHORTCUT_SCOPE_CREATION_MENU,
   },
   workspaceNoteTab: {
     id: 'workspace-note-tab',
     label: 'New notes tab',
     display: '[Ctrl+N, N]',
     key: 'n',
+    scope: SHORTCUT_SCOPE_CREATION_MENU,
   },
   workspaceOpenFile: {
     id: 'workspace-open-file',
     label: 'Open file',
     display: '[Ctrl+N, O]',
     key: 'o',
+    scope: SHORTCUT_SCOPE_CREATION_MENU,
   },
   workspaceAllTabs: {
     id: 'workspace-all-tabs',
     label: 'Open all tabs list',
     display: '[Ctrl+E]',
     key: 'e',
+    scope: SHORTCUT_SCOPE_GLOBAL,
     ctrlOrMeta: true,
   },
   workspaceQuickOpen: {
@@ -135,6 +167,15 @@ export const SHORTCUTS = {
     label: 'Quick open file',
     display: '[Ctrl+P]',
     key: 'p',
+    scope: SHORTCUT_SCOPE_GLOBAL,
+    ctrlOrMeta: true,
+  },
+  repoPanelFilesFilterFocus: {
+    id: 'repo-panel-files-filter-focus',
+    label: 'Focus repository file filter',
+    display: '[Ctrl+F]',
+    key: 'f',
+    scope: SHORTCUT_SCOPE_REPO_PANEL,
     ctrlOrMeta: true,
   },
   workspaceFindInFiles: {
@@ -142,6 +183,7 @@ export const SHORTCUTS = {
     label: 'Find in files',
     display: '[Ctrl+Shift+F]',
     key: 'f',
+    scope: SHORTCUT_SCOPE_GLOBAL,
     shift: true,
     ctrlOrMeta: true,
   },
@@ -150,6 +192,7 @@ export const SHORTCUTS = {
     label: 'Replace in files',
     display: '[Ctrl+Shift+R]',
     key: 'r',
+    scope: SHORTCUT_SCOPE_GLOBAL,
     shift: true,
     ctrlOrMeta: true,
   },
@@ -158,6 +201,7 @@ export const SHORTCUTS = {
     label: 'Open clipboard history',
     display: '[Ctrl+Shift+H]',
     key: 'h',
+    scope: SHORTCUT_SCOPE_GLOBAL,
     shift: true,
     ctrlOrMeta: true,
   },
@@ -166,6 +210,7 @@ export const SHORTCUTS = {
     label: 'Reveal active file in All files',
     display: '[Ctrl+Alt+R]',
     key: 'r',
+    scope: SHORTCUT_SCOPE_GLOBAL,
     alt: true,
     ctrlOrMeta: true,
   },
@@ -174,6 +219,7 @@ export const SHORTCUTS = {
     label: 'Split or focus editor pane left',
     display: '[Ctrl+Alt+Left]',
     key: 'ArrowLeft',
+    scope: SHORTCUT_SCOPE_GLOBAL,
     alt: true,
     ctrlOrMeta: true,
   },
@@ -182,6 +228,7 @@ export const SHORTCUTS = {
     label: 'Split or focus editor pane right',
     display: '[Ctrl+Alt+Right]',
     key: 'ArrowRight',
+    scope: SHORTCUT_SCOPE_GLOBAL,
     alt: true,
     ctrlOrMeta: true,
   },
@@ -190,6 +237,7 @@ export const SHORTCUTS = {
     label: 'Split or focus editor pane up',
     display: '[Ctrl+Alt+Up]',
     key: 'ArrowUp',
+    scope: SHORTCUT_SCOPE_GLOBAL,
     alt: true,
     ctrlOrMeta: true,
   },
@@ -198,6 +246,7 @@ export const SHORTCUTS = {
     label: 'Split or focus editor pane down',
     display: '[Ctrl+Alt+Down]',
     key: 'ArrowDown',
+    scope: SHORTCUT_SCOPE_GLOBAL,
     alt: true,
     ctrlOrMeta: true,
   },
@@ -206,6 +255,7 @@ export const SHORTCUTS = {
     label: 'Close editor pane into left pane',
     display: '[Ctrl+Alt+Shift+Left]',
     key: 'ArrowLeft',
+    scope: SHORTCUT_SCOPE_GLOBAL,
     alt: true,
     shift: true,
     ctrlOrMeta: true,
@@ -215,6 +265,7 @@ export const SHORTCUTS = {
     label: 'Close editor pane into right pane',
     display: '[Ctrl+Alt+Shift+Right]',
     key: 'ArrowRight',
+    scope: SHORTCUT_SCOPE_GLOBAL,
     alt: true,
     shift: true,
     ctrlOrMeta: true,
@@ -224,6 +275,7 @@ export const SHORTCUTS = {
     label: 'Close editor pane into upper pane',
     display: '[Ctrl+Alt+Shift+Up]',
     key: 'ArrowUp',
+    scope: SHORTCUT_SCOPE_GLOBAL,
     alt: true,
     shift: true,
     ctrlOrMeta: true,
@@ -233,6 +285,7 @@ export const SHORTCUTS = {
     label: 'Close editor pane into lower pane',
     display: '[Ctrl+Alt+Shift+Down]',
     key: 'ArrowDown',
+    scope: SHORTCUT_SCOPE_GLOBAL,
     alt: true,
     shift: true,
     ctrlOrMeta: true,
@@ -242,6 +295,7 @@ export const SHORTCUTS = {
     label: 'Previous notes view mode',
     display: '[Alt+PgUp]',
     key: 'PageUp',
+    scope: SHORTCUT_SCOPE_NOTE,
     alt: true,
   },
   noteViewNext: {
@@ -249,6 +303,7 @@ export const SHORTCUTS = {
     label: 'Next notes view mode',
     display: '[Alt+PgDn]',
     key: 'PageDown',
+    scope: SHORTCUT_SCOPE_NOTE,
     alt: true,
   },
   noteSearch: {
@@ -256,6 +311,7 @@ export const SHORTCUTS = {
     label: 'Find in note',
     display: '[Ctrl+F]',
     key: 'f',
+    scope: SHORTCUT_SCOPE_NOTE,
     ctrlOrMeta: true,
   },
   codeFindReferences: {
@@ -263,6 +319,7 @@ export const SHORTCUTS = {
     label: 'Find references',
     display: '[Shift+F12]',
     key: 'F12',
+    scope: SHORTCUT_SCOPE_CODE,
     shift: true,
   },
   terminalCloseTab: {
@@ -270,6 +327,7 @@ export const SHORTCUTS = {
     label: 'Close active shell tab',
     display: '[Ctrl+F4]',
     key: 'F4',
+    scope: SHORTCUT_SCOPE_GLOBAL,
     ctrlOrMeta: true,
   },
   terminalPreviousTab: {
@@ -277,6 +335,7 @@ export const SHORTCUTS = {
     label: 'Previous shell tab',
     display: '[Ctrl+PgUp]',
     key: 'PageUp',
+    scope: SHORTCUT_SCOPE_GLOBAL,
     ctrlOrMeta: true,
   },
   terminalNextTab: {
@@ -284,6 +343,7 @@ export const SHORTCUTS = {
     label: 'Next shell tab',
     display: '[Ctrl+PgDn]',
     key: 'PageDown',
+    scope: SHORTCUT_SCOPE_GLOBAL,
     ctrlOrMeta: true,
   },
   commitOpenDiff: {
@@ -291,135 +351,298 @@ export const SHORTCUTS = {
     label: 'Open selected commit diff',
     display: '[Ctrl+Enter]',
     key: 'Enter',
+    scope: SHORTCUT_SCOPE_HISTORY,
     ctrlOrMeta: true,
   },
 } satisfies Record<string, ShortcutDefinition>;
 
-export const SETTINGS_SHORTCUT_GROUPS: ShortcutGroupDefinition[] = [
+type ShortcutRegistry = typeof DEFAULT_SHORTCUTS;
+type ShortcutRegistryKey = keyof ShortcutRegistry;
+
+const SHORTCUT_GROUP_BLUEPRINTS: Array<{ id: string; label: string; shortcuts: ShortcutRegistryKey[] }> = [
   {
     id: 'panel-toggles',
     label: 'Panels',
-    shortcuts: [
-      SHORTCUTS.panelRepoToggle,
-      SHORTCUTS.panelDiffToggle,
-      SHORTCUTS.panelTerminalToggle,
-    ],
+    shortcuts: ['panelRepoToggle', 'panelDiffToggle', 'panelTerminalToggle'],
   },
   {
     id: 'dialogs',
     label: 'Dialogs',
-    shortcuts: [
-      SHORTCUTS.settingsOpen,
-      SHORTCUTS.dockerDialogOpen,
-      SHORTCUTS.historyOpen,
-    ],
+    shortcuts: ['settingsOpen', 'dockerDialogOpen', 'historyOpen'],
   },
   {
     id: 'workspace',
     label: 'Workspace',
     shortcuts: [
-      SHORTCUTS.workspaceNewTabMenu,
-      SHORTCUTS.terminalNewTab,
-      SHORTCUTS.workspaceNoteTab,
-      SHORTCUTS.workspaceOpenFile,
-      SHORTCUTS.workspaceQuickOpen,
-      SHORTCUTS.workspaceAllTabs,
-      SHORTCUTS.terminalCloseTab,
-      SHORTCUTS.terminalPreviousTab,
-      SHORTCUTS.terminalNextTab,
-      SHORTCUTS.workspaceFindInFiles,
-      SHORTCUTS.workspaceReplaceInFiles,
-      SHORTCUTS.clipboardHistoryOpen,
-      SHORTCUTS.workspaceRevealInAllFiles,
+      'workspaceNewTabMenu',
+      'terminalNewTab',
+      'workspaceNoteTab',
+      'workspaceOpenFile',
+      'workspaceQuickOpen',
+      'repoPanelFilesFilterFocus',
+      'workspaceAllTabs',
+      'terminalCloseTab',
+      'terminalPreviousTab',
+      'terminalNextTab',
+      'workspaceFindInFiles',
+      'workspaceReplaceInFiles',
+      'clipboardHistoryOpen',
+      'workspaceRevealInAllFiles',
     ],
   },
   {
     id: 'editor-panes',
     label: 'Editor panes',
     shortcuts: [
-      SHORTCUTS.editorPaneSplitLeft,
-      SHORTCUTS.editorPaneSplitRight,
-      SHORTCUTS.editorPaneSplitUp,
-      SHORTCUTS.editorPaneSplitDown,
-      SHORTCUTS.editorPaneCloseLeft,
-      SHORTCUTS.editorPaneCloseRight,
-      SHORTCUTS.editorPaneCloseUp,
-      SHORTCUTS.editorPaneCloseDown,
+      'editorPaneSplitLeft',
+      'editorPaneSplitRight',
+      'editorPaneSplitUp',
+      'editorPaneSplitDown',
+      'editorPaneCloseLeft',
+      'editorPaneCloseRight',
+      'editorPaneCloseUp',
+      'editorPaneCloseDown',
     ],
   },
   {
     id: 'code',
     label: 'Code editor',
-    shortcuts: [
-      SHORTCUTS.codeFindReferences,
-    ],
+    shortcuts: ['codeFindReferences'],
   },
   {
     id: 'notes',
     label: 'Notes',
-    shortcuts: [
-      SHORTCUTS.noteSearch,
-      SHORTCUTS.noteViewPrevious,
-      SHORTCUTS.noteViewNext,
-    ],
+    shortcuts: ['noteSearch', 'noteViewPrevious', 'noteViewNext'],
   },
   {
     id: 'git-history',
     label: 'Git history',
-    shortcuts: [
-      SHORTCUTS.historySearch,
-      SHORTCUTS.commitOpenDiff,
-    ],
+    shortcuts: ['historySearch', 'commitOpenDiff'],
   },
   {
     id: 'diff-navigation',
     label: 'Diff navigation',
-    shortcuts: [
-      SHORTCUTS.diffPrevious,
-      SHORTCUTS.diffNext,
-      SHORTCUTS.diffStageAndContinue,
-    ],
+    shortcuts: ['diffPrevious', 'diffNext', 'diffStageAndContinue'],
   },
-] satisfies ShortcutGroupDefinition[];
-
-export const SETTINGS_SHORTCUTS: ShortcutDefinition[] = [
-  SHORTCUTS.panelRepoToggle,
-  SHORTCUTS.panelDiffToggle,
-  SHORTCUTS.panelTerminalToggle,
-  SHORTCUTS.settingsOpen,
-  SHORTCUTS.dockerDialogOpen,
-  SHORTCUTS.historyOpen,
-  SHORTCUTS.workspaceNewTabMenu,
-  SHORTCUTS.terminalNewTab,
-  SHORTCUTS.workspaceNoteTab,
-  SHORTCUTS.workspaceOpenFile,
-  SHORTCUTS.workspaceQuickOpen,
-  SHORTCUTS.workspaceAllTabs,
-  SHORTCUTS.terminalCloseTab,
-  SHORTCUTS.terminalPreviousTab,
-  SHORTCUTS.terminalNextTab,
-  SHORTCUTS.workspaceFindInFiles,
-  SHORTCUTS.workspaceReplaceInFiles,
-  SHORTCUTS.clipboardHistoryOpen,
-  SHORTCUTS.workspaceRevealInAllFiles,
-  SHORTCUTS.editorPaneSplitLeft,
-  SHORTCUTS.editorPaneSplitRight,
-  SHORTCUTS.editorPaneSplitUp,
-  SHORTCUTS.editorPaneSplitDown,
-  SHORTCUTS.editorPaneCloseLeft,
-  SHORTCUTS.editorPaneCloseRight,
-  SHORTCUTS.editorPaneCloseUp,
-  SHORTCUTS.editorPaneCloseDown,
-  SHORTCUTS.codeFindReferences,
-  SHORTCUTS.noteSearch,
-  SHORTCUTS.noteViewPrevious,
-  SHORTCUTS.noteViewNext,
-  SHORTCUTS.historySearch,
-  SHORTCUTS.commitOpenDiff,
-  SHORTCUTS.diffPrevious,
-  SHORTCUTS.diffNext,
-  SHORTCUTS.diffStageAndContinue,
 ];
+
+const MODIFIER_KEYS = new Set(['Alt', 'AltGraph', 'Control', 'Meta', 'Shift']);
+const KEY_DISPLAY_LABELS: Record<string, string> = {
+  ' ': 'Space',
+  ArrowDown: 'Down',
+  ArrowLeft: 'Left',
+  ArrowRight: 'Right',
+  ArrowUp: 'Up',
+  Escape: 'Esc',
+  PageDown: 'PgDn',
+  PageUp: 'PgUp',
+};
+
+const DEFAULT_SHORTCUTS_BY_ID = new Map(
+  Object.values(DEFAULT_SHORTCUTS).map((shortcut) => [shortcut.id, shortcut] as const),
+);
+
+function cloneShortcutDefinition(shortcut: ShortcutDefinition): ShortcutDefinition {
+  return {
+    ...shortcut,
+    keys: shortcut.keys ? [...shortcut.keys] : undefined,
+    codes: shortcut.codes ? [...shortcut.codes] : undefined,
+  };
+}
+
+function cloneShortcutRegistry(shortcuts: ShortcutRegistry): ShortcutRegistry {
+  return Object.fromEntries(
+    Object.entries(shortcuts).map(([shortcutKey, shortcut]) => [shortcutKey, cloneShortcutDefinition(shortcut)]),
+  ) as ShortcutRegistry;
+}
+
+function mutateShortcutDefinition(target: ShortcutDefinition, source: ShortcutDefinition) {
+  target.id = source.id;
+  target.label = source.label;
+  target.display = source.display;
+  target.key = source.key;
+  target.scope = source.scope;
+  target.keys = source.keys ? [...source.keys] : undefined;
+  target.codes = source.codes ? [...source.codes] : undefined;
+  target.alt = source.alt;
+  target.shift = source.shift;
+  target.ctrlOrMeta = source.ctrlOrMeta;
+  target.ignoreShift = source.ignoreShift;
+}
+
+function resolveShortcutOverride(shortcut: ShortcutDefinition, override?: ShortcutOverride): ShortcutDefinition {
+  if (!override) {
+    return cloneShortcutDefinition(shortcut);
+  }
+
+  return {
+    ...cloneShortcutDefinition(shortcut),
+    display: override.display.trim() || shortcut.display,
+    key: override.key,
+    keys: undefined,
+    codes: override.code ? [override.code] : undefined,
+    alt: override.alt,
+    shift: override.shift,
+    ctrlOrMeta: override.ctrlOrMeta,
+    ignoreShift: false,
+  };
+}
+
+function createShortcutRegistry(overrides: ShortcutOverrides = {}): ShortcutRegistry {
+  return Object.fromEntries(
+    Object.entries(DEFAULT_SHORTCUTS).map(([shortcutKey, shortcut]) => [
+      shortcutKey,
+      resolveShortcutOverride(shortcut, overrides[shortcut.id]),
+    ]),
+  ) as ShortcutRegistry;
+}
+
+function buildShortcutGroupsFromRegistry(shortcuts: ShortcutRegistry): ShortcutGroupDefinition[] {
+  return SHORTCUT_GROUP_BLUEPRINTS.map((group) => ({
+    id: group.id,
+    label: group.label,
+    shortcuts: group.shortcuts.map((shortcutKey) => shortcuts[shortcutKey]),
+  }));
+}
+
+function formatShortcutKeyLabel(key: string): string {
+  if (KEY_DISPLAY_LABELS[key]) {
+    return KEY_DISPLAY_LABELS[key];
+  }
+
+  return key.length === 1 ? key.toLocaleUpperCase() : key;
+}
+
+function buildShortcutDisplayFromEvent(event: KeyboardEvent): string {
+  const parts: string[] = [];
+
+  if (event.ctrlKey || event.metaKey) {
+    parts.push('Ctrl');
+  }
+
+  if (event.altKey) {
+    parts.push('Alt');
+  }
+
+  if (event.shiftKey) {
+    parts.push('Shift');
+  }
+
+  parts.push(formatShortcutKeyLabel(event.key));
+
+  return `[${parts.join('+')}]`;
+}
+
+function collectShortcutBindingSignatures(shortcut: ShortcutDefinition): string[] {
+  const signatures = new Set<string>();
+  const scopeSignature = shortcut.scope ?? SHORTCUT_SCOPE_GLOBAL;
+  const shiftVariants = shortcut.shift === undefined
+    ? (shortcut.ignoreShift ? ['noshift', 'shift'] : ['noshift'])
+    : [shortcut.shift ? 'shift' : 'noshift'];
+
+  for (const shiftVariant of shiftVariants) {
+    const modifierSignature = [
+      `scope:${scopeSignature}`,
+      shortcut.ctrlOrMeta ? 'ctrlmeta' : 'plain',
+      shortcut.alt ? 'alt' : 'noalt',
+      shiftVariant,
+    ].join('|');
+
+    for (const key of [shortcut.key, ...(shortcut.keys ?? [])]) {
+      signatures.add(`${modifierSignature}|key:${key.toLocaleLowerCase()}`);
+    }
+
+    for (const code of shortcut.codes ?? []) {
+      signatures.add(`${modifierSignature}|code:${code}`);
+    }
+  }
+
+  return [...signatures];
+}
+
+export const SHORTCUTS: ShortcutRegistry = cloneShortcutRegistry(DEFAULT_SHORTCUTS);
+export const shortcutBindingsRevision = ref(0);
+
+export const SETTINGS_SHORTCUT_GROUPS: ShortcutGroupDefinition[] = buildShortcutGroupsFromRegistry(SHORTCUTS);
+export const SETTINGS_SHORTCUTS: ShortcutDefinition[] = SETTINGS_SHORTCUT_GROUPS.flatMap((group) => group.shortcuts);
+
+export function getDefaultShortcutDefinition(shortcutId: string): ShortcutDefinition | null {
+  const shortcut = DEFAULT_SHORTCUTS_BY_ID.get(shortcutId);
+  return shortcut ? cloneShortcutDefinition(shortcut) : null;
+}
+
+export function getResolvedShortcutDefinition(
+  shortcutId: string,
+  overrides: ShortcutOverrides = {},
+): ShortcutDefinition | null {
+  const shortcut = DEFAULT_SHORTCUTS_BY_ID.get(shortcutId);
+  return shortcut ? resolveShortcutOverride(shortcut, overrides[shortcutId]) : null;
+}
+
+export function buildSettingsShortcutGroups(overrides: ShortcutOverrides = {}): ShortcutGroupDefinition[] {
+  return buildShortcutGroupsFromRegistry(createShortcutRegistry(overrides));
+}
+
+export function findShortcutConflicts(overrides: ShortcutOverrides = {}): ShortcutConflict[] {
+  const shortcuts = buildSettingsShortcutGroups(overrides).flatMap((group) => group.shortcuts);
+  const shortcutsBySignature = new Map<string, ShortcutDefinition[]>();
+
+  for (const shortcut of shortcuts) {
+    for (const signature of collectShortcutBindingSignatures(shortcut)) {
+      const currentShortcuts = shortcutsBySignature.get(signature) ?? [];
+      currentShortcuts.push(shortcut);
+      shortcutsBySignature.set(signature, currentShortcuts);
+    }
+  }
+
+  return [...shortcutsBySignature.entries()]
+    .map(([signature, groupedShortcuts]) => ({
+      signature,
+      shortcuts: groupedShortcuts,
+    }))
+    .filter((conflict) => {
+      const uniqueShortcutIds = new Set(conflict.shortcuts.map((shortcut) => shortcut.id));
+      return uniqueShortcutIds.size > 1;
+    });
+}
+
+export function captureShortcutOverride(event: KeyboardEvent): ShortcutOverride | null {
+  if (MODIFIER_KEYS.has(event.key)) {
+    return null;
+  }
+
+  return {
+    key: event.key,
+    code: event.code && event.code !== 'Unidentified' ? event.code : undefined,
+    display: buildShortcutDisplayFromEvent(event),
+    alt: event.altKey || undefined,
+    shift: event.shiftKey || undefined,
+    ctrlOrMeta: (event.ctrlKey || event.metaKey) || undefined,
+  };
+}
+
+export function isShortcutOverrideRedundant(shortcutId: string, override: ShortcutOverride): boolean {
+  const defaultShortcut = DEFAULT_SHORTCUTS_BY_ID.get(shortcutId);
+
+  if (!defaultShortcut) {
+    return false;
+  }
+
+  const overrideShortcut = resolveShortcutOverride(defaultShortcut, override);
+  const defaultSignatures = new Set(collectShortcutBindingSignatures(defaultShortcut));
+
+  return collectShortcutBindingSignatures(overrideShortcut).every((signature) => defaultSignatures.has(signature));
+}
+
+export function applyShortcutOverrides(overrides: ShortcutOverrides = {}) {
+  const resolvedShortcuts = createShortcutRegistry(overrides);
+
+  for (const shortcutKey of Object.keys(SHORTCUTS) as ShortcutRegistryKey[]) {
+    mutateShortcutDefinition(SHORTCUTS[shortcutKey], resolvedShortcuts[shortcutKey]);
+  }
+
+  shortcutBindingsRevision.value += 1;
+}
 
 export function formatCommandSlotShortcut(slot: number | null): string {
   return slot ? `[Ctrl+Alt+${slot}]` : '';

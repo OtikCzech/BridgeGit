@@ -36,7 +36,8 @@ import {
   resolveWorkspaceFileTabType,
 } from '../../shared/bridgegit';
 import { useColumnSplitter } from '../composables/useColumnSplitter';
-import { SHORTCUTS, formatCommandSlotShortcut } from '../shortcuts';
+import { useTerminal } from '../composables/useTerminal';
+import { SHORTCUTS, formatCommandSlotShortcut, shortcutBindingsRevision } from '../shortcuts';
 import { playNotificationBeep } from '../utils/notification-audio';
 import AppConfirmDialog from './AppConfirmDialog.vue';
 import NoteTabView from './NoteTabView.vue';
@@ -72,6 +73,7 @@ interface Props {
 }
 
 const props = defineProps<Props>();
+const shortcutBindingsVersion = shortcutBindingsRevision;
 const CREATION_MENU_ACTION_ORDER = ['shell', 'note', 'open-file'] as const;
 type FindInFilesMode = 'find' | 'replace';
 type CreationMenuActionId = (typeof CREATION_MENU_ACTION_ORDER)[number];
@@ -89,6 +91,7 @@ const emit = defineEmits<{
   'update:editor-pane-layout': [editorPaneLayout: WorkspaceEditorPaneLayout];
   'update:multi-display-tab-ids': [multiDisplayTabIds: string[]];
   'update:active-tab-id': [activeTabId: string | null];
+  'update:workspace-tab-defaults': [workspaceTabDefaults: WorkspaceTabDefaults];
   'update:recent-activity': [payload: { workspaceId: string; recentActivity: Record<string, boolean> }];
   'update:attention': [payload: { workspaceId: string; attention: Record<string, boolean> }];
   'reveal-in-all-files': [filePath: string];
@@ -156,6 +159,7 @@ const tabAttention = ref<Record<string, boolean>>({});
 const tabLastInputAt = ref<Record<string, number>>({});
 const tabLastTypingAt = ref<Record<string, number>>({});
 const tabLastSubmitAt = ref<Record<string, number>>({});
+const tabPendingCommandAt = ref<Record<string, number>>({});
 const interactedShellTabs = ref<Record<string, boolean>>({});
 const startedShellTabs = ref<Record<string, boolean>>({});
 const draggedTabId = ref<string | null>(null);
@@ -168,8 +172,10 @@ type PendingCloseDialogState = {
   hasSavedFile: boolean;
   hasActivity: boolean;
   hasAttention: boolean;
+  hasPendingCommand: boolean;
   keepTabId: string | null;
   dirtyCount: number;
+  shellPendingCount: number;
   shellAttentionCount: number;
   shellActivityCount: number;
 };
@@ -315,26 +321,30 @@ const collapseButtonTitle = computed(() => (
     ? `Collapse tabs panel ${props.collapseShortcutDisplay}`
     : 'Tabs panel cannot be collapsed while it is the last visible panel'
 ));
-const creationMenuActions = computed(() => ([
-  {
-    id: 'shell' as const,
-    label: 'New shell tab',
-    shortcutDisplay: SHORTCUTS.terminalNewTab.display,
-    key: 's',
-  },
-  {
-    id: 'note' as const,
-    label: 'New notes tab',
-    shortcutDisplay: SHORTCUTS.workspaceNoteTab.display,
-    key: 'n',
-  },
-  {
-    id: 'open-file' as const,
-    label: 'Open file',
-    shortcutDisplay: SHORTCUTS.workspaceOpenFile.display,
-    key: 'o',
-  },
-]));
+const creationMenuActions = computed(() => {
+  shortcutBindingsRevision.value;
+
+  return [
+    {
+      id: 'shell' as const,
+      label: 'New shell tab',
+      shortcutDisplay: SHORTCUTS.terminalNewTab.display,
+      key: 's',
+    },
+    {
+      id: 'note' as const,
+      label: 'New notes tab',
+      shortcutDisplay: SHORTCUTS.workspaceNoteTab.display,
+      key: 'n',
+    },
+    {
+      id: 'open-file' as const,
+      label: 'Open file',
+      shortcutDisplay: SHORTCUTS.workspaceOpenFile.display,
+      key: 'o',
+    },
+  ];
+});
 const allTabsResults = computed(() => {
   const normalizedQuery = allTabsSearchQuery.value.trim().toLocaleLowerCase();
   const normalizedLayout = normalizeEditorPaneLayout(editorPaneLayout.value, tabs.value, activeTabId.value);
@@ -380,11 +390,15 @@ const pendingCloseDialogEyebrow = computed(() => {
       return 'Unsaved changes';
     }
 
+    if (dialog.shellPendingCount > 0) {
+      return 'Running command';
+    }
+
     return dialog.shellAttentionCount > 0 ? 'Shell attention' : 'Shell activity';
   }
 
   return dialog.kind === 'shell'
-    ? 'Shell activity'
+    ? (dialog.hasPendingCommand ? 'Running command' : 'Shell activity')
     : (dialog.kind === 'code' ? 'Unsaved file' : 'Unsaved note');
 });
 const pendingCloseDialogTitle = computed(() => {
@@ -412,7 +426,9 @@ const pendingCloseDialogCopy = computed(() => {
         : 'This scratch note has unsaved changes. Save it before closing or discard the changes.')
       : dialog.kind === 'code'
         ? 'This file has unsaved changes. Save it before closing, save a copy under a new file name, or discard the changes.'
-        : (dialog.hasAttention
+        : (dialog.hasPendingCommand
+          ? 'A shell command still looks active. Close this tab anyway?'
+          : dialog.hasAttention
           ? 'This shell tab still needs attention. Close it anyway?'
           : 'This shell tab still shows recent activity. Close it anyway?');
   }
@@ -432,6 +448,14 @@ const pendingCloseDialogCopy = computed(() => {
       dialog.shellAttentionCount === 1
         ? '1 shell tab still needs attention'
         : `${dialog.shellAttentionCount} shell tabs still need attention`,
+    );
+  }
+
+  if (dialog.shellPendingCount > 0) {
+    warnings.push(
+      dialog.shellPendingCount === 1
+        ? '1 shell tab still looks active'
+        : `${dialog.shellPendingCount} shell tabs still look active`,
     );
   }
 
@@ -1441,7 +1465,7 @@ function buildNoteTab(): WorkspaceNoteTabState {
     filePath: null,
     content,
     savedContent: content,
-    viewMode: 'split',
+    viewMode: props.workspaceTabDefaults.noteViewMode,
     splitRatio: 0.5,
     fontSize: props.workspaceTabDefaults.noteFontSize,
   };
@@ -1826,6 +1850,22 @@ function clearTabLastSubmit(tabId: string) {
   tabLastSubmitAt.value = nextSubmits;
 }
 
+function setTabPendingCommand(tabId: string) {
+  tabPendingCommandAt.value = {
+    ...tabPendingCommandAt.value,
+    [tabId]: Date.now(),
+  };
+}
+
+function clearTabPendingCommand(tabId: string) {
+  if (!(tabId in tabPendingCommandAt.value)) {
+    return;
+  }
+
+  const { [tabId]: _removedPendingAt, ...nextPending } = tabPendingCommandAt.value;
+  tabPendingCommandAt.value = nextPending;
+}
+
 function pruneTabActivityState(nextTabs: WorkspaceTabState[]) {
   const nextTabIds = new Set(nextTabs.map((tab) => tab.id));
 
@@ -1870,6 +1910,13 @@ function pruneTabActivityState(nextTabs: WorkspaceTabState[]) {
     tabLastSubmitAt.value = Object.fromEntries(nextSubmitEntries);
   }
 
+  const nextPendingCommandEntries = Object.entries(tabPendingCommandAt.value)
+    .filter(([tabId]) => nextTabIds.has(tabId));
+
+  if (nextPendingCommandEntries.length !== Object.keys(tabPendingCommandAt.value).length) {
+    tabPendingCommandAt.value = Object.fromEntries(nextPendingCommandEntries);
+  }
+
   const nextBusyEntries = Object.entries(noteBusyByTabId.value)
     .filter(([tabId]) => nextTabIds.has(tabId));
 
@@ -1902,6 +1949,7 @@ function resetTransientTabState() {
   tabLastInputAt.value = {};
   tabLastTypingAt.value = {};
   tabLastSubmitAt.value = {};
+  tabPendingCommandAt.value = {};
   interactedShellTabs.value = {};
   startedShellTabs.value = {};
   noteBusyByTabId.value = {};
@@ -1981,8 +2029,13 @@ function hasAttention(tabId: string) {
     && Boolean(interactedShellTabs.value[tabId]);
 }
 
+function hasPendingCommand(tabId: string) {
+  return Boolean(tabPendingCommandAt.value[tabId])
+    && Boolean(interactedShellTabs.value[tabId]);
+}
+
 function shellNeedsCloseConfirmation(tabId: string) {
-  return isTabActive(tabId) || hasAttention(tabId);
+  return hasPendingCommand(tabId) || isTabActive(tabId) || hasAttention(tabId);
 }
 
 function showsShellTabIndicator(tab: WorkspaceTabState) {
@@ -2339,10 +2392,24 @@ function buildFileBackedNoteTab(filePath: string, content: string): WorkspaceNot
     filePath,
     content,
     savedContent: content,
-    viewMode: 'split',
+    ...buildDefaultNotePresentationState(),
+  };
+}
+
+function buildDefaultNotePresentationState(): Pick<WorkspaceNoteTabState, 'viewMode' | 'splitRatio' | 'fontSize' | 'cursor'> {
+  return {
+    viewMode: props.workspaceTabDefaults.noteViewMode,
     splitRatio: 0.5,
     fontSize: props.workspaceTabDefaults.noteFontSize,
+    cursor: undefined,
   };
+}
+
+function updateWorkspaceTabDefaults(nextDefaults: Partial<WorkspaceTabDefaults>) {
+  emit('update:workspace-tab-defaults', {
+    ...props.workspaceTabDefaults,
+    ...nextDefaults,
+  });
 }
 
 function buildFileBackedCodeTab(filePath: string, content: string): WorkspaceCodeTabState {
@@ -2790,6 +2857,7 @@ function handleTabInput(tabId: string, input: string) {
   if (input.includes('\r')) {
     clearTabLastTyping(tabId);
     setTabLastSubmit(tabId);
+    setTabPendingCommand(tabId);
     return;
   }
 
@@ -2835,6 +2903,7 @@ function handleTabActivity(tabId: string) {
         ...tabAttention.value,
         [tabId]: true,
       };
+      clearTabPendingCommand(tabId);
       clearTabLastSubmit(tabId);
     }, TAB_ACTIVITY_TIMEOUT_MS));
 
@@ -2861,6 +2930,8 @@ function handleTabActivity(tabId: string) {
       };
     }
 
+    clearTabPendingCommand(tabId);
+
     if (shouldNotify) {
       void playNotificationBeep();
     }
@@ -2873,6 +2944,18 @@ function handleTabAttention(tabId: string) {
   markShellTabAsInteracted(tabId);
   clearTabActivityTimer(tabId);
   clearTabActivity(tabId);
+  clearTabPendingCommand(tabId);
+  tabAttention.value = {
+    ...tabAttention.value,
+    [tabId]: true,
+  };
+}
+
+function handleTabExit(tabId: string) {
+  markShellTabAsInteracted(tabId);
+  clearTabActivityTimer(tabId);
+  clearTabActivity(tabId);
+  clearTabPendingCommand(tabId);
   tabAttention.value = {
     ...tabAttention.value,
     [tabId]: true,
@@ -3020,6 +3103,7 @@ function openResolvedWorkspaceFile(
         filePath: openedFile.path,
         content: openedFile.content,
         savedContent: openedFile.content,
+        ...buildDefaultNotePresentationState(),
       });
       seedTrackedFileState(targetTab.id, openedFile);
       activateTab(targetTab.id);
@@ -4371,6 +4455,17 @@ function performCloseTabs(tabIds: string[], preferredActiveTabId: string | null 
     return;
   }
 
+  closingIds.forEach((tabId) => {
+    const tab = getTabById(tabId);
+
+    if (!tab || !isShellTab(tab)) {
+      return;
+    }
+
+    const runtimeKey = buildWorkspaceTabRuntimeKey(props.workspaceId, tabId);
+    useTerminal(runtimeKey).kill();
+  });
+
   const closingSet = new Set(closingIds);
   const firstClosedIndex = tabs.value.findIndex((tab) => closingSet.has(tab.id));
   const nextTabs = tabs.value.filter((tab) => !closingSet.has(tab.id));
@@ -4396,6 +4491,7 @@ function performCloseTabs(tabIds: string[], preferredActiveTabId: string | null 
     clearTabLastInput(tabId);
     clearTabLastTyping(tabId);
     clearTabLastSubmit(tabId);
+    clearTabPendingCommand(tabId);
     setNoteBusy(tabId, false);
   }
 
@@ -4446,9 +4542,10 @@ function requestCloseTabs(
   }
 
   const dirtyTabs = closingTabs.filter((tab) => isEditableTab(tab) && isEditableTabDirty(tab));
+  const shellPendingCount = closingTabs.filter((tab) => isShellTab(tab) && hasPendingCommand(tab.id)).length;
   const shellAttentionCount = closingTabs.filter((tab) => isShellTab(tab) && hasAttention(tab.id)).length;
   const shellActivityCount = closingTabs.filter((tab) => (
-    isShellTab(tab) && shellNeedsCloseConfirmation(tab.id) && !hasAttention(tab.id)
+    isShellTab(tab) && shellNeedsCloseConfirmation(tab.id) && !hasPendingCommand(tab.id) && !hasAttention(tab.id)
   )).length;
   const keepTabId = options.keepTabId ?? null;
 
@@ -4456,7 +4553,7 @@ function requestCloseTabs(
   creationMenu.value = null;
   commandMenuOpen.value = false;
 
-  if (dirtyTabs.length > 0 || shellAttentionCount > 0 || shellActivityCount > 0) {
+  if (dirtyTabs.length > 0 || shellPendingCount > 0 || shellAttentionCount > 0 || shellActivityCount > 0) {
     const singleTab = closingTabs.length === 1 ? closingTabs[0] : null;
     pendingCloseDialog.value = {
       mode: singleTab ? 'single' : 'bulk',
@@ -4468,8 +4565,10 @@ function requestCloseTabs(
       hasSavedFile: Boolean(singleTab && isEditableTab(singleTab) && singleTab.filePath),
       hasActivity: Boolean(singleTab && isShellTab(singleTab) && isTabActive(singleTab.id)),
       hasAttention: Boolean(singleTab && isShellTab(singleTab) && hasAttention(singleTab.id)),
+      hasPendingCommand: Boolean(singleTab && isShellTab(singleTab) && hasPendingCommand(singleTab.id)),
       keepTabId,
       dirtyCount: dirtyTabs.length,
+      shellPendingCount,
       shellAttentionCount,
       shellActivityCount,
     };
@@ -5401,7 +5500,11 @@ defineExpose({
 </script>
 
 <template>
-  <section class="terminal-panel" :data-appearance-theme="props.appearanceTheme">
+  <section
+    class="terminal-panel"
+    :data-appearance-theme="props.appearanceTheme"
+    :data-shortcut-bindings-version="shortcutBindingsVersion"
+  >
     <header class="terminal-panel__tabs-header">
       <div class="terminal-panel__tabs" role="tablist" aria-label="Tabs panel">
         <div
@@ -5425,16 +5528,33 @@ defineExpose({
           @dragend="clearTabDragState"
         >
             <span
-              class="terminal-panel__tab-dot"
+              class="terminal-panel__tab-type-icon terminal-panel__tab-type-icon--tab"
               :class="{
-                'terminal-panel__tab-dot--note-file': editableTabHasSavedFile(tab) && !isEditableTabDirty(tab),
-                'terminal-panel__tab-dot--note-dirty': isEditableTabDirty(tab),
-                'terminal-panel__tab-dot--attention': hasAttention(tab.id),
-                'terminal-panel__tab-dot--current': tab.id === activeTabId && showsShellTabIndicator(tab),
-                'terminal-panel__tab-dot--active': isTabActive(tab.id),
-            }"
+                [`terminal-panel__tab-type-icon--${tab.type}`]: true,
+                'terminal-panel__tab-type-icon--dirty': isEditableTabDirty(tab),
+                'terminal-panel__tab-type-icon--attention': hasAttention(tab.id),
+                'terminal-panel__tab-type-icon--current': tab.id === activeTabId && showsShellTabIndicator(tab),
+                'terminal-panel__tab-type-icon--active': isTabActive(tab.id),
+              }"
             aria-hidden="true"
-          />
+          >
+            <svg v-if="tab.type === 'shell'" viewBox="0 0 24 24">
+              <path d="M2.25 5.5A1.25 1.25 0 0 1 3.5 4.25h17A1.25 1.25 0 0 1 21.75 5.5v13A1.25 1.25 0 0 1 20.5 19.75h-17A1.25 1.25 0 0 1 2.25 18.5v-13Z" opacity="0.5" />
+              <path d="m6.25 9.5 2.9 2.75-2.9 2.75" />
+              <path d="M11.75 15h4" />
+            </svg>
+            <svg v-else-if="tab.type === 'note'" viewBox="0 0 24 24">
+              <path d="M2.25 5.5A1.25 1.25 0 0 1 3.5 4.25h17A1.25 1.25 0 0 1 21.75 5.5v13A1.25 1.25 0 0 1 20.5 19.75h-17A1.25 1.25 0 0 1 2.25 18.5v-13Z" opacity="0.5" />
+              <path d="M6.5 10.25h11" />
+              <path d="M6.5 14.25h11" />
+            </svg>
+            <svg v-else viewBox="0 0 24 24">
+              <path d="M2.25 5.5A1.25 1.25 0 0 1 3.5 4.25h17A1.25 1.25 0 0 1 21.75 5.5v13A1.25 1.25 0 0 1 20.5 19.75h-17A1.25 1.25 0 0 1 2.25 18.5v-13Z" opacity="0.5" />
+              <path d="m7.25 9.75-2.35 2.5 2.35 2.5" />
+              <path d="m16.75 9.75 2.35 2.5-2.35 2.5" />
+              <path d="m13.25 8.75-2.5 7" />
+            </svg>
+          </span>
 
           <input
             v-if="editingTabId === tab.id && !allTabsDialogOpen"
@@ -5457,7 +5577,7 @@ defineExpose({
             @dblclick="startEditing(tab)"
           >
             <span class="terminal-panel__tab-label">
-              {{ tabDisplayTitle(tab) }}
+              <span class="terminal-panel__tab-label-text">{{ tabDisplayTitle(tab) }}</span>
             </span>
           </button>
 
@@ -5584,6 +5704,7 @@ defineExpose({
           @activate="handleTerminalViewActivate(tab.id)"
           @activity="handleTabActivity(tab.id)"
           @attention="handleTabAttention(tab.id)"
+          @exit="handleTabExit(tab.id)"
           @input="handleTabInput(tab.id, $event)"
           @open-navigation-target="openCodeNavigationTarget($event)"
           @update:font-size="updateShellFontSize(tab.id, $event)"
@@ -5607,6 +5728,7 @@ defineExpose({
           :external-change="externalFileChangeByTabId[tab.id] ?? null"
           :view-mode="tab.viewMode"
           :split-ratio="tab.splitRatio"
+          :line-numbers-enabled="props.workspaceTabDefaults.noteLineNumbers"
           :font-size="tab.fontSize"
           :cursor="tab.cursor"
           @focus-previous-tab="selectAdjacentTab(-1)"
@@ -5623,6 +5745,7 @@ defineExpose({
           @update:font-size="updateNoteFontSize(tab.id, $event)"
           @update:view-mode="updateNoteViewMode(tab.id, $event)"
           @update:split-ratio="updateNoteSplitRatio(tab.id, $event)"
+          @update:line-numbers-enabled="updateWorkspaceTabDefaults({ noteLineNumbers: $event })"
         />
 
         <CodeTabView
@@ -5696,6 +5819,7 @@ defineExpose({
             @activate="handleTerminalViewActivate(tab.id)"
             @activity="handleTabActivity(tab.id)"
             @attention="handleTabAttention(tab.id)"
+            @exit="handleTabExit(tab.id)"
             @input="handleTabInput(tab.id, $event)"
             @open-navigation-target="openCodeNavigationTarget($event)"
             @update:font-size="updateShellFontSize(tab.id, $event)"
@@ -5718,6 +5842,7 @@ defineExpose({
             :external-change="externalFileChangeByTabId[tab.id] ?? null"
             :view-mode="tab.viewMode"
             :split-ratio="tab.splitRatio"
+            :line-numbers-enabled="props.workspaceTabDefaults.noteLineNumbers"
             :font-size="tab.fontSize"
             :cursor="tab.cursor"
             @focus-previous-tab="selectAdjacentTab(-1)"
@@ -5734,6 +5859,7 @@ defineExpose({
             @update:font-size="updateNoteFontSize(tab.id, $event)"
             @update:view-mode="updateNoteViewMode(tab.id, $event)"
             @update:split-ratio="updateNoteSplitRatio(tab.id, $event)"
+            @update:line-numbers-enabled="updateWorkspaceTabDefaults({ noteLineNumbers: $event })"
           />
 
           <CodeTabView
@@ -5818,7 +5944,24 @@ defineExpose({
               :title="entry.tab.filePath ?? entry.tab.title"
               @click="setActiveEditorPane(entry.pane.id)"
             >
-              {{ entry.tab.title }}
+              <span
+                class="terminal-panel__tab-type-icon terminal-panel__tab-type-icon--pane"
+                :class="`terminal-panel__tab-type-icon--${entry.tab.type}`"
+                aria-hidden="true"
+              >
+                <svg v-if="entry.tab.type === 'note'" viewBox="0 0 24 24">
+                  <path d="M2.25 5.5A1.25 1.25 0 0 1 3.5 4.25h17A1.25 1.25 0 0 1 21.75 5.5v13A1.25 1.25 0 0 1 20.5 19.75h-17A1.25 1.25 0 0 1 2.25 18.5v-13Z" opacity="0.5" />
+                  <path d="M6.5 10.25h11" />
+                  <path d="M6.5 14.25h11" />
+                </svg>
+                <svg v-else viewBox="0 0 24 24">
+                  <path d="M2.25 5.5A1.25 1.25 0 0 1 3.5 4.25h17A1.25 1.25 0 0 1 21.75 5.5v13A1.25 1.25 0 0 1 20.5 19.75h-17A1.25 1.25 0 0 1 2.25 18.5v-13Z" opacity="0.5" />
+                  <path d="m7.25 9.75-2.35 2.5 2.35 2.5" />
+                  <path d="m16.75 9.75 2.35 2.5-2.35 2.5" />
+                  <path d="m13.25 8.75-2.5 7" />
+                </svg>
+              </span>
+              <span class="terminal-panel__editor-pane-title-text">{{ entry.tab.title }}</span>
             </button>
 
             <div class="terminal-panel__editor-pane-actions">
@@ -5883,6 +6026,7 @@ defineExpose({
             :external-change="externalFileChangeByTabId[entry.tab.id] ?? null"
             :view-mode="entry.tab.viewMode"
             :split-ratio="entry.tab.splitRatio"
+            :line-numbers-enabled="props.workspaceTabDefaults.noteLineNumbers"
             :font-size="entry.tab.fontSize"
             :cursor="entry.tab.cursor"
             @focus-previous-tab="selectAdjacentTab(-1)"
@@ -5899,6 +6043,7 @@ defineExpose({
             @update:font-size="updateNoteFontSize(entry.tab.id, $event)"
             @update:view-mode="updateNoteViewMode(entry.tab.id, $event)"
             @update:split-ratio="updateNoteSplitRatio(entry.tab.id, $event)"
+            @update:line-numbers-enabled="updateWorkspaceTabDefaults({ noteLineNumbers: $event })"
           />
 
           <CodeTabView
@@ -6056,6 +6201,28 @@ defineExpose({
 
                 <span class="terminal-panel__switcher-copy">
                   <span class="terminal-panel__switcher-row">
+                    <span
+                      class="terminal-panel__tab-type-icon terminal-panel__tab-type-icon--switcher"
+                      :class="`terminal-panel__tab-type-icon--${entry.tab.type}`"
+                      aria-hidden="true"
+                    >
+                      <svg v-if="entry.tab.type === 'shell'" viewBox="0 0 24 24">
+                        <path d="M2.25 5.5A1.25 1.25 0 0 1 3.5 4.25h17A1.25 1.25 0 0 1 21.75 5.5v13A1.25 1.25 0 0 1 20.5 19.75h-17A1.25 1.25 0 0 1 2.25 18.5v-13Z" opacity="0.5" />
+                        <path d="m6.25 9.5 2.9 2.75-2.9 2.75" />
+                        <path d="M11.75 15h4" />
+                      </svg>
+                      <svg v-else-if="entry.tab.type === 'note'" viewBox="0 0 24 24">
+                        <path d="M2.25 5.5A1.25 1.25 0 0 1 3.5 4.25h17A1.25 1.25 0 0 1 21.75 5.5v13A1.25 1.25 0 0 1 20.5 19.75h-17A1.25 1.25 0 0 1 2.25 18.5v-13Z" opacity="0.5" />
+                        <path d="M6.5 10.25h11" />
+                        <path d="M6.5 14.25h11" />
+                      </svg>
+                      <svg v-else viewBox="0 0 24 24">
+                        <path d="M2.25 5.5A1.25 1.25 0 0 1 3.5 4.25h17A1.25 1.25 0 0 1 21.75 5.5v13A1.25 1.25 0 0 1 20.5 19.75h-17A1.25 1.25 0 0 1 2.25 18.5v-13Z" opacity="0.5" />
+                        <path d="m7.25 9.75-2.35 2.5 2.35 2.5" />
+                        <path d="m16.75 9.75 2.35 2.5-2.35 2.5" />
+                        <path d="m13.25 8.75-2.5 7" />
+                      </svg>
+                    </span>
                     <span class="terminal-panel__switcher-name">{{ entry.tab.title }}</span>
                   </span>
                   <span v-if="entry.secondaryMeta" class="terminal-panel__switcher-path">{{ entry.secondaryMeta }}</span>
@@ -6803,7 +6970,7 @@ defineExpose({
 .terminal-panel__tab-button {
   min-width: 0;
   max-width: 176px;
-  padding: 0.55rem 0 0.55rem 0;
+  padding: 0;
   overflow: hidden;
   font-weight: 600;
   color: var(--text-dim);
@@ -6812,14 +6979,98 @@ defineExpose({
 }
 
 .terminal-panel__tab-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.terminal-panel__tab-label-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.terminal-panel__tab-type-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  flex: 0 0 auto;
+  color: color-mix(in srgb, var(--text-primary) 50%, transparent);
+}
+
+.terminal-panel__tab-type-icon svg {
+  width: 18px;
+  height: 18px;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.7;
+}
+
+.terminal-panel__tab-type-icon--shell {
+  color: #b9f0ce;
+}
+
+.terminal-panel__tab-type-icon--note {
+  color: #ffd89f;
+}
+
+.terminal-panel__tab-type-icon--code {
+  color: #beddff;
+}
+
+.terminal-panel__tab-type-icon--switcher {
+  margin-top: 1px;
+}
+
+.terminal-panel__tab-type-icon--pane {
+  width: 16px;
+  height: 16px;
+}
+
+.terminal-panel__tab-type-icon--pane svg {
+  width: 16px;
+  height: 16px;
+}
+
+.terminal-panel__tab-type-icon--tab {
+  margin: -5px 0 -5px -1px;
+}
+
+.terminal-panel__tab-type-icon--dirty {
+  color: #ffcd93;
+}
+
+.terminal-panel__tab-type-icon--current {
+  color: #b9f0ce;
+}
+
+.terminal-panel__tab-type-icon--active {
+  color: #8fc3ff;
+  filter: drop-shadow(0 0 6px rgba(108, 176, 255, 0.35));
+}
+
+.terminal-panel__tab-type-icon--attention {
+  color: #ffcd93;
+  filter: drop-shadow(0 0 6px rgba(255, 176, 102, 0.24));
+}
+
+.terminal-panel__tab-type-icon--dirty.terminal-panel__tab-type-icon--active,
+.terminal-panel__tab-type-icon--dirty.terminal-panel__tab-type-icon--current {
+  color: #ffcd93;
+  filter: none;
 }
 
 .terminal-panel__tab-input {
   width: 132px;
   min-width: 0;
-  padding: 0.48rem 0 0.48rem 0;
+  padding: 0;
   border: 0;
   background: transparent;
   color: rgba(216, 224, 236, 0.92);
@@ -7109,6 +7360,9 @@ defineExpose({
 }
 
 .terminal-panel__editor-pane-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
   min-width: 0;
   max-width: 100%;
   padding: 0;
@@ -7121,6 +7375,12 @@ defineExpose({
   text-overflow: ellipsis;
   white-space: nowrap;
   overflow: hidden;
+}
+
+.terminal-panel__editor-pane-title-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .terminal-panel__editor-pane--active .terminal-panel__editor-pane-title {

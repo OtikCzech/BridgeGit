@@ -3,6 +3,7 @@ import {
   DEFAULT_SESSION_DATA,
   cloneClipboardHistoryEntries,
   cloneDismissedWorktreePaths,
+  cloneShortcutOverrides,
   cloneWorkspaceTabDefaults,
   cloneSeenInfoNoteRevisions,
   clonePanelLayoutsByWorkspace,
@@ -33,6 +34,7 @@ function cloneSession(session: SessionData): SessionData {
     panelLayoutsByWorkspace: clonePanelLayoutsByWorkspace(session.panelLayoutsByWorkspace),
     workspaceRepoPanelStates: cloneWorkspaceRepoPanelStates(session.workspaceRepoPanelStates),
     projectTitlesByContext: cloneProjectTitlesByContext(session.projectTitlesByContext),
+    shortcutOverrides: cloneShortcutOverrides(session.shortcutOverrides),
     workspaceIndicatorVisibility: cloneWorkspaceIndicatorVisibilitySettings(session.workspaceIndicatorVisibility),
     workspaceTabDefaults: cloneWorkspaceTabDefaults(session.workspaceTabDefaults),
     dismissedWorktreePaths: cloneDismissedWorktreePaths(session.dismissedWorktreePaths),
@@ -96,6 +98,9 @@ function mergeSession(base: SessionData, patch: SessionPatch): SessionData {
     projectTitlesByContext: patch.projectTitlesByContext
       ? cloneProjectTitlesByContext(patch.projectTitlesByContext)
       : cloneProjectTitlesByContext(base.projectTitlesByContext),
+    shortcutOverrides: patch.shortcutOverrides
+      ? cloneShortcutOverrides(patch.shortcutOverrides)
+      : cloneShortcutOverrides(base.shortcutOverrides),
     workspaceIndicatorVisibility: patch.workspaceIndicatorVisibility
       ? cloneWorkspaceIndicatorVisibilitySettings(patch.workspaceIndicatorVisibility)
       : cloneWorkspaceIndicatorVisibilitySettings(base.workspaceIndicatorVisibility),

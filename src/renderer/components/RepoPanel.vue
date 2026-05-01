@@ -21,7 +21,7 @@ import type {
   WorkspaceRepoPanelState,
 } from '../../shared/bridgegit';
 import { areRepoPathsEquivalent, normalizeNoteFontSize, resolveWorkspaceFileTabType } from '../../shared/bridgegit';
-import { SHORTCUTS } from '../shortcuts';
+import { SHORTCUTS, matchesShortcut, shortcutBindingsRevision } from '../shortcuts';
 
 interface Props {
   projectTitle: string;
@@ -54,6 +54,7 @@ interface Props {
 }
 
 const props = defineProps<Props>();
+const shortcutBindingsVersion = shortcutBindingsRevision;
 
 const emit = defineEmits<{
   (event: 'open-info'): void;
@@ -203,6 +204,7 @@ const workspaceListRef = ref<HTMLElement | null>(null);
 const workspaceRenameInputRef = ref<HTMLInputElement | null>(null);
 const commitInputRef = ref<HTMLInputElement | null>(null);
 const filesFilterInputRef = ref<HTMLInputElement | null>(null);
+const allFilesScopeRef = ref<HTMLElement | null>(null);
 const fileMenu = ref<FileMenuState | null>(null);
 const workspaceMenu = ref<WorkspaceMenuState | null>(null);
 const branchItemMenu = ref<BranchItemMenuState | null>(null);
@@ -219,9 +221,14 @@ const isFilesFilterVisible = ref(false);
 const workspaceRenameValue = ref('');
 const fileListMode = ref<FileListMode>(props.repoPanelState.files.viewMode);
 const isAllFilesExpanded = ref(props.repoPanelState.files.showAll);
+const showHiddenAllFiles = ref(props.repoPanelState.files.showHidden);
 const isFilesExpanded = ref(props.repoPanelState.files.expanded);
 const isWorkspaceDetailExpanded = ref(props.repoPanelState.workspaceDetailExpanded);
 const isWorkspaceFamilyFocus = ref(props.repoPanelState.workspaceFamilyFocus);
+const pinnedWorkspaceIds = ref<string[]>([...(props.repoPanelState.pinnedWorkspaceIds ?? [])]);
+const isWorkspacePinSelectionPending = ref(false);
+const pendingPinnedWorkspaceIds = ref<string[]>([]);
+const lastPendingPinnedWorkspaceId = ref<string | null>(null);
 const collapsedSections = ref<SectionState>({ ...props.repoPanelState.files.collapsedSections });
 const repoPanelFontSize = ref(normalizeNoteFontSize(props.repoPanelState.fontSize));
 const pendingCommitFocus = ref(false);
@@ -236,11 +243,14 @@ const isSearchingAllFiles = ref(false);
 const hasRequestedAllFilesLoad = ref(false);
 const focusedAllFilesPath = ref<string | null>(null);
 const allFilesTypeSelectQuery = ref('');
+const pendingFilesFilterFocusSelect = ref(false);
 let isApplyingRepoPanelState = false;
 let allFilesSearchToken = 0;
 let allFilesSearchDebounceTimer: number | null = null;
 let allFilesTypeSelectTimer: number | null = null;
 let branchSearchFocusTimer: number | null = null;
+let filesFilterDeferredFocusTimers: number[] = [];
+let filesFilterFocusRequestToken = 0;
 const historyCount = computed(() => props.log?.items.length ?? 0);
 const collapseButtonTitle = computed(() => (
   props.canCollapse
@@ -251,6 +261,28 @@ const hasWorkspaceItems = computed(() => props.workspaceItems.length > 0);
 const currentWorkspaceItem = computed(() => (
   props.workspaceItems.find((workspace) => workspace.isCurrent) ?? props.workspaceItems[0] ?? null
 ));
+
+function normalizeWorkspaceIdList(workspaceIds: string[]) {
+  const allowedWorkspaceIds = new Set(props.workspaceItems.map((workspace) => workspace.workspaceId));
+  const seenWorkspaceIds = new Set<string>();
+
+  return workspaceIds.filter((workspaceId) => {
+    if (!allowedWorkspaceIds.has(workspaceId) || seenWorkspaceIds.has(workspaceId)) {
+      return false;
+    }
+
+    seenWorkspaceIds.add(workspaceId);
+    return true;
+  });
+}
+
+function areWorkspaceIdListsEqual(left: string[], right: string[]) {
+  if (left.length !== right.length) {
+    return false;
+  }
+
+  return left.every((workspaceId, index) => workspaceId === right[index]);
+}
 
 function workspaceFamilySourceName(workspace: WorkspaceOverviewItem) {
   if (workspace.path) {
@@ -279,14 +311,57 @@ const currentWorkspaceFamilyItems = computed(() => (
 const currentWorkspaceFamilyLabel = computed(() => (
   currentWorkspaceItem.value ? workspaceFamilyLabel(currentWorkspaceItem.value) : 'Current repo'
 ));
+const normalizedPinnedWorkspaceIds = computed(() => normalizeWorkspaceIdList(pinnedWorkspaceIds.value));
+const normalizedPendingPinnedWorkspaceIds = computed(() => normalizeWorkspaceIdList(pendingPinnedWorkspaceIds.value));
+const pinnedWorkspaceIdSet = computed(() => new Set(normalizedPinnedWorkspaceIds.value));
+const pendingPinnedWorkspaceIdSet = computed(() => new Set(normalizedPendingPinnedWorkspaceIds.value));
+const isPinnedWorkspaceFilterActive = computed(() => normalizedPinnedWorkspaceIds.value.length > 0);
+const isWorkspacePinSelectionActive = computed(() => isWorkspacePinSelectionPending.value);
+const pinnedWorkspaceItems = computed(() => (
+  props.workspaceItems.filter((workspace) => pinnedWorkspaceIdSet.value.has(workspace.workspaceId))
+));
+const highlightedPinnedWorkspaceIdSet = computed(() => (
+  isWorkspacePinSelectionActive.value ? pendingPinnedWorkspaceIdSet.value : pinnedWorkspaceIdSet.value
+));
+const isWorkspaceFilterActive = computed(() => (
+  isPinnedWorkspaceFilterActive.value || isWorkspaceFamilyFocus.value
+));
 const visibleWorkspaceItems = computed(() => (
-  isWorkspaceFamilyFocus.value && currentWorkspaceItem.value
+  isPinnedWorkspaceFilterActive.value
+    ? pinnedWorkspaceItems.value
+    : isWorkspaceFamilyFocus.value && currentWorkspaceItem.value
     ? currentWorkspaceFamilyItems.value
     : props.workspaceItems
 ));
 const shouldShowWorkspaceFamilySwitcher = computed(() => (
-  isWorkspaceFamilyFocus.value && currentWorkspaceFamilyItems.value.length > 0
+  isWorkspacePinSelectionActive.value
+    ? true
+    : isPinnedWorkspaceFilterActive.value
+      ? pinnedWorkspaceItems.value.length > 0
+      : isWorkspaceFamilyFocus.value && currentWorkspaceFamilyItems.value.length > 0
 ));
+const workspaceFilterSummaryName = computed(() => {
+  if (isWorkspacePinSelectionActive.value) {
+    return 'Pinning repos';
+  }
+
+  if (isPinnedWorkspaceFilterActive.value) {
+    return 'Pinned repos';
+  }
+
+  return currentWorkspaceFamilyLabel.value;
+});
+const workspaceFilterSummaryCount = computed(() => {
+  if (isWorkspacePinSelectionActive.value) {
+    return normalizedPendingPinnedWorkspaceIds.value.length;
+  }
+
+  if (isPinnedWorkspaceFilterActive.value) {
+    return pinnedWorkspaceItems.value.length;
+  }
+
+  return currentWorkspaceFamilyItems.value.length;
+});
 
 const sections = computed<Omit<RepoSectionViewModel, 'filteredItems'>[]>(() => {
   const source = props.status;
@@ -423,9 +498,13 @@ const normalizedFilesFilterQuery = computed(() => filesFilterQuery.value.toLower
 const hasFilesFilter = computed(() => Boolean(filesFilterQuery.value));
 const isFilesFilterOpen = computed(() => isFilesExpanded.value && isFilesFilterVisible.value);
 const shouldShowFilesFilterRow = computed(() => isFilesExpanded.value && isFilesFilterVisible.value);
-const filesFilterToggleTitle = computed(() => (
-  isFilesFilterVisible.value ? 'Close file filter' : 'Focus file filter'
-));
+const filesFilterToggleTitle = computed(() => {
+  shortcutBindingsRevision.value;
+
+  return isFilesFilterVisible.value
+    ? `Focus file filter ${SHORTCUTS.repoPanelFilesFilterFocus.display}`
+    : `Open file filter ${SHORTCUTS.repoPanelFilesFilterFocus.display}`;
+});
 const filesFilterPlaceholder = computed(() => 'Filter files');
 const isAllFilesSearchMode = computed(() => hasFilesFilter.value);
 const isAllFilesTreeFilterMode = computed(() => (
@@ -686,10 +765,12 @@ const visibleAllFilesSearchError = computed(() => (
   shouldDisplayError(allFilesSearchError.value) ? allFilesSearchError.value : null
 ));
 const allFilesSearchResultsWithChanges = computed(() => (
-  (allFilesSearchResults.value ?? []).map((path) => ({
-    path,
-    item: allFilesChangeMap.value.get(path),
-  }))
+  (allFilesSearchResults.value ?? [])
+    .filter((path) => shouldShowAllFilesPath(path))
+    .map((path) => ({
+      path,
+      item: allFilesChangeMap.value.get(path),
+    }))
 ));
 const persistedExpandedAllFilesDirectories = computed(() => normalizeExpandedDirectories(
   Object.entries(expandedAllFilesDirectories.value)
@@ -727,8 +808,11 @@ const allFilesCountLabel = computed(() => {
     return null;
   }
 
-  return (allFilesSearchResults.value ?? []).length.toLocaleString();
+  return allFilesSearchResultsWithChanges.value.length.toLocaleString();
 });
+const hiddenFilesToggleTitle = computed(() => (
+  showHiddenAllFiles.value ? 'Hide hidden files' : 'Show hidden files'
+));
 const sortedItemsBySection = computed<Record<SectionId, GitChange[]>>(() => {
   const nextItems: Record<SectionId, GitChange[]> = {
     staged: [],
@@ -775,6 +859,22 @@ function shouldDisplayError(value: string | null): value is string {
 
 function splitPath(path: string) {
   return normalizePathSeparators(path).split('/').filter(Boolean);
+}
+
+function isHiddenPathSegment(segment: string) {
+  return segment.startsWith('.') && segment !== '.' && segment !== '..' && segment !== '.git';
+}
+
+function shouldShowAllFilesPath(path: string) {
+  if (showHiddenAllFiles.value) {
+    return true;
+  }
+
+  return !splitPath(path).some((segment) => isHiddenPathSegment(segment));
+}
+
+function shouldShowAllFilesEntry(entry: RepoDirectoryEntry) {
+  return showHiddenAllFiles.value || !isHiddenPathSegment(entry.name);
 }
 
 function fileName(path: string) {
@@ -935,7 +1035,8 @@ function hasAllFilesDirectoryLoaded(path: string) {
 
 function buildAllFilesTreeRows(relativePath = '', depth = 0): AllFilesTreeRow[] {
   const rows: AllFilesTreeRow[] = [];
-  const entries = allFilesEntriesByDirectory.value[relativePath] ?? [];
+  const entries = (allFilesEntriesByDirectory.value[relativePath] ?? [])
+    .filter((entry) => shouldShowAllFilesEntry(entry));
 
   entries.forEach((entry) => {
     const change = allFilesChangeMap.value.get(entry.path);
@@ -1050,7 +1151,9 @@ function buildFilteredAllFilesTreeRowsFromDirectory(
 function buildFilteredAllFilesTreeRows(paths: string[]): AllFilesTreeRow[] {
   const rootDirectory = createFilteredAllFilesDirectoryNode('', '');
 
-  [...new Set(paths.map((path) => normalizePathSeparators(path)).filter(Boolean))]
+  [...new Set(paths
+    .map((path) => normalizePathSeparators(path))
+    .filter((path) => Boolean(path) && shouldShowAllFilesPath(path)))]
     .sort(compareText)
     .forEach((path) => {
       const segments = splitPath(path);
@@ -1655,7 +1758,12 @@ function detectedWorktreeLabel(worktree: GitWorktreeSummary | null) {
   return worktree.branch ?? fileName(worktree.path);
 }
 
-function handleWorkspaceSelect(workspaceId: string) {
+function handleWorkspaceSelect(workspaceId: string, event?: MouseEvent) {
+  if (event?.ctrlKey) {
+    toggleWorkspacePinnedSelection(workspaceId);
+    return;
+  }
+
   if (props.workspaceItems.some((workspace) => workspace.workspaceId === workspaceId && workspace.isCurrent)) {
     isWorkspaceDetailExpanded.value = !isWorkspaceDetailExpanded.value;
     return;
@@ -1688,9 +1796,11 @@ function areRepoPanelStatesEqual(left: WorkspaceRepoPanelState, right: Workspace
     && left.historyOpen === right.historyOpen
     && left.workspaceDetailExpanded === right.workspaceDetailExpanded
     && left.workspaceFamilyFocus === right.workspaceFamilyFocus
+    && areWorkspaceIdListsEqual(left.pinnedWorkspaceIds, right.pinnedWorkspaceIds)
     && left.files.expanded === right.files.expanded
     && left.files.viewMode === right.files.viewMode
     && left.files.showAll === right.files.showAll
+    && left.files.showHidden === right.files.showHidden
     && areSectionStatesEqual(left.files.collapsedSections, right.files.collapsedSections)
     && areExpandedDirectoryListsEqual(left.files.expandedDirectories, right.files.expandedDirectories);
 }
@@ -1701,10 +1811,12 @@ function buildRepoPanelState(): WorkspaceRepoPanelState {
     historyOpen: props.isHistoryOpen,
     workspaceDetailExpanded: isWorkspaceDetailExpanded.value,
     workspaceFamilyFocus: isWorkspaceFamilyFocus.value,
+    pinnedWorkspaceIds: normalizedPinnedWorkspaceIds.value,
     files: {
       expanded: isFilesExpanded.value,
       viewMode: fileListMode.value,
       showAll: isAllFilesExpanded.value,
+      showHidden: showHiddenAllFiles.value,
       collapsedSections: cloneSectionState(collapsedSections.value),
       expandedDirectories: persistedExpandedAllFilesDirectories.value,
     },
@@ -1716,9 +1828,12 @@ function applyRepoPanelState(nextRepoPanelState: WorkspaceRepoPanelState) {
   repoPanelFontSize.value = normalizeNoteFontSize(nextRepoPanelState.fontSize);
   fileListMode.value = nextRepoPanelState.files.viewMode;
   isAllFilesExpanded.value = nextRepoPanelState.files.showAll;
+  showHiddenAllFiles.value = nextRepoPanelState.files.showHidden;
   isFilesExpanded.value = nextRepoPanelState.files.expanded;
   isWorkspaceDetailExpanded.value = nextRepoPanelState.workspaceDetailExpanded;
   isWorkspaceFamilyFocus.value = nextRepoPanelState.workspaceFamilyFocus;
+  pinnedWorkspaceIds.value = normalizeWorkspaceIdList(nextRepoPanelState.pinnedWorkspaceIds ?? []);
+  clearPendingWorkspacePinSelection();
   collapsedSections.value = cloneSectionState(nextRepoPanelState.files.collapsedSections);
   expandedAllFilesDirectories.value = Object.fromEntries(
     normalizeExpandedDirectories(nextRepoPanelState.files.expandedDirectories).map((path) => [path, true]),
@@ -1956,7 +2071,62 @@ function handleCommitMessageUpdate(event: Event) {
 }
 
 function handleFilesFilterToggleClick() {
-  void toggleFilesFilter();
+  void focusFilesFilter(true);
+}
+
+function handleFilesFilterToggleMouseDown(event: MouseEvent) {
+  event.preventDefault();
+}
+
+function asHtmlInputElement(value: unknown): HTMLInputElement | null {
+  if (value instanceof HTMLInputElement) {
+    return value;
+  }
+
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const resolvedItem = asHtmlInputElement(item);
+
+      if (resolvedItem) {
+        return resolvedItem;
+      }
+    }
+
+    return null;
+  }
+
+  if (value && typeof value === 'object' && '$el' in value) {
+    const element = (value as { $el?: unknown }).$el;
+
+    if (element instanceof HTMLInputElement) {
+      return element;
+    }
+
+    if (element instanceof HTMLElement) {
+      return element.querySelector<HTMLInputElement>('input');
+    }
+  }
+
+  return null;
+}
+
+function resolveFilesFilterInput() {
+  const resolvedFromRef = asHtmlInputElement(filesFilterInputRef.value);
+
+  if (resolvedFromRef) {
+    return resolvedFromRef;
+  }
+
+  return rootRef.value?.querySelector<HTMLInputElement>('.repo-panel__files-filter') ?? null;
+}
+
+function handleFilesFilterRowPointerDown(event: PointerEvent) {
+  if (event.target instanceof HTMLInputElement) {
+    return;
+  }
+
+  event.preventDefault();
+  void focusFilesFilter(false);
 }
 
 async function focusCommitInput() {
@@ -2003,15 +2173,6 @@ function toggleBranchMenu() {
   }
 }
 
-async function toggleFilesFilter() {
-  if (isFilesFilterVisible.value) {
-    closeFilesFilter();
-    return;
-  }
-
-  await focusFilesFilter(true);
-}
-
 async function focusFilesFilter(selectContents = false) {
   if (!isWorkspaceDetailExpanded.value) {
     isWorkspaceDetailExpanded.value = true;
@@ -2021,21 +2182,105 @@ async function focusFilesFilter(selectContents = false) {
     isFilesExpanded.value = true;
   }
 
+  pendingFilesFilterFocusSelect.value = selectContents;
   isFilesFilterVisible.value = true;
-  await nextTick();
-  filesFilterInputRef.value?.focus({ preventScroll: true });
-
-  if (selectContents) {
-    filesFilterInputRef.value?.select();
-  }
+  await focusVisibleFilesFilterInput();
+  scheduleFilesFilterDeferredFocus();
 }
 
 function closeFilesFilter() {
+  cancelFilesFilterFocusRequest();
+  pendingFilesFilterFocusSelect.value = false;
   isFilesFilterVisible.value = false;
   void nextTick().then(() => {
     filesFilter.value = '';
-    filesFilterInputRef.value?.blur();
+    resolveFilesFilterInput()?.blur();
   });
+}
+
+function cancelFilesFilterFocusRequest() {
+  filesFilterFocusRequestToken += 1;
+
+  if (!filesFilterDeferredFocusTimers.length) {
+    return;
+  }
+
+  filesFilterDeferredFocusTimers.forEach((timerId) => {
+    window.clearTimeout(timerId);
+  });
+  filesFilterDeferredFocusTimers = [];
+}
+
+function scheduleFilesFilterDeferredFocus() {
+  cancelFilesFilterFocusRequest();
+  const requestToken = filesFilterFocusRequestToken;
+  const attemptDelays = [0, 24, 80, 180, 360];
+
+  filesFilterDeferredFocusTimers = attemptDelays.map((delay) => window.setTimeout(() => {
+    if (requestToken !== filesFilterFocusRequestToken) {
+      return;
+    }
+
+    void focusVisibleFilesFilterInput(requestToken);
+  }, delay));
+}
+
+async function focusVisibleFilesFilterInput(requestToken = filesFilterFocusRequestToken) {
+  const shouldSelectContents = pendingFilesFilterFocusSelect.value;
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    if (requestToken !== filesFilterFocusRequestToken) {
+      return false;
+    }
+
+    await nextTick();
+    await new Promise<void>((resolve) => {
+      window.requestAnimationFrame(() => resolve());
+    });
+
+    if (requestToken !== filesFilterFocusRequestToken) {
+      return false;
+    }
+
+    const input = resolveFilesFilterInput();
+
+    if (!input || !shouldShowFilesFilterRow.value) {
+      continue;
+    }
+
+    const activeElement = document.activeElement;
+
+    if (
+      activeElement instanceof HTMLElement
+      && activeElement !== input
+      && rootRef.value?.contains(activeElement)
+    ) {
+      activeElement.blur();
+    }
+
+    input.focus({ preventScroll: true });
+
+    if (document.activeElement !== input) {
+      continue;
+    }
+
+    if (shouldSelectContents) {
+      if (input.value.length > 0) {
+        input.select();
+      } else {
+        input.setSelectionRange(0, 0);
+      }
+    } else {
+      const cursorPosition = input.value.length;
+      input.setSelectionRange(cursorPosition, cursorPosition);
+    }
+
+    pendingFilesFilterFocusSelect.value = false;
+    cancelFilesFilterFocusRequest();
+    return true;
+  }
+
+  return false;
 }
 
 async function scrollCurrentBranchIntoView() {
@@ -2183,8 +2428,57 @@ function openWorkspaceMenuAtPosition(x: number, y: number, workspace: WorkspaceO
   };
 }
 
+function clearPendingWorkspacePinSelection() {
+  isWorkspacePinSelectionPending.value = false;
+  pendingPinnedWorkspaceIds.value = [];
+  lastPendingPinnedWorkspaceId.value = null;
+}
+
+function finalizeWorkspacePinSelection() {
+  if (!isWorkspacePinSelectionActive.value) {
+    return;
+  }
+
+  const nextPinnedWorkspaceIds = normalizeWorkspaceIdList(pendingPinnedWorkspaceIds.value);
+  const nextWorkspaceId = nextPinnedWorkspaceIds.includes(lastPendingPinnedWorkspaceId.value ?? '')
+    ? lastPendingPinnedWorkspaceId.value
+    : nextPinnedWorkspaceIds[0] ?? null;
+
+  pinnedWorkspaceIds.value = nextPinnedWorkspaceIds;
+  isWorkspaceFamilyFocus.value = false;
+  clearPendingWorkspacePinSelection();
+  emitRepoPanelState();
+
+  if (
+    nextWorkspaceId
+    && !props.workspaceItems.some((workspace) => workspace.workspaceId === nextWorkspaceId && workspace.isCurrent)
+  ) {
+    emit('select-workspace', nextWorkspaceId);
+  }
+}
+
+function toggleWorkspacePinnedSelection(workspaceId: string) {
+  isWorkspacePinSelectionPending.value = true;
+  const currentPinnedWorkspaceIds = isWorkspacePinSelectionActive.value
+    ? [...pendingPinnedWorkspaceIds.value]
+    : [...normalizedPinnedWorkspaceIds.value];
+  const nextPinnedWorkspaceIds = currentPinnedWorkspaceIds.includes(workspaceId)
+    ? currentPinnedWorkspaceIds.filter((entryWorkspaceId) => entryWorkspaceId !== workspaceId)
+    : [...currentPinnedWorkspaceIds, workspaceId];
+
+  pendingPinnedWorkspaceIds.value = normalizeWorkspaceIdList(nextPinnedWorkspaceIds);
+  lastPendingPinnedWorkspaceId.value = workspaceId;
+}
+
 function handleWorkspaceFamilyFocusToggle() {
-  isWorkspaceFamilyFocus.value = !isWorkspaceFamilyFocus.value;
+  if (isWorkspaceFilterActive.value || isWorkspacePinSelectionActive.value) {
+    pinnedWorkspaceIds.value = [];
+    isWorkspaceFamilyFocus.value = false;
+    clearPendingWorkspacePinSelection();
+    return;
+  }
+
+  isWorkspaceFamilyFocus.value = true;
 }
 
 function closeWorkspaceMenu() {
@@ -2373,6 +2667,20 @@ function handleDocumentPointerDown(event: PointerEvent) {
   }
 }
 
+function handleAllFilesScopePointerDown(event: PointerEvent) {
+  const target = event.target;
+
+  if (!(target instanceof HTMLElement)) {
+    return;
+  }
+
+  if (target.closest('button, input, textarea, select, a, [contenteditable="true"]')) {
+    return;
+  }
+
+  allFilesScopeRef.value?.focus({ preventScroll: true });
+}
+
 function isKeyboardEventInsideRepoPanel(target: EventTarget | null) {
   return target instanceof Node && Boolean(rootRef.value?.contains(target));
 }
@@ -2385,8 +2693,21 @@ function isKeyboardEventOnAllFilesRow(target: EventTarget | null) {
   return target instanceof Element && Boolean(target.closest('[data-all-files-path]'));
 }
 
+function isKeyboardEventOnAllFilesScopeContainer(target: EventTarget | null) {
+  return target instanceof HTMLElement && target === allFilesScopeRef.value;
+}
+
 function handleDocumentKeydown(event: KeyboardEvent) {
-  if (event.key === 'Escape' && document.activeElement === filesFilterInputRef.value) {
+  const hasOpenRepoPanelMenu = Boolean(
+    isBranchMenuOpen.value
+    || fileMenu.value
+    || workspaceMenu.value
+    || branchItemMenu.value,
+  );
+
+  const filesFilterInput = resolveFilesFilterInput();
+
+  if (event.key === 'Escape' && document.activeElement === filesFilterInput) {
     event.preventDefault();
 
     if (hasFilesFilter.value) {
@@ -2398,28 +2719,69 @@ function handleDocumentKeydown(event: KeyboardEvent) {
     return;
   }
 
-  const handlesAllFilesKeyboardInput = (
+  if (
+    isKeyboardEventInsideRepoPanel(event.target)
+    && !isEditableTarget(event.target)
+    && !hasOpenRepoPanelMenu
+    && matchesShortcut(event, SHORTCUTS.repoPanelFilesFilterFocus)
+  ) {
+    event.preventDefault();
+    void focusFilesFilter(true);
+    return;
+  }
+
+  if (
+    isFilesFilterOpen.value
+    && isKeyboardEventInsideRepoPanel(event.target)
+    && !isEditableTarget(event.target)
+    && !hasOpenRepoPanelMenu
+    && !event.ctrlKey
+    && !event.metaKey
+    && !event.altKey
+  ) {
+    if (event.key === 'Backspace') {
+      event.preventDefault();
+      filesFilter.value = filesFilter.value.slice(0, -1);
+      pendingFilesFilterFocusSelect.value = false;
+      void focusVisibleFilesFilterInput();
+      return;
+    }
+
+    if (event.key.length === 1 && !event.repeat) {
+      event.preventDefault();
+      filesFilter.value += event.key;
+      pendingFilesFilterFocusSelect.value = false;
+      void focusVisibleFilesFilterInput();
+      return;
+    }
+  }
+
+  const handlesAllFilesTypeSelectInput = (
     isKeyboardEventInsideRepoPanel(event.target)
     && isKeyboardEventInsideAllFilesScope(event.target)
-    && isKeyboardEventOnAllFilesRow(event.target)
     && !isEditableTarget(event.target)
     && !event.ctrlKey
     && !event.metaKey
     && !event.altKey
-    && !isBranchMenuOpen.value
-    && !fileMenu.value
-    && !workspaceMenu.value
-    && !branchItemMenu.value
+    && !hasOpenRepoPanelMenu
     && navigableAllFilesRows.value.length > 0
   );
 
-  if (handlesAllFilesKeyboardInput && event.key === 'Escape' && allFilesTypeSelectQuery.value) {
+  const handlesAllFilesRowNavigation = (
+    handlesAllFilesTypeSelectInput
+    && (
+      isKeyboardEventOnAllFilesRow(event.target)
+      || isKeyboardEventOnAllFilesScopeContainer(event.target)
+    )
+  );
+
+  if (handlesAllFilesTypeSelectInput && event.key === 'Escape' && allFilesTypeSelectQuery.value) {
     event.preventDefault();
     resetAllFilesTypeSelectQuery();
     return;
   }
 
-  if (handlesAllFilesKeyboardInput && event.key === 'Backspace' && allFilesTypeSelectQuery.value) {
+  if (handlesAllFilesTypeSelectInput && event.key === 'Backspace' && allFilesTypeSelectQuery.value) {
     event.preventDefault();
     const nextQuery = allFilesTypeSelectQuery.value.slice(0, -1);
     allFilesTypeSelectQuery.value = nextQuery;
@@ -2435,7 +2797,7 @@ function handleDocumentKeydown(event: KeyboardEvent) {
   }
 
   if (
-    handlesAllFilesKeyboardInput
+    handlesAllFilesRowNavigation
   ) {
     if (event.key === 'ArrowDown') {
       event.preventDefault();
@@ -2481,6 +2843,15 @@ function handleDocumentKeydown(event: KeyboardEvent) {
     }
   }
 
+  if (handlesAllFilesTypeSelectInput && event.key.length === 1 && !event.repeat) {
+    event.preventDefault();
+    const nextQuery = `${allFilesTypeSelectQuery.value}${event.key}`;
+    allFilesTypeSelectQuery.value = nextQuery;
+    scheduleAllFilesTypeSelectReset();
+    void focusAllFilesTypeSelectMatch(nextQuery);
+    return;
+  }
+
   if (
     isBranchMenuOpen.value
     && !isEditableTarget(event.target)
@@ -2509,6 +2880,16 @@ function handleDocumentKeydown(event: KeyboardEvent) {
     closeWorkspaceMenu();
     closeBranchItemMenu();
   }
+}
+
+function handleDocumentKeyup(event: KeyboardEvent) {
+  if (event.key === 'Control') {
+    finalizeWorkspacePinSelection();
+  }
+}
+
+function handleWindowBlur() {
+  finalizeWorkspacePinSelection();
 }
 
 function handleBranchSelect(branch: BranchInfo) {
@@ -2693,6 +3074,13 @@ watch(
 );
 
 watch(
+  () => showHiddenAllFiles.value,
+  () => {
+    emitRepoPanelState();
+  },
+);
+
+watch(
   () => persistedExpandedAllFilesDirectories.value,
   () => {
     emitRepoPanelState();
@@ -2711,6 +3099,18 @@ watch(
 );
 
 watch(
+  () => shouldShowFilesFilterRow.value,
+  (isVisible) => {
+    if (!isVisible || !pendingFilesFilterFocusSelect.value) {
+      return;
+    }
+
+    scheduleFilesFilterDeferredFocus();
+    void focusVisibleFilesFilterInput();
+  },
+);
+
+watch(
   () => isWorkspaceDetailExpanded.value,
   () => {
     emitRepoPanelState();
@@ -2721,6 +3121,37 @@ watch(
   () => isWorkspaceFamilyFocus.value,
   () => {
     emitRepoPanelState();
+  },
+);
+
+watch(
+  () => normalizedPinnedWorkspaceIds.value,
+  (nextPinnedWorkspaceIds, previousPinnedWorkspaceIds) => {
+    if (areWorkspaceIdListsEqual(nextPinnedWorkspaceIds, previousPinnedWorkspaceIds ?? [])) {
+      return;
+    }
+
+    if (!areWorkspaceIdListsEqual(pinnedWorkspaceIds.value, nextPinnedWorkspaceIds)) {
+      pinnedWorkspaceIds.value = [...nextPinnedWorkspaceIds];
+      return;
+    }
+
+    emitRepoPanelState();
+  },
+);
+
+watch(
+  () => props.workspaceItems.map((workspace) => workspace.workspaceId).join('\u0000'),
+  () => {
+    const nextPinnedWorkspaceIds = normalizeWorkspaceIdList(pinnedWorkspaceIds.value);
+    if (!areWorkspaceIdListsEqual(nextPinnedWorkspaceIds, pinnedWorkspaceIds.value)) {
+      pinnedWorkspaceIds.value = nextPinnedWorkspaceIds;
+    }
+
+    const nextPendingPinnedWorkspaceIds = normalizeWorkspaceIdList(pendingPinnedWorkspaceIds.value);
+    if (!areWorkspaceIdListsEqual(nextPendingPinnedWorkspaceIds, pendingPinnedWorkspaceIds.value)) {
+      pendingPinnedWorkspaceIds.value = nextPendingPinnedWorkspaceIds;
+    }
   },
 );
 
@@ -2872,11 +3303,16 @@ watch(
 onMounted(() => {
   document.addEventListener('pointerdown', handleDocumentPointerDown);
   document.addEventListener('keydown', handleDocumentKeydown);
+  document.addEventListener('keyup', handleDocumentKeyup);
+  window.addEventListener('blur', handleWindowBlur);
 });
 
 onBeforeUnmount(() => {
   document.removeEventListener('pointerdown', handleDocumentPointerDown);
   document.removeEventListener('keydown', handleDocumentKeydown);
+  document.removeEventListener('keyup', handleDocumentKeyup);
+  window.removeEventListener('blur', handleWindowBlur);
+  cancelFilesFilterFocusRequest();
 
   if (allFilesSearchDebounceTimer !== null) {
     window.clearTimeout(allFilesSearchDebounceTimer);
@@ -2900,6 +3336,7 @@ onBeforeUnmount(() => {
     ref="rootRef"
     class="git-panel"
     :data-appearance-theme="props.appearanceTheme"
+    :data-shortcut-bindings-version="shortcutBindingsVersion"
     :style="repoPanelStyle"
     @wheel.capture="handleWheelZoom"
   >
@@ -2986,10 +3423,10 @@ onBeforeUnmount(() => {
 
           <button
             class="repo-panel__mini-action repo-panel__mini-action--icon"
-            :class="{ 'repo-panel__mini-action--active': isWorkspaceFamilyFocus }"
+            :class="{ 'repo-panel__mini-action--active': isWorkspaceFilterActive || isWorkspacePinSelectionActive }"
             type="button"
-            :aria-label="isWorkspaceFamilyFocus ? 'Show all workspaces' : 'Show only current repo family'"
-            :title="isWorkspaceFamilyFocus ? 'Show all workspaces' : 'Show only current repo family'"
+            :aria-label="isWorkspaceFilterActive || isWorkspacePinSelectionActive ? 'Show all workspaces' : 'Show only current repo family'"
+            :title="isWorkspaceFilterActive || isWorkspacePinSelectionActive ? 'Show all workspaces' : 'Show only current repo family'"
             @click="handleWorkspaceFamilyFocusToggle"
           >
             <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -3001,8 +3438,8 @@ onBeforeUnmount(() => {
 
       <div v-if="shouldShowWorkspaceFamilySwitcher" class="repo-panel__workspace-family-switcher">
         <div class="repo-panel__workspace-family-summary">
-          <span class="repo-panel__workspace-family-name">{{ currentWorkspaceFamilyLabel }}</span>
-          <span class="repo-panel__workspace-family-count">{{ currentWorkspaceFamilyItems.length }} repos</span>
+          <span class="repo-panel__workspace-family-name">{{ workspaceFilterSummaryName }}</span>
+          <span class="repo-panel__workspace-family-count">{{ workspaceFilterSummaryCount }} repos</span>
         </div>
       </div>
 
@@ -3024,9 +3461,13 @@ onBeforeUnmount(() => {
         >
           <button
             class="repo-panel__workspace-item"
-            :class="{ 'repo-panel__workspace-item--current': workspace.isCurrent }"
+            :class="{
+              'repo-panel__workspace-item--current': workspace.isCurrent,
+              'repo-panel__workspace-item--pinned': highlightedPinnedWorkspaceIdSet.has(workspace.workspaceId),
+              'repo-panel__workspace-item--pinning': isWorkspacePinSelectionActive && highlightedPinnedWorkspaceIdSet.has(workspace.workspaceId),
+            }"
             type="button"
-            @click="handleWorkspaceSelect(workspace.workspaceId)"
+            @click="handleWorkspaceSelect(workspace.workspaceId, $event)"
             @contextmenu="openWorkspaceMenu($event, workspace)"
           >
             <span class="repo-panel__workspace-mainline">
@@ -3455,6 +3896,7 @@ onBeforeUnmount(() => {
                       type="button"
                       :title="filesFilterToggleTitle"
                       :aria-label="filesFilterToggleTitle"
+                      @mousedown.stop.prevent="handleFilesFilterToggleMouseDown"
                       @click.stop.prevent="handleFilesFilterToggleClick"
                     >
                       <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -3466,7 +3908,12 @@ onBeforeUnmount(() => {
                   </div>
                 </div>
 
-                <div v-if="shouldShowFilesFilterRow" class="repo-panel__files-filter-row">
+                <div
+                  class="repo-panel__files-filter-row"
+                  :class="{ 'repo-panel__files-filter-row--visible': shouldShowFilesFilterRow }"
+                  :aria-hidden="!shouldShowFilesFilterRow"
+                  @pointerdown="handleFilesFilterRowPointerDown"
+                >
                   <input
                     ref="filesFilterInputRef"
                     v-model="filesFilter"
@@ -3475,12 +3922,19 @@ onBeforeUnmount(() => {
                     :placeholder="filesFilterPlaceholder"
                     autocomplete="off"
                     spellcheck="false"
+                    :tabindex="shouldShowFilesFilterRow ? 0 : -1"
                   />
                 </div>
               </div>
 
               <div v-if="isFilesExpanded" class="repo-panel__groups">
-                <section class="repo-panel__group" data-all-files-scope="true">
+                <section
+                  ref="allFilesScopeRef"
+                  class="repo-panel__group"
+                  data-all-files-scope="true"
+                  tabindex="-1"
+                  @pointerdown="handleAllFilesScopePointerDown"
+                >
                   <header class="repo-panel__group-header">
                     <button
                       class="repo-panel__group-toggle"
@@ -3498,6 +3952,20 @@ onBeforeUnmount(() => {
                     </button>
 
                     <div class="repo-panel__group-actions">
+                      <button
+                        class="repo-panel__mini-action repo-panel__mini-action--icon"
+                        :class="{ 'repo-panel__action--active': showHiddenAllFiles }"
+                        type="button"
+                        :aria-label="hiddenFilesToggleTitle"
+                        :title="hiddenFilesToggleTitle"
+                        @click.stop="showHiddenAllFiles = !showHiddenAllFiles"
+                      >
+                        <svg viewBox="0 0 24 24" aria-hidden="true">
+                          <path
+                            d="M12 5c4.96 0 9.03 3.15 10.44 6.55a1.32 1.32 0 0 1 0 .9C21.03 15.85 16.96 19 12 19s-9.03-3.15-10.44-6.55a1.32 1.32 0 0 1 0-.9C2.97 8.15 7.04 5 12 5Zm0 1.5c-4.26 0-7.8 2.68-9 5.5 1.2 2.82 4.74 5.5 9 5.5s7.8-2.68 9-5.5c-1.2-2.82-4.74-5.5-9-5.5Zm0 2.25A3.25 3.25 0 1 1 8.75 12 3.25 3.25 0 0 1 12 8.75Zm0 1.5A1.75 1.75 0 1 0 13.75 12 1.75 1.75 0 0 0 12 10.25Z"
+                          />
+                        </svg>
+                      </button>
                       <button
                         v-if="!isAllFilesSearchMode && !shouldLoadAllFiles"
                         class="repo-panel__mini-action repo-panel__mini-action--icon"
@@ -4451,6 +4919,25 @@ onBeforeUnmount(() => {
   background: var(--repo-panel-surface-active-bg);
 }
 
+.repo-panel__workspace-item--pinned {
+  border-color: rgba(111, 224, 165, 0.34);
+  background:
+    linear-gradient(135deg, rgba(111, 224, 165, 0.14), rgba(110, 197, 255, 0.06)),
+    var(--repo-panel-surface-bg);
+}
+
+.repo-panel__workspace-item--pinning {
+  box-shadow: inset 0 0 0 1px rgba(111, 224, 165, 0.14);
+}
+
+.repo-panel__workspace-item--current.repo-panel__workspace-item--pinned,
+.repo-panel__workspace-item--pinned:hover {
+  border-color: rgba(111, 224, 165, 0.42);
+  background:
+    linear-gradient(135deg, rgba(111, 224, 165, 0.18), rgba(110, 197, 255, 0.09)),
+    var(--repo-panel-surface-active-bg);
+}
+
 .repo-panel__workspace-title {
   min-width: 0;
   overflow: hidden;
@@ -5143,6 +5630,22 @@ onBeforeUnmount(() => {
 .repo-panel__files-filter-row {
   display: flex;
   min-width: 0;
+  max-height: 0;
+  opacity: 0;
+  overflow: hidden;
+  pointer-events: none;
+  transform: translateY(-4px);
+  transition:
+    max-height 120ms ease,
+    opacity 120ms ease,
+    transform 120ms ease;
+}
+
+.repo-panel__files-filter-row--visible {
+  max-height: 56px;
+  opacity: 1;
+  pointer-events: auto;
+  transform: translateY(0);
 }
 
 .repo-panel__files-filter {

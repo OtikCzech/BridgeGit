@@ -290,6 +290,7 @@ export interface WorkspaceRepoPanelFilesState {
   expanded: boolean;
   viewMode: RepoPanelFileListMode;
   showAll: boolean;
+  showHidden: boolean;
   collapsedSections: RepoPanelSectionState;
   expandedDirectories: string[];
 }
@@ -299,6 +300,7 @@ export interface WorkspaceRepoPanelState {
   historyOpen: boolean;
   workspaceDetailExpanded: boolean;
   workspaceFamilyFocus: boolean;
+  pinnedWorkspaceIds: string[];
   files: WorkspaceRepoPanelFilesState;
 }
 
@@ -356,7 +358,7 @@ export interface WorkspaceNoteTabState {
   filePath: string | null;
   content: string;
   savedContent: string;
-  viewMode: 'source' | 'split' | 'preview';
+  viewMode: WorkspaceNoteViewMode;
   splitRatio: number;
   fontSize: number;
   cursor?: WorkspaceEditorCursorState;
@@ -505,10 +507,13 @@ export type EditorThemePreset = AppAppearance;
 export type EditorTheme = 'follow-app' | EditorThemePreset;
 export type ResolvedEditorTheme = EditorThemePreset;
 export type ThemeVariant = 'dark' | 'light';
+export type WorkspaceNoteViewMode = 'source' | 'split' | 'preview';
 
 export interface WorkspaceTabDefaults {
   shellFontSize: number;
   noteFontSize: number;
+  noteViewMode: WorkspaceNoteViewMode;
+  noteLineNumbers: boolean;
 }
 
 export type WorktreeDetectionInterval = 60_000 | 180_000 | 300_000 | 900_000 | null;
@@ -637,6 +642,17 @@ export interface TerminalCommandPreset {
   steps: TerminalCommandStep[];
 }
 
+export interface ShortcutOverride {
+  key: string;
+  code?: string | null;
+  display: string;
+  alt?: boolean;
+  shift?: boolean;
+  ctrlOrMeta?: boolean;
+}
+
+export type ShortcutOverrides = Record<string, ShortcutOverride>;
+
 export type ProjectTitleMode = 'auto' | 'custom';
 
 export interface SessionData {
@@ -656,6 +672,7 @@ export interface SessionData {
   projectTitlesByContext: Record<string, string>;
   appAppearance: AppAppearance;
   editorTheme: EditorTheme;
+  shortcutOverrides: ShortcutOverrides;
   workspaceIndicatorVisibility: WorkspaceIndicatorVisibilitySettings;
   workspaceTabDefaults: WorkspaceTabDefaults;
   worktreeDetectionIntervalMs: WorktreeDetectionInterval;
@@ -681,6 +698,7 @@ export interface ProjectSettingsFormData {
   diffPlacement: PanelLayout['diffPlacement'];
   appAppearance: AppAppearance;
   editorTheme: EditorTheme;
+  shortcutOverrides: ShortcutOverrides;
   workspacePanelFontSize: number;
   workspaceIndicatorVisibility: WorkspaceIndicatorVisibilitySettings;
   workspaceTabDefaults: WorkspaceTabDefaults;
@@ -693,6 +711,12 @@ export function cloneWorkspaceIndicatorVisibilitySettings(
   workspaceIndicatorVisibility: WorkspaceIndicatorVisibilitySettings,
 ): WorkspaceIndicatorVisibilitySettings {
   return { ...workspaceIndicatorVisibility };
+}
+
+export function cloneShortcutOverrides(shortcutOverrides: ShortcutOverrides): ShortcutOverrides {
+  return Object.fromEntries(
+    Object.entries(shortcutOverrides).map(([shortcutId, override]) => [shortcutId, { ...override }]),
+  );
 }
 
 export function cloneWorkspaceTabDefaults(workspaceTabDefaults: WorkspaceTabDefaults): WorkspaceTabDefaults {
@@ -785,10 +809,12 @@ export function cloneWorkspaceRepoPanelState(workspaceRepoPanelState: WorkspaceR
     historyOpen: workspaceRepoPanelState.historyOpen,
     workspaceDetailExpanded: workspaceRepoPanelState.workspaceDetailExpanded,
     workspaceFamilyFocus: workspaceRepoPanelState.workspaceFamilyFocus,
+    pinnedWorkspaceIds: [...(workspaceRepoPanelState.pinnedWorkspaceIds ?? [])],
     files: {
       expanded: workspaceRepoPanelState.files.expanded,
       viewMode: workspaceRepoPanelState.files.viewMode,
       showAll: workspaceRepoPanelState.files.showAll,
+      showHidden: workspaceRepoPanelState.files.showHidden,
       collapsedSections: cloneRepoPanelSectionState(workspaceRepoPanelState.files.collapsedSections),
       expandedDirectories: [...(workspaceRepoPanelState.files.expandedDirectories ?? [])],
     },
@@ -980,6 +1006,7 @@ export const DEFAULT_SESSION_DATA: SessionData = {
   projectTitlesByContext: {},
   appAppearance: 'bridgegit-dark',
   editorTheme: 'follow-app',
+  shortcutOverrides: {},
   workspaceIndicatorVisibility: {
     repo: true,
     activity: true,
@@ -988,6 +1015,8 @@ export const DEFAULT_SESSION_DATA: SessionData = {
   workspaceTabDefaults: {
     shellFontSize: DEFAULT_SHELL_FONT_SIZE,
     noteFontSize: DEFAULT_NOTE_FONT_SIZE,
+    noteViewMode: 'split',
+    noteLineNumbers: true,
   },
   worktreeDetectionIntervalMs: 180_000,
   dismissedWorktreePaths: [],

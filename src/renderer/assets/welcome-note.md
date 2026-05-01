@@ -2,17 +2,20 @@
 
 This note is the default place for release updates and small product messages inside BridgeGit.
 
-## New in 0.7.1
+## New in 0.8.0
 
-- restored the branch label inside the pinned workspace button after the 0.7.0 repo-family header cleanup, with a subtle fallback when the branch is not known
-- kept the simplified repo-family focus header without bringing back the duplicate selector and extra actions
+- customize keyboard shortcuts for workspace actions and command slots directly in Settings
+- choose default note behavior in Settings, including the open mode and line-number preference for new notes tabs
+- pin repo filters in larger workspace sessions to keep multi-repo focus easier to control
+- rely on safer shell tab closing, latest-selection paste support in the terminal and calmer note default reuse
+- spot shell, note and code tabs faster through clearer type icons in the workspace tab strip
 
-## Also in the 0.7.x line
+## Also in the 0.8.x line
 
-- write notes in the new CodeMirror-based editor with matched themes, better editing behavior and optional line numbers
-- reuse recent clipboard snippets through persistent clipboard history and smarter paste behavior across shell and editor tabs
-- rely on calmer workspace restore: tab state, active pane recovery and app-close session saving are more robust than in the previous public release line
-- resize note split, multi-display and editor-pane layouts directly with draggable dividers
+- the CodeMirror-based notes editor keeps matched themes, better editing behavior and optional line numbers
+- persistent clipboard history still works across shell and editor tabs when you need older snippets
+- workspace restore remains stronger than in the older release line, including tab state and active pane recovery
+- note split, multi-display and editor-pane layouts stay directly resizable with draggable dividers
 
 ## Quick Start
 

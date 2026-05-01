@@ -32,7 +32,7 @@ import {
 import { getCodeEditorThemeExtension } from '../codemirror/codeEditor';
 import { useClipboardHistoryTarget } from '../composables/useClipboardHistoryTarget';
 import { useColumnSplitter } from '../composables/useColumnSplitter';
-import { SHORTCUTS, matchesShortcut } from '../shortcuts';
+import { SHORTCUTS, matchesShortcut, shortcutBindingsRevision } from '../shortcuts';
 
 interface Props {
   active: boolean;
@@ -48,11 +48,13 @@ interface Props {
   themeVariant: ThemeVariant;
   viewMode: WorkspaceNoteTabState['viewMode'];
   splitRatio: number;
+  lineNumbersEnabled: boolean;
   fontSize: number;
   cursor?: WorkspaceEditorCursorState;
 }
 
 const props = defineProps<Props>();
+const shortcutBindingsVersion = shortcutBindingsRevision;
 
 const emit = defineEmits<{
   'dismiss-external-change': [];
@@ -67,6 +69,7 @@ const emit = defineEmits<{
   'update:content': [content: string];
   'update:cursor': [cursor: WorkspaceEditorCursorState];
   'update:font-size': [fontSize: number];
+  'update:line-numbers-enabled': [enabled: boolean];
   'update:split-ratio': [splitRatio: number];
   'update:view-mode': [viewMode: WorkspaceNoteTabState['viewMode']];
 }>();
@@ -89,19 +92,7 @@ const themeCompartment = new Compartment();
 const lineNumbersCompartment = new Compartment();
 let editorView: EditorView | null = null;
 let suppressContentSync = false;
-
-const LINE_NUMBERS_STORAGE_KEY = 'bridgegit.note.lineNumbers';
-
-function readStoredLineNumbers(): boolean {
-  try {
-    const raw = window.localStorage.getItem(LINE_NUMBERS_STORAGE_KEY);
-    return raw === null ? true : raw === '1';
-  } catch {
-    return true;
-  }
-}
-
-const lineNumbersEnabled = ref(readStoredLineNumbers());
+const lineNumbersEnabled = ref(props.lineNumbersEnabled);
 let copyToastTimer: number | null = null;
 let copySelectionTimer: number | null = null;
 let lastCopiedSelection: string | null = null;
@@ -934,17 +925,7 @@ function buildLineNumbersExtension() {
 }
 
 function toggleLineNumbers() {
-  lineNumbersEnabled.value = !lineNumbersEnabled.value;
-
-  try {
-    window.localStorage.setItem(LINE_NUMBERS_STORAGE_KEY, lineNumbersEnabled.value ? '1' : '0');
-  } catch {
-    // localStorage unavailable; ignore.
-  }
-
-  editorView?.dispatch({
-    effects: lineNumbersCompartment.reconfigure(buildLineNumbersExtension()),
-  });
+  emit('update:line-numbers-enabled', !lineNumbersEnabled.value);
 }
 
 const CURSOR_EMIT_DEBOUNCE_MS = 250;
@@ -1133,6 +1114,17 @@ function reconfigureEditor() {
     ],
   });
 }
+
+watch(
+  () => props.lineNumbersEnabled,
+  (enabled) => {
+    lineNumbersEnabled.value = enabled;
+
+    editorView?.dispatch({
+      effects: lineNumbersCompartment.reconfigure(buildLineNumbersExtension()),
+    });
+  },
+);
 
 function updateChecklistItem(taskIndex: number, checked: boolean) {
   if (!Number.isInteger(taskIndex) || taskIndex < 0) {
@@ -1825,6 +1817,7 @@ defineExpose({
   <section
     ref="rootRef"
     class="note-tab"
+    :data-shortcut-bindings-version="shortcutBindingsVersion"
     :data-appearance-theme="appearanceTheme"
     :data-editor-theme-id="editorTheme"
     :data-editor-theme="themeVariant"
@@ -2215,6 +2208,12 @@ defineExpose({
   --note-editor-active-gutter-bg: rgba(36, 52, 69, 0.92);
   --note-editor-active-gutter-color: rgba(232, 240, 246, 0.88);
   --note-editor-selection-bg: rgba(59, 130, 246, 0.3);
+  --note-editor-panel-bg: rgba(15, 21, 29, 0.98);
+  --note-editor-search-input-bg: rgba(10, 15, 22, 0.96);
+  --note-editor-search-button-bg: rgba(20, 28, 39, 0.96);
+  --note-editor-search-button-hover-bg: rgba(28, 39, 54, 0.98);
+  --note-editor-search-match-bg: rgba(241, 194, 122, 0.2);
+  --note-editor-search-match-outline: rgba(241, 194, 122, 0.28);
   position: relative;
   display: flex;
   flex-direction: column;
@@ -2234,6 +2233,12 @@ defineExpose({
   --note-editor-active-gutter-bg: rgba(211, 225, 242, 0.96);
   --note-editor-active-gutter-color: #1f3a5c;
   --note-editor-selection-bg: rgba(74, 139, 232, 0.2);
+  --note-editor-panel-bg: rgba(244, 248, 252, 0.98);
+  --note-editor-search-input-bg: rgba(255, 255, 255, 0.98);
+  --note-editor-search-button-bg: rgba(236, 242, 249, 0.98);
+  --note-editor-search-button-hover-bg: rgba(224, 234, 244, 0.98);
+  --note-editor-search-match-bg: rgba(241, 194, 122, 0.3);
+  --note-editor-search-match-outline: rgba(195, 142, 62, 0.32);
 }
 
 .note-tab[data-editor-theme-id='github-dark'] {
@@ -2246,6 +2251,12 @@ defineExpose({
   --note-editor-active-gutter-bg: rgba(56, 139, 253, 0.12);
   --note-editor-active-gutter-color: #c9d1d9;
   --note-editor-selection-bg: rgba(56, 139, 253, 0.28);
+  --note-editor-panel-bg: #161b22;
+  --note-editor-search-input-bg: #0d1117;
+  --note-editor-search-button-bg: #21262d;
+  --note-editor-search-button-hover-bg: #30363d;
+  --note-editor-search-match-bg: rgba(210, 153, 34, 0.2);
+  --note-editor-search-match-outline: rgba(210, 153, 34, 0.28);
 }
 
 .note-tab[data-editor-theme-id='github-light'] {
@@ -2258,6 +2269,12 @@ defineExpose({
   --note-editor-active-gutter-bg: rgba(9, 105, 218, 0.12);
   --note-editor-active-gutter-color: #24292f;
   --note-editor-selection-bg: rgba(9, 105, 218, 0.18);
+  --note-editor-panel-bg: #f6f8fa;
+  --note-editor-search-input-bg: #ffffff;
+  --note-editor-search-button-bg: #f6f8fa;
+  --note-editor-search-button-hover-bg: #eef2f6;
+  --note-editor-search-match-bg: rgba(191, 135, 0, 0.2);
+  --note-editor-search-match-outline: rgba(191, 135, 0, 0.28);
 }
 
 .note-tab[data-editor-theme-id='nord'] {
@@ -2270,6 +2287,12 @@ defineExpose({
   --note-editor-active-gutter-bg: rgba(136, 192, 208, 0.2);
   --note-editor-active-gutter-color: #eceff4;
   --note-editor-selection-bg: rgba(136, 192, 208, 0.3);
+  --note-editor-panel-bg: #3b4252;
+  --note-editor-search-input-bg: #2e3440;
+  --note-editor-search-button-bg: #3b4252;
+  --note-editor-search-button-hover-bg: #434c5e;
+  --note-editor-search-match-bg: rgba(235, 203, 139, 0.18);
+  --note-editor-search-match-outline: rgba(235, 203, 139, 0.28);
 }
 
 .note-tab[data-appearance-theme='bridgegit-light'] {
@@ -2848,6 +2871,63 @@ defineExpose({
 .note-tab__editor :deep(.cm-matchingBracket),
 .note-tab__editor :deep(.cm-nonmatchingBracket) {
   border-bottom: 1px solid rgba(123, 208, 255, 0.55);
+}
+
+.note-tab__editor :deep(.cm-selectionMatch) {
+  background: rgba(141, 199, 255, 0.14);
+}
+
+.note-tab__editor :deep(.cm-panels) {
+  border-bottom: 1px solid rgba(108, 124, 148, 0.22);
+  background: var(--note-editor-panel-bg);
+  color: var(--note-editor-text);
+}
+
+.note-tab__editor :deep(.cm-panels-top) {
+  border-bottom: 1px solid rgba(108, 124, 148, 0.22);
+}
+
+.note-tab__editor :deep(.cm-search) {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  font: 500 0.78rem/1.35 var(--font-mono);
+}
+
+.note-tab__editor :deep(.cm-search label) {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.note-tab__editor :deep(.cm-search .cm-textfield) {
+  min-width: 12rem;
+  border: 1px solid rgba(108, 124, 148, 0.28);
+  border-radius: 8px;
+  background: var(--note-editor-search-input-bg);
+  color: var(--note-editor-text);
+  padding: 0.3rem 0.48rem;
+}
+
+.note-tab__editor :deep(.cm-search .cm-button) {
+  border: 1px solid rgba(108, 124, 148, 0.26);
+  border-radius: 8px;
+  background: var(--note-editor-search-button-bg);
+  color: var(--note-editor-text);
+  padding: 0.26rem 0.5rem;
+  font: 600 0.74rem/1.2 var(--font-mono);
+}
+
+.note-tab__editor :deep(.cm-search .cm-button:hover) {
+  border-color: rgba(110, 197, 255, 0.28);
+  background: var(--note-editor-search-button-hover-bg);
+}
+
+.note-tab__editor :deep(.cm-searchMatch) {
+  background: var(--note-editor-search-match-bg);
+  outline: 1px solid var(--note-editor-search-match-outline);
 }
 
 .note-tab__editor:focus-within {

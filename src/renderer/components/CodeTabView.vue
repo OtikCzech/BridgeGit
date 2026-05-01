@@ -54,7 +54,7 @@ import {
   resolveCodeNavigationResolutionAtOffset,
 } from '../navigation/codeNavigation';
 import { useClipboardHistoryTarget } from '../composables/useClipboardHistoryTarget';
-import { SHORTCUTS, matchesShortcut } from '../shortcuts';
+import { SHORTCUTS, matchesShortcut, shortcutBindingsRevision } from '../shortcuts';
 
 interface Props {
   active: boolean;
@@ -72,6 +72,7 @@ interface Props {
 }
 
 const props = defineProps<Props>();
+const shortcutBindingsVersion = shortcutBindingsRevision;
 
 const emit = defineEmits<{
   'dismiss-external-change': [];
@@ -1175,6 +1176,7 @@ onBeforeUnmount(() => {
     ref="rootRef"
     class="code-tab"
     :class="{ 'code-tab--link-hovering': isPointerLinkActive }"
+    :data-shortcut-bindings-version="shortcutBindingsVersion"
     :data-editor-theme-id="editorTheme"
     :data-editor-theme="themeVariant"
     :style="codeStyle"

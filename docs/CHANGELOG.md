@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.8.0 - 2026-05-01
+
+Workspace refinement release focused on reusable workflows, calmer note defaults and clearer multi-repo filtering.
+
+- Added customizable keyboard shortcuts across workspace actions and command slots
+- Added note tab defaults in Settings, including the default open mode and line-number preference
+- Added pinned repo filters in the workspace sidebar to keep larger multi-repo sessions easier to narrow down
+- Improved terminal and workspace behavior with safer shell close handling, latest-selection paste support and reused note defaults
+- Polished note search styling, repo-panel file-filter focus and clearer workspace tab type icons
+
 ## v0.7.1 - 2026-04-24
 
 Patch release focused on restoring a small but visible repo-panel detail after the 0.7.0 handoff.

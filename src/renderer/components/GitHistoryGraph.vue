@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, ref, watch } from 'vue';
 import type { GitCommitRef, GitLogEntry } from '../../shared/bridgegit';
-import { SHORTCUTS } from '../shortcuts';
+import { SHORTCUTS, shortcutBindingsRevision } from '../shortcuts';
 
 interface Props {
   commits: GitLogEntry[];
@@ -10,6 +10,8 @@ interface Props {
   fill?: boolean;
   simplifyGraph?: boolean;
 }
+
+const shortcutBindingsVersion = shortcutBindingsRevision;
 
 interface LaneTransition {
   color: string;
@@ -448,7 +450,11 @@ watch(
 </script>
 
 <template>
-  <section class="git-history" :class="{ 'git-history--fill': fill }">
+  <section
+    class="git-history"
+    :class="{ 'git-history--fill': fill }"
+    :data-shortcut-bindings-version="shortcutBindingsVersion"
+  >
     <header class="git-history__header">
       <div class="git-history__title-row">
         <div class="git-history__title-main">
