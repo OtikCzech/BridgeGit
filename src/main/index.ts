@@ -5,13 +5,18 @@ import { execFile } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { readdir, readFile, stat, writeFile } from 'node:fs/promises';
 import { basename, dirname, extname, isAbsolute, join, resolve, win32 } from 'node:path';
-import { promisify } from 'node:util';
 import { registerDockerIpcHandlers } from './docker';
+import { resolveDialogDefaultPath, resolveReadableFilePath } from './file-path-resolution';
 import { registerGitIpcHandlers } from './git';
-import { normalizeStoredPath, parseWindowsWslPath } from './path-utils';
 import { cleanupPtysForWebContents, registerPtyIpcHandlers } from './pty';
 import { loadSession, saveSession, saveSessionSync } from './store';
-import type { NoteFileHandle, NoteFileStat, SessionData } from '../shared/bridgegit';
+import type {
+  NoteFileHandle,
+  NoteFileStat,
+  ResolvedWorkspaceFileTarget,
+  SessionData,
+} from '../shared/bridgegit';
+import { resolveWorkspaceFileTabType } from '../shared/bridgegit';
 
 let mainWindow: BrowserWindow | null = null;
 
@@ -38,7 +43,6 @@ const WORKSPACE_FILE_FILTERS = [
   },
 ];
 const NOTE_LINK_EXTENSIONS = new Set(['.md', '.markdown', '.txt']);
-const execFileAsync = promisify(execFile);
 
 function getPreloadPath() {
   return join(__dirname, '../preload/index.js');
@@ -84,32 +88,6 @@ function formatErrorMessage(error: unknown): string {
   return 'Unexpected file system error.';
 }
 
-async function resolveDialogDefaultPath(defaultPath?: string | null): Promise<string | undefined> {
-  const trimmedPath = defaultPath?.trim();
-
-  if (!trimmedPath) {
-    return undefined;
-  }
-
-  if (process.platform === 'win32' && trimmedPath.startsWith('/')) {
-    try {
-      const { stdout } = await execFileAsync('wsl.exe', ['wslpath', '-w', trimmedPath], {
-        encoding: 'utf8',
-        windowsHide: true,
-      });
-      const convertedPath = stdout.trim();
-
-      if (convertedPath) {
-        return convertedPath;
-      }
-    } catch {
-      // Fall back to the generic path normalization below.
-    }
-  }
-
-  return normalizeStoredPath(trimmedPath) ?? undefined;
-}
-
 async function readNoteFileHandle(filePath: string): Promise<NoteFileHandle> {
   const resolvedFilePath = await resolveReadableFilePath(filePath);
   const [content, fileStat] = await Promise.all([
@@ -144,61 +122,22 @@ async function readNoteFileStat(filePath: string): Promise<NoteFileStat | null> 
   }
 }
 
-function buildReadableFilePathCandidates(filePath: string): string[] {
-  const trimmedPath = filePath.trim();
+async function resolveWorkspaceFileOpenTarget(filePath: string): Promise<ResolvedWorkspaceFileTarget | null> {
+  try {
+    const file = await readNoteFileHandle(filePath);
+    const tabType = resolveWorkspaceFileTabType(file.path);
 
-  if (!trimmedPath) {
-    return [];
-  }
-
-  const candidates = new Set<string>();
-  const normalizedStoredPath = normalizeStoredPath(trimmedPath);
-  const normalizedWslUncPath = /^\/(wsl\.localhost|wsl\$)\//i.test(trimmedPath) && !trimmedPath.startsWith('//')
-    ? `/${trimmedPath}`
-    : trimmedPath;
-
-  candidates.add(trimmedPath);
-  candidates.add(normalizedWslUncPath);
-
-  if (normalizedStoredPath) {
-    candidates.add(normalizedStoredPath);
-  }
-
-  if (process.platform !== 'win32') {
-    const normalizedWindowsPath = trimmedPath.replace(/\\/g, '/');
-    const windowsDriveMatch = normalizedWindowsPath.match(/^([A-Za-z]):\/(.*)$/);
-
-    if (windowsDriveMatch) {
-      const [, driveLetter, suffix] = windowsDriveMatch;
-      candidates.add(`/mnt/${driveLetter.toLowerCase()}/${suffix}`);
+    if (tabType === 'unsupported') {
+      return null;
     }
 
-    const wslPath = parseWindowsWslPath(normalizedWslUncPath.replace(/\//g, '\\'));
-
-    if (wslPath?.linuxPath) {
-      candidates.add(wslPath.linuxPath);
-    }
+    return {
+      file,
+      tabType,
+    };
+  } catch {
+    return null;
   }
-
-  return [...candidates];
-}
-
-async function resolveReadableFilePath(filePath: string): Promise<string> {
-  const candidates = buildReadableFilePathCandidates(filePath);
-
-  for (const candidate of candidates) {
-    try {
-      const fileStat = await stat(candidate);
-
-      if (fileStat.isFile()) {
-        return candidate;
-      }
-    } catch {
-      // Try the next candidate path variant.
-    }
-  }
-
-  throw new Error(`File not found: ${filePath}`);
 }
 
 function normalizeNoteLinkLookup(value: string) {
@@ -307,16 +246,19 @@ async function resolveExistingNoteLink(baseFilePath: string | null, rawHref: str
 async function createMainWindow() {
   const windowIcon = nativeImage.createFromPath(getWindowIconPath());
   let allowTerminalRefreshShortcut = false;
+  let revealWindowTimer: NodeJS.Timeout | null = null;
+  const showWindowImmediately = process.platform === 'linux';
 
   mainWindow = new BrowserWindow({
     width: 1520,
     height: 980,
     minWidth: 1200,
     minHeight: 720,
+    center: true,
     backgroundColor: '#0b0f14',
     title: 'BridgeGit',
     icon: windowIcon.isEmpty() ? undefined : windowIcon,
-    show: false,
+    show: showWindowImmediately,
     webPreferences: {
       preload: getPreloadPath(),
       contextIsolation: true,
@@ -325,6 +267,31 @@ async function createMainWindow() {
   });
 
   applyWindowsTaskbarDetails(mainWindow);
+
+  const revealMainWindow = () => {
+    if (!mainWindow || mainWindow.isDestroyed()) {
+      return;
+    }
+
+    if (revealWindowTimer) {
+      clearTimeout(revealWindowTimer);
+      revealWindowTimer = null;
+    }
+
+    if (!windowIcon.isEmpty()) {
+      mainWindow.setIcon(windowIcon);
+    }
+
+    if (mainWindow.isMinimized()) {
+      mainWindow.restore();
+    }
+
+    if (!mainWindow.isVisible()) {
+      mainWindow.show();
+    }
+
+    mainWindow.focus();
+  };
 
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     void shell.openExternal(url);
@@ -343,16 +310,20 @@ async function createMainWindow() {
   });
 
   mainWindow.once('ready-to-show', () => {
-    if (!windowIcon.isEmpty()) {
-      mainWindow?.setIcon(windowIcon);
-    }
-
-    mainWindow?.show();
+    revealMainWindow();
 
     // if (isDevelopment) {
     //   mainWindow?.webContents.openDevTools({ mode: 'detach' });
     // }
   });
+
+  mainWindow.webContents.once('did-finish-load', () => {
+    revealMainWindow();
+  });
+
+  revealWindowTimer = setTimeout(() => {
+    revealMainWindow();
+  }, 2200);
 
   const activeWebContentsId = mainWindow.webContents.id;
   let closeAfterSessionFlush = false;
@@ -421,6 +392,11 @@ async function createMainWindow() {
   });
 
   mainWindow.on('closed', () => {
+    if (revealWindowTimer) {
+      clearTimeout(revealWindowTimer);
+      revealWindowTimer = null;
+    }
+
     clearCloseFlushTimer();
     ipcMain.removeListener('app:closeReady', handleCloseReady);
     ipcMain.removeListener('app:setTerminalFocusState', handleTerminalFocusState);
@@ -492,6 +468,7 @@ function registerCoreIpcHandlers() {
       return null;
     }
   });
+  ipcMain.handle('notes:resolveOpenTarget', async (_event, filePath: string) => resolveWorkspaceFileOpenTarget(filePath));
   ipcMain.handle('notes:statFile', async (_event, filePath: string) => readNoteFileStat(filePath));
   ipcMain.handle('notes:resolveLink', async (_event, baseFilePath: string | null, href: string) => {
     try {

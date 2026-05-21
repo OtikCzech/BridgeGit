@@ -18,6 +18,7 @@ import type {
   NoteFileHandle,
   NoteFileStat,
   ResolvedEditorTheme,
+  SupportedWorkspaceFileTabType,
   TerminalCommandPreset,
   ThemeVariant,
   WorkspaceCodeTabState,
@@ -48,6 +49,11 @@ const CodeTabView = defineAsyncComponent(() => import('./CodeTabView.vue'));
 interface TerminalSessionViewExpose {
   reconnect: () => Promise<void>;
   runPreset: (preset: TerminalCommandPreset) => Promise<boolean>;
+}
+
+interface WorkspaceNavigationTarget extends CodeNavigationTarget {
+  openedFile?: NoteFileHandle;
+  preferredType?: SupportedWorkspaceFileTabType;
 }
 
 interface Props {
@@ -3069,7 +3075,7 @@ async function openWorkspaceFile(targetTabId?: string | null) {
 function openResolvedWorkspaceFile(
   openedFile: NoteFileHandle,
   targetTabId?: string | null,
-  preferredType?: 'note' | 'code',
+  preferredType?: SupportedWorkspaceFileTabType,
 ) {
   const tabType = preferredType ?? resolveWorkspaceFileTabType(openedFile.path);
 
@@ -3128,6 +3134,49 @@ function openResolvedWorkspaceFile(
   return nextCodeTab;
 }
 
+function resolveWorkspaceNavigationTargetType(
+  target: Pick<WorkspaceNavigationTarget, 'filePath' | 'preferredType'>,
+): SupportedWorkspaceFileTabType | null {
+  const tabType = target.preferredType ?? resolveWorkspaceFileTabType(target.filePath);
+  return tabType === 'unsupported' ? null : tabType;
+}
+
+function resolveWorkspaceNavigationTargetTabId(
+  targetType: SupportedWorkspaceFileTabType,
+  targetTabId?: string | null,
+) {
+  const activeTab = activeTabId.value ? getTabById(activeTabId.value) : null;
+
+  return targetTabId ?? (
+    activeTab
+    && ((targetType === 'note' && isNoteTab(activeTab)) || (targetType === 'code' && isCodeTab(activeTab)))
+      ? activeTab.id
+      : null
+  );
+}
+
+function openResolvedWorkspaceNavigationFile(
+  openedFile: NoteFileHandle,
+  targetType: SupportedWorkspaceFileTabType,
+  targetTabId?: string | null,
+) {
+  creationMenu.value = null;
+
+  const resolvedTargetTabId = resolveWorkspaceNavigationTargetTabId(targetType, targetTabId);
+
+  if (resolvedTargetTabId) {
+    setNoteBusy(resolvedTargetTabId, true);
+  }
+
+  try {
+    return openResolvedWorkspaceFile(openedFile, resolvedTargetTabId, targetType);
+  } finally {
+    if (resolvedTargetTabId) {
+      setNoteBusy(resolvedTargetTabId, false);
+    }
+  }
+}
+
 async function openNoteFilePath(filePath: string, targetTabId?: string | null) {
   creationMenu.value = null;
 
@@ -3156,48 +3205,49 @@ async function openNoteFilePath(filePath: string, targetTabId?: string | null) {
 }
 
 async function openWorkspaceFilePath(filePath: string, targetTabId?: string | null) {
-  creationMenu.value = null;
-
   if (!window.bridgegit?.notes) {
     return null;
   }
 
-  const activeTab = activeTabId.value ? getTabById(activeTabId.value) : null;
-  const targetType = resolveWorkspaceFileTabType(filePath);
+  const targetType = resolveWorkspaceNavigationTargetType({ filePath });
 
-  if (targetType === 'unsupported') {
+  if (!targetType) {
     return null;
-  }
-
-  const resolvedTargetTabId = targetTabId ?? (
-    activeTab
-    && ((targetType === 'note' && isNoteTab(activeTab)) || (targetType === 'code' && isCodeTab(activeTab)))
-      ? activeTab.id
-      : null
-  );
-
-  if (resolvedTargetTabId) {
-    setNoteBusy(resolvedTargetTabId, true);
   }
 
   try {
-    const openedFile = await window.bridgegit.notes.readFile(filePath);
-    return openResolvedWorkspaceFile(openedFile, resolvedTargetTabId, targetType);
+    const resolvedTarget = await window.bridgegit.notes.resolveOpenTarget(filePath);
+
+    if (!resolvedTarget) {
+      return null;
+    }
+
+    return openResolvedWorkspaceNavigationFile(resolvedTarget.file, resolvedTarget.tabType, targetTabId);
   } catch (error) {
     console.error('Failed to open workspace file path.', error);
     return null;
-  } finally {
-    if (resolvedTargetTabId) {
-      setNoteBusy(resolvedTargetTabId, false);
-    }
   }
 }
 
-async function openCodeNavigationTarget(target: CodeNavigationTarget, targetTabId?: string | null) {
-  const openedTab = await openWorkspaceFilePath(target.filePath, targetTabId);
+async function openCodeNavigationTarget(target: WorkspaceNavigationTarget, targetTabId?: string | null) {
+  const targetType = resolveWorkspaceNavigationTargetType(target);
+  const openedTab = target.openedFile && targetType
+    ? openResolvedWorkspaceNavigationFile(target.openedFile, targetType, targetTabId)
+    : await openWorkspaceFilePath(target.filePath, targetTabId);
 
   if (!openedTab) {
     return null;
+  }
+
+  if (isNoteTab(openedTab) && (target.line || target.column)) {
+    const cursor = buildNavigationCursor(openedTab.content, target.line, target.column);
+
+    if (cursor) {
+      updateNoteTabState(openedTab.id, {
+        cursor,
+        ...(openedTab.viewMode === 'preview' ? { viewMode: 'split' } : {}),
+      });
+    }
   }
 
   if (isCodeTab(openedTab) && (target.line || target.column)) {
@@ -4605,6 +4655,39 @@ function updateNoteCursor(tabId: string, cursor: WorkspaceEditorCursorState) {
   updateNoteTabState(tabId, { cursor });
 }
 
+function getLineStartOffset(content: string, lineNumber: number) {
+  if (lineNumber <= 1) {
+    return 0;
+  }
+
+  const lines = content.split('\n');
+  let offset = 0;
+
+  for (let index = 0; index < lines.length && index < lineNumber - 1; index += 1) {
+    offset += (lines[index]?.length ?? 0) + 1;
+  }
+
+  return offset;
+}
+
+function buildNavigationCursor(content: string, line?: number, column?: number): WorkspaceEditorCursorState | null {
+  if (!line) {
+    return null;
+  }
+
+  const lines = content.split('\n');
+  const boundedLineNumber = Math.max(1, Math.min(line, Math.max(1, lines.length)));
+  const targetLine = lines[boundedLineNumber - 1] ?? '';
+  const lineStartOffset = getLineStartOffset(content, boundedLineNumber);
+  const boundedColumn = Math.max(1, Math.min(column ?? 1, targetLine.length + 1));
+  const offset = lineStartOffset + boundedColumn - 1;
+
+  return {
+    anchor: offset,
+    head: offset,
+  };
+}
+
 function updateCodeContent(tabId: string, content: string) {
   updateCodeTabState(tabId, { content });
 }
@@ -5600,7 +5683,7 @@ defineExpose({
           :ref="setCreationButtonRef"
           class="terminal-panel__add terminal-panel__add--inline"
           type="button"
-          title="Create workspace tab"
+          :title="`Create workspace tab ${SHORTCUTS.workspaceNewTabMenu.display}`"
           aria-label="Create workspace tab"
           @click="openCreationMenu"
           @contextmenu="openCreationMenu"

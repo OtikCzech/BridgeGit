@@ -528,7 +528,13 @@ export interface NoteFileHandle extends NoteFileStat {
   content: string;
 }
 
-export type WorkspaceFileTabType = 'note' | 'code' | 'unsupported';
+export type SupportedWorkspaceFileTabType = 'note' | 'code';
+export type WorkspaceFileTabType = SupportedWorkspaceFileTabType | 'unsupported';
+
+export interface ResolvedWorkspaceFileTarget {
+  file: NoteFileHandle;
+  tabType: SupportedWorkspaceFileTabType;
+}
 
 export const GLOBAL_WORKSPACE_SESSION_KEY = '__global__';
 export const GLOBAL_WORKSPACE_ID = 'workspace-global';

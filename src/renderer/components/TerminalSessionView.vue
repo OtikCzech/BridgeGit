@@ -5,12 +5,18 @@ import { Terminal, type ILink, type ILinkProvider } from '@xterm/xterm';
 import { nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import {
   normalizeShellFontSize,
-  resolveWorkspaceFileTabType,
   type AppAppearance,
   type CodeNavigationTarget,
+  type NoteFileHandle,
   type TerminalCommandPreset,
   type ThemeVariant,
+  type SupportedWorkspaceFileTabType,
 } from '../../shared/bridgegit';
+import {
+  buildTerminalNavigationTargets,
+  inferTerminalHomePath,
+  TERMINAL_FILE_LINK_PATTERN,
+} from '../../shared/terminalFileLinks';
 import {
   readClipboardText as readSharedClipboardText,
   rememberClipboardText,
@@ -33,6 +39,11 @@ interface Props {
   reconnectToken?: number;
 }
 
+interface TerminalNavigationTarget extends CodeNavigationTarget {
+  openedFile?: NoteFileHandle;
+  preferredType?: SupportedWorkspaceFileTabType;
+}
+
 const props = defineProps<Props>();
 const emit = defineEmits<{
   activity: [];
@@ -40,7 +51,7 @@ const emit = defineEmits<{
   activate: [];
   exit: [exitCode: number];
   input: [data: string];
-  'open-navigation-target': [target: CodeNavigationTarget];
+  'open-navigation-target': [target: TerminalNavigationTarget];
   'update:font-size': [fontSize: number];
 }>();
 
@@ -106,8 +117,6 @@ const blockedTerminalShortcuts = [
   SHORTCUTS.terminalPreviousTab,
   SHORTCUTS.terminalNextTab,
 ];
-const TERMINAL_FILE_LINK_PATTERN = /(?:[A-Za-z]:[\\/]|~[\\/]|\/|\.{1,2}[\\/]|(?:[\w.-]+[\\/])+)[^\s"'`(){}<>|]+?(?:\.[A-Za-z0-9_-]+|\/[\w.-]+)(?::\d+(?::\d+)?)?/g;
-
 function getTerminalTheme(theme: AppAppearance) {
   if (theme === 'bridgegit-light') {
     return {
@@ -238,202 +247,41 @@ function getTerminalTheme(theme: AppAppearance) {
   };
 }
 
-function normalizeTerminalPath(value: string) {
-  const normalizedValue = value.replace(/\\/g, '/');
-
-  if (/^\/(wsl\.localhost|wsl\$)\//i.test(normalizedValue) && !normalizedValue.startsWith('//')) {
-    return `/${normalizedValue}`;
-  }
-
-  return normalizedValue;
-}
-
-function parseTerminalUncPath(value: string) {
-  const match = normalizeTerminalPath(value).match(/^\/\/([^/]+)\/([^/]+)(\/.*)?$/);
-
-  if (!match) {
-    return null;
-  }
-
-  return {
-    host: match[1],
-    share: match[2],
-    path: match[3] ?? '/',
-  };
-}
-
-function resolvePosixRelativePath(basePath: string, relativePath: string) {
-  const baseSegments = splitTerminalPath(basePath);
-  const relativeSegments = splitTerminalPath(relativePath);
-  const resolvedSegments: string[] = [];
-
-  for (const segment of baseSegments) {
-    if (!segment || segment === '.') {
-      continue;
-    }
-
-    resolvedSegments.push(segment);
-  }
-
-  for (const segment of relativeSegments) {
-    if (!segment || segment === '.') {
-      continue;
-    }
-
-    if (segment === '..') {
-      if (resolvedSegments.length > 0 && resolvedSegments.at(-1) !== '..') {
-        resolvedSegments.pop();
-      }
-      continue;
-    }
-
-    resolvedSegments.push(segment);
-  }
-
-  if (/^[A-Za-z]:$/.test(resolvedSegments[0] ?? '')) {
-    return resolvedSegments.join('/');
-  }
-
-  return `/${resolvedSegments.join('/')}`;
-}
-
-function sanitizeTerminalNavigationPath(value: string) {
-  let normalizedValue = value.trim();
-
-  const wrappedPathMatch = normalizedValue.match(/^[A-Za-z][\w-]*\((.+)\)$/);
-
-  if (wrappedPathMatch?.[1]) {
-    normalizedValue = wrappedPathMatch[1].trim();
-  }
-
-  normalizedValue = normalizedValue
-    .replace(/^[`"'<>]+/, '')
-    .replace(/[)`"',;.!<>]+$/, '');
-
-  if (
-    (normalizedValue.startsWith('(') && normalizedValue.endsWith(')'))
-    || (normalizedValue.startsWith('[') && normalizedValue.endsWith(']'))
-  ) {
-    normalizedValue = normalizedValue.slice(1, -1).trim();
-  }
-
-  return normalizedValue;
-}
-
-function splitTerminalPath(value: string) {
-  return normalizeTerminalPath(value).split('/');
-}
-
-function inferTerminalHomePath() {
-  const candidates = [props.cwd, props.projectRoot];
-
-  for (const candidate of candidates) {
-    const normalizedCandidate = normalizeTerminalPath(candidate ?? '');
-    const unixMatch = normalizedCandidate.match(/^(\/home\/[^/]+|\/Users\/[^/]+)(?:\/|$)/);
-
-    if (unixMatch?.[1]) {
-      return unixMatch[1];
-    }
-
-    const windowsMatch = normalizedCandidate.match(/^([A-Za-z]:\/Users\/[^/]+)(?:\/|$)/);
-
-    if (windowsMatch?.[1]) {
-      return windowsMatch[1];
-    }
-  }
-
-  return null;
-}
-
-function resolveTerminalPath(basePath: string, relativePath: string) {
-  const normalizedBasePath = normalizeTerminalPath(basePath);
-  const normalizedRelativePath = normalizeTerminalPath(relativePath);
-  const isWindowsAbsolutePath = /^[A-Za-z]:\//.test(normalizedRelativePath);
-  const relativeUncPath = parseTerminalUncPath(normalizedRelativePath);
-
-  if (isWindowsAbsolutePath || relativeUncPath || normalizedRelativePath.startsWith('/')) {
-    return normalizedRelativePath;
-  }
-
-  const baseUncPath = parseTerminalUncPath(normalizedBasePath);
-
-  if (baseUncPath) {
-    const resolvedUncPath = resolvePosixRelativePath(baseUncPath.path, normalizedRelativePath);
-    return `//${baseUncPath.host}/${baseUncPath.share}${resolvedUncPath === '/' ? '' : resolvedUncPath}`;
-  }
-
-  return resolvePosixRelativePath(normalizedBasePath, normalizedRelativePath);
-}
-
-function buildTerminalNavigationTargets(rawLinkText: string): CodeNavigationTarget[] {
-  const normalizedLinkText = rawLinkText.trim();
-
-  if (!normalizedLinkText) {
-    return [];
-  }
-
-  const match = normalizedLinkText.match(/^(.*?)(?::(\d+))?(?::(\d+))?$/);
-  const rawPath = sanitizeTerminalNavigationPath(match?.[1]?.trim() ?? normalizedLinkText);
-  const line = match?.[2] ? Number.parseInt(match[2], 10) : undefined;
-  const column = match?.[3] ? Number.parseInt(match[3], 10) : undefined;
-  const normalizedRawPath = normalizeTerminalPath(rawPath);
-  const expandedRawPath = normalizedRawPath.startsWith('~/')
-    ? `${inferTerminalHomePath() ?? '~'}${normalizedRawPath.slice(1)}`
-    : normalizedRawPath;
-
-  if (expandedRawPath.startsWith('~/')) {
-    return [];
-  }
-
-  const isAbsolutePath = /^[A-Za-z]:\//.test(expandedRawPath) || expandedRawPath.startsWith('/');
-  const candidateBasePaths = isAbsolutePath
-    ? [null]
-    : [props.cwd, props.projectRoot].filter((value, index, source): value is string => (
-      Boolean(value) && source.indexOf(value) === index
-    ));
-
-  const targets = candidateBasePaths
-    .map((basePath) => (
-      basePath
-        ? resolveTerminalPath(basePath, expandedRawPath)
-        : expandedRawPath
-    ))
-    .filter((filePath, index, source) => (
-      resolveWorkspaceFileTabType(filePath) !== 'unsupported'
-      && source.findIndex((candidate) => normalizeTerminalPath(candidate) === normalizeTerminalPath(filePath)) === index
-    ))
-    .map<CodeNavigationTarget>((filePath) => ({
-      filePath,
-      line,
-      column,
-    }));
-
-  return targets;
+function getTerminalNavigationTargets(rawLinkText: string) {
+  return buildTerminalNavigationTargets(rawLinkText, {
+    cwd: props.cwd,
+    projectRoot: props.projectRoot,
+    homePath: inferTerminalHomePath([props.cwd, props.projectRoot]),
+  });
 }
 
 function parseTerminalNavigationTarget(rawLinkText: string): CodeNavigationTarget | null {
-  const targets = buildTerminalNavigationTargets(rawLinkText);
+  const targets = getTerminalNavigationTargets(rawLinkText);
   return targets[0] ?? null;
 }
 
 async function activateTerminalFileLink(rawLinkText: string) {
-  const targets = buildTerminalNavigationTargets(rawLinkText);
+  const targets = getTerminalNavigationTargets(rawLinkText);
 
   if (!targets.length || !window.bridgegit?.notes) {
+    showToast('No file target detected');
     return;
   }
 
   try {
     for (const target of targets) {
-      const inspectedFile = await window.bridgegit.notes.inspectFile(target.filePath);
+      const resolvedTarget = await window.bridgegit.notes.resolveOpenTarget(target.filePath);
 
-      if (!inspectedFile) {
+      if (!resolvedTarget) {
         continue;
       }
 
+      showToast(`Opening ${resolvedTarget.file.path}`);
       emit('open-navigation-target', {
         ...target,
-        filePath: inspectedFile.path,
+        filePath: resolvedTarget.file.path,
+        openedFile: resolvedTarget.file,
+        preferredType: resolvedTarget.tabType,
       });
       return;
     }

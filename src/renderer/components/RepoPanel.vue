@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import CopyableErrorNotice from './CopyableErrorNotice.vue';
+import { writeClipboardText } from '../clipboard';
 import type {
   BranchInfo,
   BranchSummary,
@@ -152,8 +153,12 @@ interface FilesStatusIndicator {
 }
 
 interface FileMenuState {
-  change: GitChange;
+  path: string;
+  kind: 'file' | 'directory';
+  change: GitChange | null;
   canOpenFile: boolean;
+  canShowDiff: boolean;
+  canDiscard: boolean;
   x: number;
   y: number;
 }
@@ -213,6 +218,7 @@ const isBranchCreateMode = ref(false);
 const fileMenuMode = ref<FileMenuMode>('actions');
 const workspaceMenuMode = ref<WorkspaceMenuMode>('actions');
 const branchItemMenuMode = ref<BranchItemMenuMode>('actions');
+const copyToast = ref<string | null>(null);
 const draggedWorkspaceId = ref<string | null>(null);
 const dropTargetWorkspaceId = ref<string | null>(null);
 const branchFilter = ref('');
@@ -251,6 +257,7 @@ let allFilesTypeSelectTimer: number | null = null;
 let branchSearchFocusTimer: number | null = null;
 let filesFilterDeferredFocusTimers: number[] = [];
 let filesFilterFocusRequestToken = 0;
+let copyToastTimer: number | null = null;
 const historyCount = computed(() => props.log?.items.length ?? 0);
 const collapseButtonTitle = computed(() => (
   props.canCollapse
@@ -875,6 +882,10 @@ function shouldShowAllFilesPath(path: string) {
 
 function shouldShowAllFilesEntry(entry: RepoDirectoryEntry) {
   return showHiddenAllFiles.value || !isHiddenPathSegment(entry.name);
+}
+
+function isHiddenAllFilesPath(path: string) {
+  return splitPath(path).some((segment) => isHiddenPathSegment(segment));
 }
 
 function fileName(path: string) {
@@ -2332,8 +2343,34 @@ function openFileMenu(event: MouseEvent, change: GitChange) {
   closeWorkspaceMenu();
   fileMenuMode.value = 'actions';
   fileMenu.value = {
+    path: change.path,
+    kind: 'file',
     change,
     canOpenFile: supportsWorkspaceFileOpen(change.path),
+    canShowDiff: true,
+    canDiscard: true,
+    x: event.clientX,
+    y: event.clientY,
+  };
+}
+
+function openAllFilesPathMenu(
+  event: MouseEvent,
+  path: string,
+  kind: 'file' | 'directory',
+  change: GitChange | null = null,
+) {
+  event.preventDefault();
+  closeBranchMenu();
+  closeWorkspaceMenu();
+  fileMenuMode.value = 'actions';
+  fileMenu.value = {
+    path,
+    kind,
+    change,
+    canOpenFile: kind === 'file' && supportsWorkspaceFileOpen(path),
+    canShowDiff: kind === 'file' && Boolean(change),
+    canDiscard: Boolean(change),
     x: event.clientX,
     y: event.clientY,
   };
@@ -2345,27 +2382,27 @@ function closeFileMenu() {
 }
 
 function handleOpenWorkspaceFile() {
-  if (!fileMenu.value) {
+  if (!fileMenu.value || !fileMenu.value.canOpenFile) {
     return;
   }
 
-  emit('open-workspace-file', fileMenu.value.change.path);
+  emit('open-workspace-file', fileMenu.value.path);
   closeFileMenu();
 }
 
 function handleShowFileDiff() {
-  if (!fileMenu.value) {
+  if (!fileMenu.value || !fileMenu.value.canShowDiff) {
     return;
   }
 
-  const sectionId = findSectionIdByPath(fileMenu.value.change.path);
+  const sectionId = findSectionIdByPath(fileMenu.value.path);
   const diffMode = sectionId ? getSectionDiffMode(sectionId) : undefined;
-  emit('select-file', fileMenu.value.change.path, diffMode);
+  emit('select-file', fileMenu.value.path, diffMode);
   closeFileMenu();
 }
 
 function handleFileDiscardStart() {
-  if (!fileMenu.value) {
+  if (!fileMenu.value || !fileMenu.value.canDiscard) {
     return;
   }
 
@@ -2373,7 +2410,7 @@ function handleFileDiscardStart() {
 }
 
 function handleFileDiscard() {
-  if (!fileMenu.value) {
+  if (!fileMenu.value?.change) {
     return;
   }
 
@@ -2381,8 +2418,59 @@ function handleFileDiscard() {
   closeFileMenu();
 }
 
-function fileDiscardTitle() {
+function buildAbsoluteRepoPath(repoPath: string | null, relativePath: string) {
+  if (!repoPath) {
+    return relativePath;
+  }
+
+  const separator = /[\\]/.test(repoPath) && !repoPath.startsWith('/') ? '\\' : '/';
+  const trimmedRepoPath = repoPath.replace(/[\\/]+$/, '');
+  const normalizedRelativePath = separator === '\\'
+    ? relativePath.replace(/\//g, '\\')
+    : normalizePathSeparators(relativePath);
+
+  if (!normalizedRelativePath) {
+    return trimmedRepoPath;
+  }
+
+  return `${trimmedRepoPath}${separator}${normalizedRelativePath}`;
+}
+
+function showCopyToast(message: string) {
+  copyToast.value = message;
+
+  if (copyToastTimer !== null) {
+    window.clearTimeout(copyToastTimer);
+  }
+
+  copyToastTimer = window.setTimeout(() => {
+    copyToastTimer = null;
+    copyToast.value = null;
+  }, 1800);
+}
+
+async function handleCopyRepoPath() {
   if (!fileMenu.value) {
+    return;
+  }
+
+  await writeClipboardText(buildAbsoluteRepoPath(props.repoPath, fileMenu.value.path));
+  closeFileMenu();
+  showCopyToast(fileMenu.value.kind === 'directory' ? 'Directory path copied' : 'File path copied');
+}
+
+async function handleCopyProjectPath() {
+  if (!fileMenu.value) {
+    return;
+  }
+
+  await writeClipboardText(normalizePathSeparators(fileMenu.value.path));
+  closeFileMenu();
+  showCopyToast(fileMenu.value.kind === 'directory' ? 'Project directory path copied' : 'Project file path copied');
+}
+
+function fileDiscardTitle() {
+  if (!fileMenu.value?.change) {
     return 'Discard file changes?';
   }
 
@@ -2392,7 +2480,7 @@ function fileDiscardTitle() {
 }
 
 function fileDiscardCopy() {
-  if (!fileMenu.value) {
+  if (!fileMenu.value?.change) {
     return '';
   }
 
@@ -2575,6 +2663,18 @@ function handleWorkspaceRepoChange() {
 
   emit('change-workspace-repo', workspaceMenu.value.workspaceId);
   closeWorkspaceMenu();
+}
+
+async function handleCopyWorkspaceBranchName() {
+  const branchName = workspaceMenu.value?.branch?.trim();
+
+  if (!branchName) {
+    return;
+  }
+
+  await writeClipboardText(branchName);
+  closeWorkspaceMenu();
+  showCopyToast('Branch name copied');
 }
 
 function handleWorkspaceRemoveStart() {
@@ -3328,6 +3428,11 @@ onBeforeUnmount(() => {
     window.clearTimeout(allFilesTypeSelectTimer);
     allFilesTypeSelectTimer = null;
   }
+
+  if (copyToastTimer !== null) {
+    window.clearTimeout(copyToastTimer);
+    copyToastTimer = null;
+  }
 });
 </script>
 
@@ -4033,15 +4138,17 @@ onBeforeUnmount(() => {
                         :class="{
                           'repo-panel__file-main--selected': isHighlightedAllFilesPath(entry.path),
                           'repo-panel__file-main--focused': focusedAllFilesPath === entry.path,
+                          'repo-panel__file-main--hidden': isHiddenAllFilesPath(entry.path),
                         }"
                         :data-all-files-path="entry.path"
                         type="button"
+                        @contextmenu="openAllFilesPathMenu($event, entry.path, 'file', entry.item ?? null)"
                         @focus="setFocusedAllFilesPath(entry.path)"
                         @click="selectAllFilesPath(entry.path)"
                       >
                         <span class="repo-panel__file-meta">
-                          <span class="repo-panel__file-name">{{ fileName(entry.path) }}</span>
-                          <span class="repo-panel__file-directory">{{ fileDirectory(entry.path) }}</span>
+                          <span class="repo-panel__file-name" :title="fileName(entry.path)">{{ fileName(entry.path) }}</span>
+                          <span class="repo-panel__file-directory" :title="fileDirectory(entry.path)">{{ fileDirectory(entry.path) }}</span>
                         </span>
                         <span
                           v-if="entry.item"
@@ -4051,10 +4158,15 @@ onBeforeUnmount(() => {
                         />
                       </button>
 
-                      <div v-else class="repo-panel__file-main repo-panel__file-main--static">
+                      <div
+                        v-else
+                        class="repo-panel__file-main repo-panel__file-main--static"
+                        :class="{ 'repo-panel__file-main--hidden': isHiddenAllFilesPath(entry.path) }"
+                        @contextmenu="openAllFilesPathMenu($event, entry.path, 'file', entry.item ?? null)"
+                      >
                         <span class="repo-panel__file-meta">
-                          <span class="repo-panel__file-name">{{ fileName(entry.path) }}</span>
-                          <span class="repo-panel__file-directory">{{ fileDirectory(entry.path) }}</span>
+                          <span class="repo-panel__file-name" :title="fileName(entry.path)">{{ fileName(entry.path) }}</span>
+                          <span class="repo-panel__file-directory" :title="fileDirectory(entry.path)">{{ fileDirectory(entry.path) }}</span>
                         </span>
                       </div>
                     </li>
@@ -4075,15 +4187,19 @@ onBeforeUnmount(() => {
                       <button
                         v-if="row.type === 'directory'"
                         class="repo-panel__tree-directory repo-panel__tree-directory--button"
-                        :class="{ 'repo-panel__tree-directory--focused': focusedAllFilesPath === row.path }"
+                        :class="{
+                          'repo-panel__tree-directory--focused': focusedAllFilesPath === row.path,
+                          'repo-panel__tree-directory--hidden': isHiddenAllFilesPath(row.path),
+                        }"
                         :data-all-files-path="row.path"
                         :style="treeRowStyle(row.depth)"
                         type="button"
+                        @contextmenu="openAllFilesPathMenu($event, row.path, 'directory', row.item ?? null)"
                         @focus="setFocusedAllFilesPath(row.path)"
                         @click="handleAllFilesDirectoryClick(row.path)"
                       >
                         <span class="repo-panel__tree-caret" aria-hidden="true">{{ row.isExpanded ? '▾' : '▸' }}</span>
-                        <span class="repo-panel__tree-label">{{ row.name }}</span>
+                        <span class="repo-panel__tree-label" :title="row.name">{{ row.name }}</span>
                         <span
                           v-if="row.isLoading"
                           class="repo-panel__group-loader"
@@ -4112,14 +4228,16 @@ onBeforeUnmount(() => {
                         :class="{
                           'repo-panel__tree-file--selected': isHighlightedAllFilesPath(row.path),
                           'repo-panel__tree-file--focused': focusedAllFilesPath === row.path,
+                          'repo-panel__tree-file--hidden': isHiddenAllFilesPath(row.path),
                         }"
                         :data-all-files-path="row.path"
                         type="button"
                         :style="treeRowStyle(row.depth)"
+                        @contextmenu="openAllFilesPathMenu($event, row.path, 'file', row.item ?? null)"
                         @focus="setFocusedAllFilesPath(row.path)"
                         @click="selectAllFilesPath(row.path)"
                       >
-                        <span class="repo-panel__tree-label">{{ row.name }}</span>
+                        <span class="repo-panel__tree-label" :title="row.name">{{ row.name }}</span>
                         <span
                           v-if="row.item"
                           class="repo-panel__status-dot"
@@ -4131,9 +4249,11 @@ onBeforeUnmount(() => {
                       <div
                         v-else
                         class="repo-panel__tree-file-static"
+                        :class="{ 'repo-panel__tree-file-static--hidden': isHiddenAllFilesPath(row.path) }"
                         :style="treeRowStyle(row.depth)"
+                        @contextmenu="openAllFilesPathMenu($event, row.path, 'file', row.item ?? null)"
                       >
-                        <span class="repo-panel__tree-label">{{ row.name }}</span>
+                        <span class="repo-panel__tree-label" :title="row.name">{{ row.name }}</span>
                       </div>
                     </li>
                   </ul>
@@ -4333,6 +4453,7 @@ onBeforeUnmount(() => {
     >
       <template v-if="fileMenuMode === 'actions'">
         <button
+          v-if="fileMenu.canShowDiff"
           class="repo-panel__file-menu-item"
           type="button"
           role="menuitem"
@@ -4350,6 +4471,23 @@ onBeforeUnmount(() => {
           Open file
         </button>
         <button
+          class="repo-panel__file-menu-item"
+          type="button"
+          role="menuitem"
+          @click="handleCopyRepoPath"
+        >
+          Copy path
+        </button>
+        <button
+          class="repo-panel__file-menu-item"
+          type="button"
+          role="menuitem"
+          @click="handleCopyProjectPath"
+        >
+          Copy project path
+        </button>
+        <button
+          v-if="fileMenu.canDiscard"
           class="repo-panel__file-menu-item repo-panel__file-menu-item--danger"
           type="button"
           role="menuitem"
@@ -4385,6 +4523,12 @@ onBeforeUnmount(() => {
       </div>
     </div>
 
+    <transition name="repo-panel-toast">
+      <div v-if="copyToast" class="repo-panel__toast">
+        {{ copyToast }}
+      </div>
+    </transition>
+
     <div
       v-if="workspaceMenu"
       class="repo-panel__workspace-menu"
@@ -4408,6 +4552,15 @@ onBeforeUnmount(() => {
           @click="handleWorkspaceRepoChange"
         >
           Change repository folder…
+        </button>
+        <button
+          v-if="workspaceMenu.branch"
+          class="repo-panel__file-menu-item"
+          type="button"
+          role="menuitem"
+          @click="handleCopyWorkspaceBranchName"
+        >
+          Copy branch name
         </button>
         <div
           v-if="workspaceMenu.worktreeRole === 'linked'"
@@ -5885,6 +6038,14 @@ onBeforeUnmount(() => {
   box-shadow: inset 0 0 0 1px rgba(111, 224, 165, 0.2);
 }
 
+.repo-panel__file-main--hidden {
+  color: color-mix(in srgb, var(--text-muted) 86%, transparent);
+}
+
+.repo-panel__file-main--hidden .repo-panel__file-name {
+  color: color-mix(in srgb, var(--text-primary) 72%, transparent);
+}
+
 .repo-panel__file-meta {
   min-width: 0;
   flex: 1 1 auto;
@@ -5995,6 +6156,10 @@ onBeforeUnmount(() => {
   color: var(--text-primary);
 }
 
+.repo-panel__tree-directory--hidden {
+  color: color-mix(in srgb, var(--text-muted) 84%, transparent);
+}
+
 .repo-panel__tree-file {
   display: flex;
   align-items: center;
@@ -6013,6 +6178,11 @@ onBeforeUnmount(() => {
   color: var(--text-muted);
   padding-block: 0.2rem;
   padding-inline-end: 0.48rem;
+}
+
+.repo-panel__tree-file--hidden,
+.repo-panel__tree-file-static--hidden {
+  color: color-mix(in srgb, var(--text-primary) 70%, transparent);
 }
 
 .repo-panel__tree-file:hover,
@@ -6052,6 +6222,32 @@ onBeforeUnmount(() => {
   text-overflow: ellipsis;
   white-space: nowrap;
   font-size: calc(0.7rem * var(--repo-panel-scale));
+}
+
+.repo-panel__toast {
+  position: fixed;
+  right: 18px;
+  bottom: 18px;
+  z-index: 80;
+  padding: 0.55rem 0.75rem;
+  border: 1px solid rgba(108, 124, 148, 0.18);
+  border-radius: 10px;
+  background: rgba(9, 13, 18, 0.96);
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: calc(0.74rem * var(--repo-panel-scale));
+  box-shadow: 0 14px 30px rgba(0, 0, 0, 0.28);
+}
+
+.repo-panel-toast-enter-active,
+.repo-panel-toast-leave-active {
+  transition: opacity 140ms ease, transform 140ms ease;
+}
+
+.repo-panel-toast-enter-from,
+.repo-panel-toast-leave-to {
+  opacity: 0;
+  transform: translateY(6px);
 }
 
 .repo-panel__error,

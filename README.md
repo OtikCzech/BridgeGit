@@ -2,7 +2,7 @@
 
 BridgeGit is an Electron desktop app that combines Git workflows, an integrated terminal workspace, notes and a code editor in one window.
 
-Current release: `v0.8.0`
+Current release: `v0.9.0`
 
 It is built for day-to-day repository work where you want Git status, history, diffs, shell sessions and file editing to stay in the same context.
 
@@ -12,7 +12,7 @@ It is built for day-to-day repository work where you want Git status, history, d
 - Syntax-highlighted diff viewer with working-tree and staged diffs plus direct stage-and-continue flow
 - Workspace tabs for shell, notes and code files
 - Code editor with split panes up to `2x2`, file-backed tabs and code navigation for common languages
-- Notes tabs with Markdown editing, split preview and Mermaid rendering
+- Notes tabs with Markdown editing, split preview, task lens and Mermaid rendering
 - `Quick Open`, `All Tabs`, `Find in Files`, `Replace in Files` and `All files` tree for larger repos
 - Two-tab side-by-side workspace view via `Ctrl+click` on tab headers for `shell`, `note` and `code` tabs
 - Global Docker dialog for containers, images, Compose grouping, quick actions and log handoff into workspace tabs

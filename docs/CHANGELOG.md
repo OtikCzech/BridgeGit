@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.9.0 - 2026-05-21
+
+Notes and repository workflow release focused on turning markdown tasks into a first-class workspace tool while broadening repo-panel actions for larger trees.
+
+- Added a dedicated notes task workflow with `Preview` and `Tasks` lenses, richer task states, larger toggle targets, copy actions and better preview/task interaction polish
+- Refreshed notes preview behavior with steadier Mermaid lifecycle handling and a quieter Linux startup fallback
+- Expanded repo-panel `All files` actions with context menus, path-copy flows and clearer handling for hidden files and directories
+- Added `Copy branch name` to the workspace menu for faster branch handoff into terminals, notes and external tools
+- Improved WSL note-link handling in the integrated terminal and aligned editor selection highlighting with the active theme
+
 ## v0.8.0 - 2026-05-01
 
 Workspace refinement release focused on reusable workflows, calmer note defaults and clearer multi-repo filtering.

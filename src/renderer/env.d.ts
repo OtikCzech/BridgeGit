@@ -23,6 +23,7 @@ import type {
   MergeWorktreeIntoPrimaryBranchResult,
   NoteFileHandle,
   NoteFileStat,
+  ResolvedWorkspaceFileTarget,
   PtyCreateOptions,
   PtyDataEvent,
   PtyExitEvent,
@@ -54,6 +55,7 @@ declare global {
         openFile: () => Promise<NoteFileHandle | null>;
         readFile: (filePath: string) => Promise<NoteFileHandle>;
         inspectFile: (filePath: string) => Promise<NoteFileHandle | null>;
+        resolveOpenTarget: (filePath: string) => Promise<ResolvedWorkspaceFileTarget | null>;
         statFile: (filePath: string) => Promise<NoteFileStat | null>;
         resolveLink: (baseFilePath: string | null, href: string) => Promise<string | null>;
         saveFile: (filePath: string, content: string) => Promise<string>;

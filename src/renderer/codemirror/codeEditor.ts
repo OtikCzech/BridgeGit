@@ -1,5 +1,6 @@
 import type { Extension } from '@codemirror/state';
 import { HighlightStyle, StreamLanguage, syntaxHighlighting, type Language } from '@codemirror/language';
+import { EditorView } from '@codemirror/view';
 import { css } from '@codemirror/lang-css';
 import { html } from '@codemirror/lang-html';
 import { javascript } from '@codemirror/lang-javascript';
@@ -265,6 +266,26 @@ export function isCodeEditorLargeFile(content: string): boolean {
 }
 
 export const bridgeGitCodeHighlighting = syntaxHighlighting(codeHighlightStyle);
+export const bridgeGitEditorChromeTheme = EditorView.theme({
+  '&.cm-focused > .cm-scroller > .cm-selectionLayer .cm-selectionBackground': {
+    backgroundColor: 'var(--bridgegit-editor-selection-bg)',
+  },
+  '.cm-selectionLayer .cm-selectionBackground': {
+    backgroundColor: 'var(--bridgegit-editor-selection-bg)',
+  },
+  '.cm-content ::selection': {
+    backgroundColor: 'var(--bridgegit-editor-selection-bg)',
+  },
+  '.cm-line::selection': {
+    backgroundColor: 'var(--bridgegit-editor-selection-bg)',
+  },
+  '.cm-line *::selection': {
+    backgroundColor: 'var(--bridgegit-editor-selection-bg)',
+  },
+  '.cm-searchMatch.cm-searchMatch-selected': {
+    backgroundColor: 'var(--bridgegit-editor-selection-bg)',
+  },
+});
 
 export function getCodeEditorThemeExtension(theme: ResolvedEditorTheme): Extension {
   switch (theme) {

@@ -36,6 +36,7 @@ import {
   type WorkspaceExternalFileChangeState,
 } from '../../shared/bridgegit';
 import {
+  bridgeGitEditorChromeTheme,
   CODE_EDITOR_LARGE_FILE_CHAR_LIMIT,
   getCodeEditorLanguageExtension,
   getCodeEditorLanguageLabel,
@@ -898,6 +899,7 @@ function createEditor() {
       languageCompartment.of(getCodeEditorLanguageExtension(props.filePath, isLargeFile.value)),
       modeCompartment.of(buildModeExtensions(isLargeFile.value)),
       themeCompartment.of(getCodeEditorThemeExtension(props.editorTheme)),
+      bridgeGitEditorChromeTheme,
     ],
   });
 
@@ -1407,6 +1409,7 @@ onBeforeUnmount(() => {
 
 <style scoped lang="scss">
 .code-tab {
+  --bridgegit-editor-selection-bg: var(--code-tab-selection-bg);
   --code-tab-text-primary: var(--text-primary);
   --code-tab-text-muted: var(--text-muted);
   --code-tab-text-dim: var(--text-dim);

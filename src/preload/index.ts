@@ -22,6 +22,7 @@ import type {
   MergeWorktreeIntoPrimaryBranchResult,
   NoteFileHandle,
   NoteFileStat,
+  ResolvedWorkspaceFileTarget,
   PtyCreateOptions,
   PtyDataEvent,
   PtyExitEvent,
@@ -52,6 +53,8 @@ const bridgegitApi = {
     openFile: () => ipcRenderer.invoke('notes:openFile') as Promise<NoteFileHandle | null>,
     readFile: (filePath: string) => ipcRenderer.invoke('notes:readFile', filePath) as Promise<NoteFileHandle>,
     inspectFile: (filePath: string) => ipcRenderer.invoke('notes:inspectFile', filePath) as Promise<NoteFileHandle | null>,
+    resolveOpenTarget: (filePath: string) =>
+      ipcRenderer.invoke('notes:resolveOpenTarget', filePath) as Promise<ResolvedWorkspaceFileTarget | null>,
     statFile: (filePath: string) => ipcRenderer.invoke('notes:statFile', filePath) as Promise<NoteFileStat | null>,
     resolveLink: (baseFilePath: string | null, href: string) =>
       ipcRenderer.invoke('notes:resolveLink', baseFilePath, href) as Promise<string | null>,

@@ -2,20 +2,19 @@
 
 This note is the default place for release updates and small product messages inside BridgeGit.
 
-## New in 0.8.0
+## New in 0.9.0
 
-- customize keyboard shortcuts for workspace actions and command slots directly in Settings
-- choose default note behavior in Settings, including the open mode and line-number preference for new notes tabs
-- pin repo filters in larger workspace sessions to keep multi-repo focus easier to control
-- rely on safer shell tab closing, latest-selection paste support in the terminal and calmer note default reuse
-- spot shell, note and code tabs faster through clearer type icons in the workspace tab strip
+- switch notes between `Preview` and `Tasks` so markdown checklists become a faster triage and execution flow
+- move tasks through richer states like `in progress`, `waiting`, `done` and `cancelled` directly from preview and task cards
+- copy full task lines or plain task text from the tasks lens without opening the raw markdown first
+- use broader repo-panel context actions in `All files`, including path copy helpers and better hidden-file handling
+- copy the current branch name straight from the workspace menu when you need it in a shell, note or external tool
 
-## Also in the 0.8.x line
+## Also in the 0.9.x line
 
-- the CodeMirror-based notes editor keeps matched themes, better editing behavior and optional line numbers
-- persistent clipboard history still works across shell and editor tabs when you need older snippets
-- workspace restore remains stronger than in the older release line, including tab state and active pane recovery
-- note split, multi-display and editor-pane layouts stay directly resizable with draggable dividers
+- Mermaid note previews refresh more reliably during editing instead of leaving stale diagrams behind
+- WSL note links open more cleanly from the integrated terminal
+- editor selection highlighting stays aligned with the active theme for less visual noise across theme switches
 
 ## Quick Start
 

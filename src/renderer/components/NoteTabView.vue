@@ -29,7 +29,7 @@ import {
   readClipboardText as readSharedClipboardText,
   writeClipboardText as writeSharedClipboardText,
 } from '../clipboard';
-import { getCodeEditorThemeExtension } from '../codemirror/codeEditor';
+import { bridgeGitEditorChromeTheme, getCodeEditorThemeExtension } from '../codemirror/codeEditor';
 import { useClipboardHistoryTarget } from '../composables/useClipboardHistoryTarget';
 import { useColumnSplitter } from '../composables/useColumnSplitter';
 import { SHORTCUTS, matchesShortcut, shortcutBindingsRevision } from '../shortcuts';
@@ -80,6 +80,11 @@ const previewRef = ref<HTMLElement | null>(null);
 const searchInputRef = ref<HTMLInputElement | null>(null);
 const copyToast = ref<string | null>(null);
 const filePathMenu = ref<{ x: number; y: number } | null>(null);
+const taskStateMenu = ref<{ x: number; y: number; taskIndex: number } | null>(null);
+const taskCopyMenu = ref<{ x: number; y: number; taskIndex: number } | null>(null);
+const previewLens = ref<'preview' | 'tasks'>('preview');
+const taskFilter = ref<'all' | NoteTaskState>('all');
+const activeTaskTagFilter = ref<string | null>(null);
 const searchVisible = ref(false);
 const searchQuery = ref('');
 const activePreviewMatchIndex = ref(0);
@@ -108,8 +113,13 @@ let nextMermaidDiagramId = 1;
 const NOTE_PATH_LABEL_MAX_LENGTH = 36;
 const FILE_PATH_MENU_WIDTH = 220;
 const FILE_PATH_MENU_HEIGHT = 168;
+const TASK_STATE_MENU_WIDTH = 196;
+const TASK_STATE_MENU_HEIGHT = 232;
+const TASK_COPY_MENU_WIDTH = 176;
+const TASK_COPY_MENU_HEIGHT = 116;
 const NOTE_VIEW_MODES: WorkspaceNoteTabState['viewMode'][] = ['source', 'split', 'preview'];
 const NOTE_FILE_EXTENSIONS = new Set(['md', 'markdown', 'txt']);
+const TASK_LINE_PATTERN = /^(\s*(?:>\s*)*(?:[-*+]|\d+[.)])\s+\[)([ xX./\-!])(\].*)$/;
 const CODE_LANGUAGE_ALIASES: Record<string, string> = {
   js: 'javascript',
   jsx: 'javascript',
@@ -149,6 +159,47 @@ const WIKI_LINK_TOKENIZER = {
   },
 };
 
+type NoteTaskState = 'open' | 'in-progress' | 'waiting' | 'done' | 'cancelled';
+
+interface RenderedMarkdownTask {
+  taskIndex: number;
+  state: NoteTaskState;
+}
+
+interface ParsedNoteTask {
+  taskIndex: number;
+  lineIndex: number;
+  state: NoteTaskState;
+  text: string;
+  tags: string[];
+  rawText: string;
+  sourceLine: string;
+}
+
+const TASK_STATE_MARKERS: Record<NoteTaskState, string> = {
+  open: ' ',
+  'in-progress': '/',
+  waiting: '-',
+  done: 'x',
+  cancelled: '!',
+};
+
+const TASK_STATE_MENU_ITEMS: Array<{ state: NoteTaskState; label: string }> = [
+  { state: 'open', label: 'Open' },
+  { state: 'in-progress', label: 'In progress' },
+  { state: 'waiting', label: 'Waiting' },
+  { state: 'done', label: 'Done' },
+  { state: 'cancelled', label: 'Cancelled' },
+];
+const TASK_FILTER_ITEMS: Array<{ value: 'all' | NoteTaskState; label: string }> = [
+  { value: 'all', label: 'All' },
+  { value: 'open', label: 'Open' },
+  { value: 'in-progress', label: 'Active' },
+  { value: 'waiting', label: 'Waiting' },
+  { value: 'done', label: 'Done' },
+  { value: 'cancelled', label: 'Cancelled' },
+];
+
 marked.use({
   extensions: [WIKI_LINK_TOKENIZER as never],
 });
@@ -169,6 +220,200 @@ function escapeHtml(value: string) {
 
 function escapeHtmlAttribute(value: string) {
   return escapeHtml(value);
+}
+
+function getTaskStateFromMarker(marker: string): NoteTaskState | null {
+  switch (marker) {
+    case ' ':
+      return 'open';
+    case '/':
+    case '.':
+      return 'in-progress';
+    case '-':
+      return 'waiting';
+    case 'x':
+    case 'X':
+      return 'done';
+    case '!':
+      return 'cancelled';
+    default:
+      return null;
+  }
+}
+
+function isNoteTaskState(value: string | null | undefined): value is NoteTaskState {
+  return value === 'open'
+    || value === 'in-progress'
+    || value === 'waiting'
+    || value === 'done'
+    || value === 'cancelled';
+}
+
+function getTaskStateLabel(state: NoteTaskState) {
+  switch (state) {
+    case 'open':
+      return 'Open';
+    case 'in-progress':
+      return 'In progress';
+    case 'waiting':
+      return 'Waiting';
+    case 'done':
+      return 'Done';
+    case 'cancelled':
+      return 'Cancelled';
+    default:
+      return 'Task';
+  }
+}
+
+function getTaskStateGlyph(state: NoteTaskState) {
+  switch (state) {
+    case 'in-progress':
+      return '/';
+    case 'waiting':
+      return '-';
+    case 'done':
+      return 'x';
+    case 'cancelled':
+      return '!';
+    case 'open':
+    default:
+      return '';
+  }
+}
+
+function getTaskStateMarkerLabel(state: NoteTaskState) {
+  const marker = TASK_STATE_MARKERS[state];
+  return `[${marker === ' ' ? ' ' : marker}]`;
+}
+
+function getTaskStateIconSvg(state: NoteTaskState, includeFrame = false) {
+  const frame = includeFrame
+    ? '<rect x="3.1" y="1.9" width="9.8" height="12.2" rx="2.2" fill="none" stroke="currentColor" stroke-width="1.5"/>'
+    : '';
+
+  switch (state) {
+    case 'in-progress':
+      return `${frame}<path d="M5.7 10.9 10.3 5.1" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>`;
+    case 'waiting':
+      return `${frame}<path d="M5.2 8h5.6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>`;
+    case 'done':
+      return `${frame}<path d="m4.9 8.1 2.3 2.4 4.1-4.8" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>`;
+    case 'cancelled':
+      return `${frame}<path d="M8 4.9v4.7" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><circle cx="8" cy="11.7" r="0.95" fill="currentColor"/>`;
+    case 'open':
+    default:
+      return frame;
+  }
+}
+
+function getNextPrimaryTaskState(currentState: NoteTaskState): NoteTaskState {
+  switch (currentState) {
+    case 'open':
+      return 'in-progress';
+    case 'in-progress':
+      return 'done';
+    case 'waiting':
+      return 'in-progress';
+    case 'cancelled':
+      return 'open';
+    case 'done':
+    default:
+      return 'open';
+  }
+}
+
+function extractTaskTags(text: string) {
+  const matches = text.match(/(^|\s)#([a-zA-Z0-9_-]+)/g) ?? [];
+  const tags: string[] = [];
+  const seen = new Set<string>();
+
+  matches.forEach((match) => {
+    const normalizedTag = match.trim().slice(1);
+    const comparableTag = normalizedTag.toLocaleLowerCase();
+
+    if (!normalizedTag || seen.has(comparableTag)) {
+      return;
+    }
+
+    seen.add(comparableTag);
+    tags.push(normalizedTag);
+  });
+
+  return tags;
+}
+
+function stripTaskTags(text: string) {
+  return text.replace(/(^|\s)#[a-zA-Z0-9_-]+/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+function parseNoteTasks(content: string) {
+  const lines = content.split('\n');
+  const parsedTasks: ParsedNoteTask[] = [];
+  const renderedTasks: RenderedMarkdownTask[] = [];
+  let taskIndex = 0;
+  let activeFenceMarker: '`' | '~' | null = null;
+  let activeFenceLength = 0;
+
+  const nextLines = lines.map((line, lineIndex) => {
+    const fenceMatch = /^(\s*)(`{3,}|~{3,})/.exec(line);
+
+    if (fenceMatch) {
+      const markerCharacter = fenceMatch[2]?.[0];
+      const markerLength = fenceMatch[2]?.length ?? 0;
+
+      if (!activeFenceMarker) {
+        activeFenceMarker = markerCharacter === '~' ? '~' : '`';
+        activeFenceLength = markerLength;
+      } else if (markerCharacter === activeFenceMarker && markerLength >= activeFenceLength) {
+        activeFenceMarker = null;
+        activeFenceLength = 0;
+      }
+
+      return line;
+    }
+
+    if (activeFenceMarker) {
+      return line;
+    }
+
+    const match = TASK_LINE_PATTERN.exec(line);
+
+    if (!match) {
+      return line;
+    }
+
+    const state = getTaskStateFromMarker(match[2] ?? '');
+
+    if (!state) {
+      return line;
+    }
+
+    const rawText = (match[3] ?? '').replace(/^\]\s*/, '').trim();
+
+    renderedTasks.push({
+      taskIndex,
+      state,
+    });
+    parsedTasks.push({
+      taskIndex,
+      lineIndex,
+      state,
+      rawText,
+      text: stripTaskTags(rawText),
+      tags: extractTaskTags(rawText),
+      sourceLine: line.trimEnd(),
+    });
+    taskIndex += 1;
+
+    return `${match[1]}${state === 'done' ? 'x' : ' '}${match[3]}`;
+  });
+
+  return {
+    parsedTasks,
+    renderedMarkdownContent: nextLines.join('\n'),
+    renderedTasks,
+  };
 }
 
 function isWindowsAbsolutePath(pathValue: string) {
@@ -253,6 +498,7 @@ type CodeBlockHighlighter = (code: string, language: string | null) => string;
 function enhanceRenderedMarkdownHtml(
   html: string,
   baseFilePath: string | null,
+  renderedTasks: RenderedMarkdownTask[],
   highlightCodeBlock?: CodeBlockHighlighter,
 ) {
   const parser = new DOMParser();
@@ -269,8 +515,44 @@ function enhanceRenderedMarkdownHtml(
   };
 
   container.querySelectorAll<HTMLInputElement>('input[type="checkbox"]').forEach((checkbox, index) => {
-    checkbox.removeAttribute('disabled');
-    checkbox.setAttribute('data-task-index', String(index));
+    const renderedTask = renderedTasks[index];
+    const taskState = renderedTask?.state ?? (checkbox.checked ? 'done' : 'open');
+    const taskItem = checkbox.closest<HTMLElement>('li');
+    const toggle = documentRoot.createElement('button');
+    toggle.className = `note-tab__task-toggle note-tab__task-toggle--${taskState}`;
+    toggle.type = 'button';
+    toggle.setAttribute('data-task-index', String(renderedTask?.taskIndex ?? index));
+    toggle.setAttribute('data-task-state', taskState);
+    toggle.setAttribute('aria-label', `Task state: ${getTaskStateLabel(taskState)}`);
+    toggle.setAttribute('title', `Task state: ${getTaskStateLabel(taskState)}`);
+    const icon = documentRoot.createElement('span');
+    icon.className = 'note-tab__task-toggle-icon';
+    icon.setAttribute('aria-hidden', 'true');
+    icon.innerHTML = `<svg viewBox="0 0 16 16" focusable="false">${getTaskStateIconSvg(taskState, true)}</svg>`;
+    toggle.append(icon);
+
+    taskItem?.classList.add('note-tab__task-item');
+    taskItem?.classList.add(`note-tab__task-item--${taskState}`);
+    taskItem?.setAttribute('data-task-index', String(renderedTask?.taskIndex ?? index));
+    taskItem?.setAttribute('data-task-state', taskState);
+
+    if (!taskItem) {
+      checkbox.replaceWith(toggle);
+      return;
+    }
+
+    const content = documentRoot.createElement('div');
+    content.className = 'note-tab__task-content';
+    let nextSibling = checkbox.nextSibling;
+
+    while (nextSibling) {
+      const currentNode = nextSibling;
+      nextSibling = nextSibling.nextSibling;
+      content.append(currentNode);
+    }
+
+    checkbox.replaceWith(toggle);
+    taskItem.append(content);
   });
 
   container.querySelectorAll<HTMLElement>('pre > code').forEach((codeElement) => {
@@ -428,13 +710,14 @@ async function updateRenderedMarkdown() {
   }
 
   try {
-    const parsed = marked.parse(props.content);
+    const { renderedMarkdownContent, renderedTasks } = parsedNoteTaskState.value;
+    const parsed = marked.parse(renderedMarkdownContent);
     const html = typeof parsed === 'string' ? parsed : '';
     const sanitizedHtml = DOMPurify.sanitize(html, {
       USE_PROFILES: { html: true },
     });
 
-    const previewHtml = enhanceRenderedMarkdownHtml(sanitizedHtml, props.filePath);
+    const previewHtml = enhanceRenderedMarkdownHtml(sanitizedHtml, props.filePath, renderedTasks);
 
     if (renderToken !== markdownRenderToken) {
       return;
@@ -456,6 +739,7 @@ async function updateRenderedMarkdown() {
       renderedMarkdown.value = enhanceRenderedMarkdownHtml(
         sanitizedHtml,
         props.filePath,
+        renderedTasks,
         renderHighlightedCodeHtml,
       );
     } catch (error) {
@@ -500,6 +784,14 @@ async function renderMermaidDiagrams() {
   }
 
   await Promise.all(diagramNodes.map(async (diagramNode) => {
+    if (diagramNode.dataset.mermaidState === 'rendered') {
+      return;
+    }
+
+    if (diagramNode.closest('details:not([open])')) {
+      return;
+    }
+
     const source = diagramNode.dataset.mermaidSource ?? '';
 
     if (!source) {
@@ -524,6 +816,41 @@ async function renderMermaidDiagrams() {
       `;
     }
   }));
+}
+
+function markPendingMermaidDiagramsAsError(message: string) {
+  const markdownRoot = previewRef.value?.querySelector('.note-tab__markdown');
+
+  if (!markdownRoot) {
+    return;
+  }
+
+  markdownRoot.querySelectorAll<HTMLElement>('.note-tab__mermaid[data-mermaid-state="pending"]').forEach((diagramNode) => {
+    diagramNode.dataset.mermaidState = 'error';
+    diagramNode.innerHTML = `
+      <div class="note-tab__mermaid-error">
+        <strong>Mermaid render failed.</strong>
+        <span>${escapeHtml(message)}</span>
+      </div>
+    `;
+  });
+}
+
+async function refreshRenderedPreviewDecorations() {
+  await nextTick();
+
+  try {
+    await renderMermaidDiagrams();
+  } catch (error) {
+    console.error('Failed to initialize mermaid preview.', error);
+    markPendingMermaidDiagramsAsError('The diagram could not be initialized.');
+  }
+
+  if (!searchVisible.value) {
+    return;
+  }
+
+  await refreshPreviewSearch();
 }
 
 function truncatePathStart(pathValue: string, maxLength = NOTE_PATH_LABEL_MAX_LENGTH) {
@@ -579,6 +906,97 @@ const resolvedFontSize = computed(() => normalizeNoteFontSize(props.fontSize));
 const noteStyle = computed(() => ({
   '--note-font-size-px': String(resolvedFontSize.value),
 }));
+const parsedNoteTaskState = computed(() => parseNoteTasks(props.content));
+const parsedNoteTasks = computed(() => parsedNoteTaskState.value.parsedTasks);
+const availableTaskTags = computed(() => {
+  const tags = new Map<string, string>();
+
+  parsedNoteTasks.value.forEach((task) => {
+    task.tags.forEach((tag) => {
+      const normalizedTag = tag.toLocaleLowerCase();
+
+      if (!tags.has(normalizedTag)) {
+        tags.set(normalizedTag, tag);
+      }
+    });
+  });
+
+  return Array.from(tags.entries())
+    .sort((left, right) => left[1].localeCompare(right[1]))
+    .map(([, tag]) => tag);
+});
+const filteredNoteTasks = computed(() => (
+  parsedNoteTasks.value.filter((task) => {
+    if (taskFilter.value !== 'all' && task.state !== taskFilter.value) {
+      return false;
+    }
+
+    if (!activeTaskTagFilter.value) {
+      return true;
+    }
+
+    return task.tags.some((tag) => tag.toLocaleLowerCase() === activeTaskTagFilter.value?.toLocaleLowerCase());
+  })
+));
+const activeTaskMenuState = computed<NoteTaskState | null>(() => {
+  const activeMenu = taskStateMenu.value;
+
+  if (!activeMenu) {
+    return null;
+  }
+
+  const lines = props.content.split('\n');
+  let currentTaskIndex = 0;
+  let activeFenceMarker: '`' | '~' | null = null;
+  let activeFenceLength = 0;
+
+  for (const line of lines) {
+    const fenceMatch = /^(\s*)(`{3,}|~{3,})/.exec(line);
+
+    if (fenceMatch) {
+      const markerCharacter = fenceMatch[2]?.[0];
+      const markerLength = fenceMatch[2]?.length ?? 0;
+
+      if (!activeFenceMarker) {
+        activeFenceMarker = markerCharacter === '~' ? '~' : '`';
+        activeFenceLength = markerLength;
+      } else if (markerCharacter === activeFenceMarker && markerLength >= activeFenceLength) {
+        activeFenceMarker = null;
+        activeFenceLength = 0;
+      }
+
+      continue;
+    }
+
+    if (activeFenceMarker) {
+      continue;
+    }
+
+    const match = TASK_LINE_PATTERN.exec(line);
+
+    if (!match) {
+      continue;
+    }
+
+    const taskState = getTaskStateFromMarker(match[2] ?? '');
+
+    if (!taskState) {
+      continue;
+    }
+
+    if (currentTaskIndex === activeMenu.taskIndex) {
+      return taskState;
+    }
+
+    currentTaskIndex += 1;
+  }
+
+  return null;
+});
+
+function getParsedTaskByIndex(taskIndex: number) {
+  return parsedNoteTasks.value.find((task) => task.taskIndex === taskIndex) ?? null;
+}
 
 const noteSplit = useColumnSplitter({ defaultRatio: props.splitRatio });
 const noteSplitStyle = computed(() => (
@@ -767,14 +1185,26 @@ async function copyFilePathText(text: string, successMessage: string) {
   }
 }
 
-function getFilePathMenuPosition(event: MouseEvent) {
-  const maxX = Math.max(12, window.innerWidth - FILE_PATH_MENU_WIDTH - 12);
-  const maxY = Math.max(12, window.innerHeight - FILE_PATH_MENU_HEIGHT - 12);
+function getMenuPosition(event: MouseEvent, width: number, height: number) {
+  const maxX = Math.max(12, window.innerWidth - width - 12);
+  const maxY = Math.max(12, window.innerHeight - height - 12);
 
   return {
     x: Math.min(event.clientX, maxX),
     y: Math.min(event.clientY, maxY),
   };
+}
+
+function getFilePathMenuPosition(event: MouseEvent) {
+  return getMenuPosition(event, FILE_PATH_MENU_WIDTH, FILE_PATH_MENU_HEIGHT);
+}
+
+function getTaskStateMenuPosition(event: MouseEvent) {
+  return getMenuPosition(event, TASK_STATE_MENU_WIDTH, TASK_STATE_MENU_HEIGHT);
+}
+
+function getTaskCopyMenuPosition(event: MouseEvent) {
+  return getMenuPosition(event, TASK_COPY_MENU_WIDTH, TASK_COPY_MENU_HEIGHT);
 }
 
 async function copyFullPath() {
@@ -798,6 +1228,14 @@ function closeFilePathMenu() {
   filePathMenu.value = null;
 }
 
+function closeTaskStateMenu() {
+  taskStateMenu.value = null;
+}
+
+function closeTaskCopyMenu() {
+  taskCopyMenu.value = null;
+}
+
 async function handleFilePathClick() {
   closeFilePathMenu();
   if (projectRelativePathLabel.value) {
@@ -811,7 +1249,31 @@ async function handleFilePathClick() {
 function openFilePathMenu(event: MouseEvent) {
   event.preventDefault();
   event.stopPropagation();
+  closeTaskStateMenu();
+  closeTaskCopyMenu();
   filePathMenu.value = getFilePathMenuPosition(event);
+}
+
+function openTaskStateMenu(event: MouseEvent, taskIndex: number) {
+  event.preventDefault();
+  event.stopPropagation();
+  closeFilePathMenu();
+  closeTaskCopyMenu();
+  taskStateMenu.value = {
+    ...getTaskStateMenuPosition(event),
+    taskIndex,
+  };
+}
+
+function openTaskCopyMenu(event: MouseEvent, taskIndex: number) {
+  event.preventDefault();
+  event.stopPropagation();
+  closeFilePathMenu();
+  closeTaskStateMenu();
+  taskCopyMenu.value = {
+    ...getTaskCopyMenuPosition(event),
+    taskIndex,
+  };
 }
 
 async function handleCopyFullPathMenuClick() {
@@ -832,6 +1294,57 @@ async function handleCopyFileNameMenuClick() {
 function handleRevealInAllFilesMenuClick() {
   closeFilePathMenu();
   emit('reveal-in-all-files');
+}
+
+async function copyTaskLineByIndex(taskIndex: number) {
+  closeTaskCopyMenu();
+  const task = getParsedTaskByIndex(taskIndex);
+
+  if (!task) {
+    showCopyToast('Task not found');
+    return;
+  }
+
+  await copyTaskLine(task);
+}
+
+async function copyTaskText(task: ParsedNoteTask) {
+  const text = task.rawText.trim();
+
+  if (!text) {
+    showCopyToast('Nothing to copy');
+    return;
+  }
+
+  try {
+    await writeClipboard(text);
+    showCopyToast('Task text copied');
+  } catch {
+    showCopyToast('Copy failed');
+  }
+}
+
+async function applyTaskCopyMenuSelection(mode: 'line' | 'text') {
+  const activeMenu = taskCopyMenu.value;
+
+  if (!activeMenu) {
+    return;
+  }
+
+  const task = getParsedTaskByIndex(activeMenu.taskIndex);
+  closeTaskCopyMenu();
+
+  if (!task) {
+    showCopyToast('Task not found');
+    return;
+  }
+
+  if (mode === 'text') {
+    await copyTaskText(task);
+    return;
+  }
+
+  await copyTaskLine(task);
 }
 
 async function copyAll() {
@@ -867,6 +1380,8 @@ async function openSearch(selectText = false) {
     openSearchPanel(editorView);
     return;
   }
+
+  previewLens.value = 'preview';
 
   if (!searchVisible.value) {
     searchVisible.value = true;
@@ -981,6 +1496,38 @@ function buildInitialSelection(docLength: number) {
   return EditorSelection.single(anchor, head);
 }
 
+function applyExternalCursor({ focus = false }: { focus?: boolean } = {}) {
+  if (!editorView || !props.cursor) {
+    return;
+  }
+
+  const docLength = editorView.state.doc.length;
+  const { anchor, head } = clampCursor(props.cursor.anchor, props.cursor.head, docLength);
+  const mainSelection = editorView.state.selection.main;
+  const selectionChanged = mainSelection.anchor !== anchor || mainSelection.head !== head;
+
+  editorView.dispatch({
+    ...(selectionChanged ? { selection: EditorSelection.single(anchor, head) } : {}),
+    effects: EditorView.scrollIntoView(anchor, { y: 'center' }),
+  });
+
+  if (focus && props.active && props.viewMode !== 'preview') {
+    editorView.focus();
+  }
+}
+
+async function revealExternalCursor(options: { focus?: boolean } = {}) {
+  if (!props.cursor || props.viewMode === 'preview') {
+    return;
+  }
+
+  await nextTick();
+
+  window.requestAnimationFrame(() => {
+    applyExternalCursor(options);
+  });
+}
+
 function handleEditorUpdate(update: ViewUpdate) {
   if (update.selectionSet) {
     scheduleSelectionCopy();
@@ -1057,6 +1604,7 @@ function createEditor() {
       editableCompartment.of(buildEditableExtensions()),
       languageCompartment.of(markdown({ base: markdownLanguage })),
       themeCompartment.of(getCodeEditorThemeExtension(props.editorTheme)),
+      bridgeGitEditorChromeTheme,
     ],
   });
 
@@ -1066,9 +1614,7 @@ function createEditor() {
   });
 
   if (props.cursor) {
-    editorView.dispatch({
-      effects: EditorView.scrollIntoView(editorView.state.selection.main, { y: 'center' }),
-    });
+    void revealExternalCursor();
   }
 
   if (props.active && props.viewMode !== 'preview') {
@@ -1126,16 +1672,49 @@ watch(
   },
 );
 
-function updateChecklistItem(taskIndex: number, checked: boolean) {
+watch(
+  () => props.cursor,
+  (cursor) => {
+    if (!editorView || !cursor) {
+      return;
+    }
+    applyExternalCursor();
+  },
+);
+
+function setTaskState(taskIndex: number, nextState: NoteTaskState) {
   if (!Number.isInteger(taskIndex) || taskIndex < 0) {
     return;
   }
 
   const lines = props.content.split('\n');
   let currentTaskIndex = 0;
+  let activeFenceMarker: '`' | '~' | null = null;
+  let activeFenceLength = 0;
 
   const nextLines = lines.map((line) => {
-    const match = /^(\s*(?:[-*+]|\d+[.)])\s+\[)(?: |x|X)(\].*)$/.exec(line);
+    const fenceMatch = /^(\s*)(`{3,}|~{3,})/.exec(line);
+
+    if (fenceMatch) {
+      const markerCharacter = fenceMatch[2]?.[0];
+      const markerLength = fenceMatch[2]?.length ?? 0;
+
+      if (!activeFenceMarker) {
+        activeFenceMarker = markerCharacter === '~' ? '~' : '`';
+        activeFenceLength = markerLength;
+      } else if (markerCharacter === activeFenceMarker && markerLength >= activeFenceLength) {
+        activeFenceMarker = null;
+        activeFenceLength = 0;
+      }
+
+      return line;
+    }
+
+    if (activeFenceMarker) {
+      return line;
+    }
+
+    const match = TASK_LINE_PATTERN.exec(line);
 
     if (!match) {
       return line;
@@ -1147,7 +1726,7 @@ function updateChecklistItem(taskIndex: number, checked: boolean) {
     }
 
     currentTaskIndex += 1;
-    return `${match[1]}${checked ? 'x' : ' '}${match[2]}`;
+    return `${match[1]}${TASK_STATE_MARKERS[nextState]}${match[3]}`;
   });
 
   emit('update:content', nextLines.join('\n'));
@@ -1214,26 +1793,104 @@ function handleWheelZoom(event: WheelEvent) {
   applyFontSize(resolvedFontSize.value + zoomStep);
 }
 
-function handlePreviewChange(event: Event) {
-  const target = event.target as HTMLInputElement | null;
+function handlePreviewTaskToggle(taskIndex: number, currentState: NoteTaskState) {
+  closeTaskStateMenu();
+  setTaskState(taskIndex, getNextPrimaryTaskState(currentState));
+}
 
-  if (!target || target.type !== 'checkbox') {
+function setPreviewLens(nextLens: 'preview' | 'tasks') {
+  previewLens.value = nextLens;
+}
+
+function toggleTaskTagFilter(tag: string) {
+  activeTaskTagFilter.value = activeTaskTagFilter.value?.toLocaleLowerCase() === tag.toLocaleLowerCase()
+    ? null
+    : tag;
+}
+
+function getLineStartOffset(content: string, lineIndex: number) {
+  if (lineIndex <= 0) {
+    return 0;
+  }
+
+  const lines = content.split('\n');
+  let offset = 0;
+
+  for (let index = 0; index < lines.length && index < lineIndex; index += 1) {
+    offset += (lines[index]?.length ?? 0) + 1;
+  }
+
+  return offset;
+}
+
+async function revealTaskInNote(task: ParsedNoteTask) {
+  const lineStartOffset = getLineStartOffset(props.content, task.lineIndex);
+  emit('update:cursor', { anchor: lineStartOffset, head: lineStartOffset });
+  previewLens.value = 'preview';
+
+  if (props.viewMode !== 'preview') {
+    await nextTick();
+    editorView?.focus();
+    editorView?.dispatch({
+      selection: EditorSelection.single(lineStartOffset, lineStartOffset),
+      effects: EditorView.scrollIntoView(lineStartOffset, { y: 'center' }),
+    });
     return;
   }
 
-  const taskIndex = Number.parseInt(target.dataset.taskIndex ?? '', 10);
+  await nextTick();
+  const previewTask = previewRef.value?.querySelector<HTMLElement>(`.note-tab__task-item[data-task-index="${task.taskIndex}"]`);
+  previewTask?.scrollIntoView({
+    block: 'center',
+    behavior: 'smooth',
+  });
+}
 
-  if (Number.isNaN(taskIndex)) {
+async function copyTaskLine(task: ParsedNoteTask) {
+  const sourceLine = task.sourceLine.trimEnd();
+
+  if (!sourceLine.trim()) {
+    showCopyToast('Nothing to copy');
     return;
   }
 
-  updateChecklistItem(taskIndex, target.checked);
+  try {
+    await writeClipboard(sourceLine);
+    showCopyToast('Task line copied');
+  } catch {
+    showCopyToast('Copy failed');
+  }
 }
 
 async function handlePreviewClick(event: MouseEvent) {
   const target = event.target as HTMLElement | null;
 
   if (!target) {
+    return;
+  }
+
+  const summary = target.closest<HTMLElement>('summary');
+
+  if (summary) {
+    await nextTick();
+    void refreshRenderedPreviewDecorations();
+  }
+
+  const taskToggle = target.closest<HTMLElement>('.note-tab__task-toggle');
+
+  if (taskToggle) {
+    event.preventDefault();
+    event.stopPropagation();
+    const taskIndex = Number.parseInt(taskToggle.dataset.taskIndex ?? '', 10);
+    const taskState = isNoteTaskState(taskToggle.dataset.taskState)
+      ? taskToggle.dataset.taskState
+      : null;
+
+    if (Number.isNaN(taskIndex) || !taskState) {
+      return;
+    }
+
+    handlePreviewTaskToggle(taskIndex, taskState);
     return;
   }
 
@@ -1308,13 +1965,56 @@ async function handlePreviewClick(event: MouseEvent) {
   window.open(href, '_blank', 'noopener');
 }
 
+function handlePreviewContextMenu(event: MouseEvent) {
+  const target = event.target as HTMLElement | null;
+
+  if (!target) {
+    return;
+  }
+
+  if (target.closest('.note-tab__task-card-copy')) {
+    return;
+  }
+
+  const taskToggle = target.closest<HTMLElement>('.note-tab__task-toggle');
+  const taskItem = target.closest<HTMLElement>('.note-tab__task-item');
+
+  if (!taskToggle && !taskItem) {
+    return;
+  }
+
+  const taskIndex = Number.parseInt(
+    taskToggle?.dataset.taskIndex
+      ?? taskItem?.dataset.taskIndex
+      ?? '',
+    10,
+  );
+
+  if (Number.isNaN(taskIndex)) {
+    return;
+  }
+
+  openTaskStateMenu(event, taskIndex);
+}
+
+function applyTaskStateMenuSelection(nextState: NoteTaskState) {
+  const activeMenu = taskStateMenu.value;
+
+  if (!activeMenu) {
+    return;
+  }
+
+  setTaskState(activeMenu.taskIndex, nextState);
+  closeTaskStateMenu();
+}
+
 function handleDocumentPointerDown(event: PointerEvent) {
   if (event.button === 0 && rootRef.value?.contains(event.target as Node | null)) {
     selectionPointerActive = true;
     selectionCopyPendingAfterPointer = false;
   }
 
-  if (!filePathMenu.value) {
+  if (!filePathMenu.value && !taskStateMenu.value && !taskCopyMenu.value) {
     return;
   }
 
@@ -1324,7 +2024,17 @@ function handleDocumentPointerDown(event: PointerEvent) {
     return;
   }
 
+  if (target?.closest('.note-tab__task-menu, .note-tab__task-toggle')) {
+    return;
+  }
+
+  if (target?.closest('.note-tab__task-copy-menu, .note-tab__task-card-copy')) {
+    return;
+  }
+
   closeFilePathMenu();
+  closeTaskStateMenu();
+  closeTaskCopyMenu();
 }
 
 function handleDocumentPointerUp() {
@@ -1583,9 +2293,10 @@ function handleDocumentKeydown(event: KeyboardEvent) {
     return;
   }
 
-  if (filePathMenu.value && event.key === 'Escape') {
+  if ((filePathMenu.value || taskStateMenu.value) && event.key === 'Escape') {
     event.preventDefault();
     closeFilePathMenu();
+    closeTaskStateMenu();
     return;
   }
 
@@ -1697,6 +2408,7 @@ onMounted(() => {
   document.addEventListener('selectionchange', scheduleSelectionCopy);
   window.addEventListener('bridgegit:flush-editor-state', handleFlushEditorState);
   void focusEditor();
+  void refreshRenderedPreviewDecorations();
 });
 
 onBeforeUnmount(() => {
@@ -1749,14 +2461,7 @@ watch(
 watch(
   renderedMarkdown,
   async () => {
-    await nextTick();
-    await renderMermaidDiagrams();
-
-    if (!searchVisible.value) {
-      return;
-    }
-
-    await refreshPreviewSearch();
+    await refreshRenderedPreviewDecorations();
   },
 );
 
@@ -1768,13 +2473,35 @@ watch(
     }
 
     void focusEditor();
+
+    if (props.cursor && props.viewMode !== 'preview') {
+      void revealExternalCursor({ focus: true });
+    }
   },
 );
 
 watch(
   () => props.viewMode,
-  () => {
+  (viewMode) => {
     void focusEditor();
+
+    if (viewMode === 'preview' && previewLens.value === 'preview') {
+      void refreshRenderedPreviewDecorations();
+      return;
+    }
+
+    if (props.cursor) {
+      void revealExternalCursor({ focus: props.active });
+    }
+  },
+);
+
+watch(
+  () => previewLens.value,
+  (lens) => {
+    if (lens === 'preview' && props.viewMode === 'preview') {
+      void refreshRenderedPreviewDecorations();
+    }
   },
 );
 
@@ -1994,7 +2721,7 @@ defineExpose({
       </div>
     </div>
 
-    <div v-if="searchVisible && viewMode === 'preview'" class="note-tab__search">
+    <div v-if="searchVisible && viewMode === 'preview' && previewLens === 'preview'" class="note-tab__search">
       <div class="note-tab__search-meta">
         <span class="note-tab__search-count">
           <template v-if="normalizedSearchQuery">
@@ -2081,10 +2808,153 @@ defineExpose({
         class="note-tab__preview"
         :class="{ 'note-tab__preview--hidden': viewMode === 'source' }"
         @pointerdown="focusHotkeySurface"
-        @change="handlePreviewChange"
         @click="handlePreviewClick"
+        @contextmenu="handlePreviewContextMenu"
       >
-        <article class="note-tab__markdown" v-html="renderedMarkdown" />
+        <div class="note-tab__preview-lens">
+          <div class="note-tab__preview-lens-toggle" role="group" aria-label="Preview lens">
+            <button
+              class="note-tab__preview-lens-button"
+              :class="{ 'note-tab__preview-lens-button--active': previewLens === 'preview' }"
+              type="button"
+              :aria-pressed="previewLens === 'preview'"
+              @click="setPreviewLens('preview')"
+            >
+              Preview
+            </button>
+            <button
+              class="note-tab__preview-lens-button"
+              :class="{ 'note-tab__preview-lens-button--active': previewLens === 'tasks' }"
+              type="button"
+              :aria-pressed="previewLens === 'tasks'"
+              @click="setPreviewLens('tasks')"
+            >
+              Tasks
+              <span v-if="parsedNoteTasks.length" class="note-tab__preview-lens-count">{{ parsedNoteTasks.length }}</span>
+            </button>
+          </div>
+        </div>
+
+        <article
+          v-if="previewLens === 'preview'"
+          class="note-tab__markdown"
+          v-html="renderedMarkdown"
+        />
+
+        <section v-else class="note-tab__tasks" aria-label="Note tasks">
+          <div class="note-tab__tasks-filters">
+            <div class="note-tab__tasks-filter-group" role="group" aria-label="Task state filter">
+              <button
+                v-for="item in TASK_FILTER_ITEMS"
+                :key="item.value"
+                class="note-tab__tasks-filter"
+                :class="{ 'note-tab__tasks-filter--active': taskFilter === item.value }"
+                type="button"
+                :aria-pressed="taskFilter === item.value"
+                @click="taskFilter = item.value"
+              >
+                {{ item.label }}
+              </button>
+            </div>
+
+            <div v-if="availableTaskTags.length" class="note-tab__tasks-tags" role="group" aria-label="Task tag filter">
+              <button
+                class="note-tab__tasks-tag"
+                :class="{ 'note-tab__tasks-tag--active': activeTaskTagFilter === null }"
+                type="button"
+                :aria-pressed="activeTaskTagFilter === null"
+                @click="activeTaskTagFilter = null"
+              >
+                All tags
+              </button>
+              <button
+                v-for="tag in availableTaskTags"
+                :key="tag"
+                class="note-tab__tasks-tag"
+                :class="{ 'note-tab__tasks-tag--active': activeTaskTagFilter?.toLocaleLowerCase() === tag.toLocaleLowerCase() }"
+                type="button"
+                :aria-pressed="activeTaskTagFilter?.toLocaleLowerCase() === tag.toLocaleLowerCase()"
+                @click="toggleTaskTagFilter(tag)"
+              >
+                #{{ tag }}
+              </button>
+            </div>
+          </div>
+
+          <div v-if="filteredNoteTasks.length" class="note-tab__tasks-list">
+            <article
+              v-for="task in filteredNoteTasks"
+              :key="task.taskIndex"
+              class="note-tab__task-card"
+              :class="`note-tab__task-card--${task.state}`"
+            >
+              <button
+                class="note-tab__task-card-toggle"
+                :class="`note-tab__task-card-toggle--${task.state}`"
+                type="button"
+                :aria-label="getTaskStateLabel(task.state)"
+                :title="getTaskStateLabel(task.state).toUpperCase()"
+                @click="handlePreviewTaskToggle(task.taskIndex, task.state)"
+                @contextmenu="openTaskStateMenu($event, task.taskIndex)"
+              >
+                <span class="note-tab__task-card-toggle-icon" aria-hidden="true" v-html="`<svg viewBox='0 0 16 16' focusable='false'>${getTaskStateIconSvg(task.state, true)}</svg>`" />
+              </button>
+
+              <div
+                class="note-tab__task-card-body"
+                role="button"
+                tabindex="0"
+                :title="`Toggle task state · ${getTaskStateLabel(task.state)}`"
+                @click="handlePreviewTaskToggle(task.taskIndex, task.state)"
+                @contextmenu="openTaskStateMenu($event, task.taskIndex)"
+                @keydown.enter.prevent="handlePreviewTaskToggle(task.taskIndex, task.state)"
+                @keydown.space.prevent="handlePreviewTaskToggle(task.taskIndex, task.state)"
+              >
+                <p class="note-tab__task-card-text">{{ task.text }}</p>
+                <div v-if="task.tags.length" class="note-tab__task-card-tags">
+                  <button
+                    v-for="tag in task.tags"
+                    :key="`${task.taskIndex}:${tag}`"
+                    class="note-tab__task-card-tag"
+                    :class="{ 'note-tab__task-card-tag--active': activeTaskTagFilter?.toLocaleLowerCase() === tag.toLocaleLowerCase() }"
+                    type="button"
+                    @click.stop="toggleTaskTagFilter(tag)"
+                  >
+                    #{{ tag }}
+                  </button>
+                </div>
+              </div>
+
+              <div class="note-tab__task-card-actions">
+                <button
+                  v-if="viewMode !== 'preview'"
+                  class="note-tab__task-card-action"
+                  type="button"
+                  :title="`Show in note · Line ${task.lineIndex + 1}`"
+                  @click.stop="revealTaskInNote(task)"
+                >
+                  Show
+                </button>
+                <button
+                  class="note-tab__action note-tab__action--inline note-tab__task-card-copy"
+                  type="button"
+                  title="Copy task line · Right-click for more options"
+                  aria-label="Copy task line"
+                  @click.stop="void copyTaskLineByIndex(task.taskIndex)"
+                  @contextmenu.stop="openTaskCopyMenu($event, task.taskIndex)"
+                >
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M8.75 5.25A2.75 2.75 0 0 1 11.5 2.5h6A2.75 2.75 0 0 1 20.25 5.25v8.5a2.75 2.75 0 0 1-2.75 2.75h-6a2.75 2.75 0 0 1-2.75-2.75v-8.5Zm2.75-1.25c-.69 0-1.25.56-1.25 1.25v8.5c0 .69.56 1.25 1.25 1.25h6c.69 0 1.25-.56 1.25-1.25v-8.5c0-.69-.56-1.25-1.25-1.25h-6Zm-5 4A2.75 2.75 0 0 1 9.25 10.75V18A2.75 2.75 0 0 0 12 20.75h6.25a.75.75 0 0 1 0 1.5H12A4.25 4.25 0 0 1 7.75 18v-7.25a.75.75 0 0 1-1.5 0V8.5A2.75 2.75 0 0 1 9 5.75h1.25a.75.75 0 0 1 0 1.5H9A1.25 1.25 0 0 0 7.75 8.5Z" />
+                  </svg>
+                </button>
+              </div>
+            </article>
+          </div>
+
+          <p v-else class="note-tab__tasks-empty">
+            No tasks match the current filters.
+          </p>
+        </section>
       </div>
     </div>
 
@@ -2136,11 +3006,59 @@ defineExpose({
         Copy file name
       </button>
     </div>
+
+    <div
+      v-if="taskStateMenu"
+      class="note-tab__task-menu"
+      :style="{ left: `${taskStateMenu.x}px`, top: `${taskStateMenu.y}px` }"
+      role="menu"
+      aria-label="Task state"
+    >
+      <button
+        v-for="item in TASK_STATE_MENU_ITEMS"
+        :key="item.state"
+        class="note-tab__task-menu-item"
+        :class="{ 'note-tab__task-menu-item--active': activeTaskMenuState === item.state }"
+        type="button"
+        role="menuitemradio"
+        :aria-checked="activeTaskMenuState === item.state"
+        @click="applyTaskStateMenuSelection(item.state)"
+      >
+        <span class="note-tab__task-menu-marker">{{ getTaskStateMarkerLabel(item.state) }}</span>
+        <span>{{ item.label }}</span>
+      </button>
+    </div>
+
+    <div
+      v-if="taskCopyMenu"
+      class="note-tab__task-copy-menu"
+      :style="{ left: `${taskCopyMenu.x}px`, top: `${taskCopyMenu.y}px` }"
+      role="menu"
+      aria-label="Copy task"
+    >
+      <button
+        class="note-tab__task-copy-menu-item"
+        type="button"
+        role="menuitem"
+        @click="void applyTaskCopyMenuSelection('line')"
+      >
+        Copy
+      </button>
+      <button
+        class="note-tab__task-copy-menu-item"
+        type="button"
+        role="menuitem"
+        @click="void applyTaskCopyMenuSelection('text')"
+      >
+        Copy text
+      </button>
+    </div>
   </section>
 </template>
 
 <style scoped lang="scss">
 .note-tab {
+  --bridgegit-editor-selection-bg: var(--note-editor-selection-bg);
   --note-tab-mode-bg: rgba(13, 18, 25, 0.9);
   --note-tab-mode-color: rgba(188, 201, 215, 0.82);
   --note-tab-mode-hover-bg: rgba(21, 30, 41, 0.94);
@@ -2190,6 +3108,21 @@ defineExpose({
   --note-tab-callout-important-border: #d391ff;
   --note-tab-callout-important-bg: rgba(108, 59, 140, 0.18);
   --note-tab-callout-important-title: #efc4ff;
+  --note-tab-task-open-border: rgba(122, 140, 162, 0.42);
+  --note-tab-task-open-glyph: rgba(0, 0, 0, 0);
+  --note-tab-task-open-bg: rgba(24, 32, 42, 0.18);
+  --note-tab-task-progress-border: rgba(102, 185, 246, 0.52);
+  --note-tab-task-progress-glyph: #8bd2ff;
+  --note-tab-task-progress-bg: rgba(49, 96, 132, 0.2);
+  --note-tab-task-waiting-border: rgba(240, 189, 96, 0.48);
+  --note-tab-task-waiting-glyph: #f5cb79;
+  --note-tab-task-waiting-bg: rgba(116, 81, 22, 0.18);
+  --note-tab-task-done-border: rgba(119, 222, 154, 0.44);
+  --note-tab-task-done-glyph: #8fe2a6;
+  --note-tab-task-done-bg: rgba(41, 110, 64, 0.18);
+  --note-tab-task-cancelled-border: rgba(255, 144, 144, 0.46);
+  --note-tab-task-cancelled-glyph: #ff9f9a;
+  --note-tab-task-cancelled-bg: rgba(119, 46, 46, 0.18);
   --code-token-comment: #6f879c;
   --code-token-string: #8dd8a6;
   --code-token-number: #f1c27a;
@@ -2345,6 +3278,20 @@ defineExpose({
   --note-tab-callout-important-border: #b67ae6;
   --note-tab-callout-important-bg: rgba(238, 224, 249, 0.88);
   --note-tab-callout-important-title: #7d49a9;
+  --note-tab-task-open-border: rgba(126, 140, 158, 0.42);
+  --note-tab-task-open-bg: rgba(222, 231, 240, 0.52);
+  --note-tab-task-progress-border: rgba(70, 144, 220, 0.42);
+  --note-tab-task-progress-glyph: #2b77cf;
+  --note-tab-task-progress-bg: rgba(214, 230, 246, 0.82);
+  --note-tab-task-waiting-border: rgba(201, 153, 74, 0.4);
+  --note-tab-task-waiting-glyph: #9f6920;
+  --note-tab-task-waiting-bg: rgba(248, 233, 201, 0.88);
+  --note-tab-task-done-border: rgba(79, 170, 110, 0.4);
+  --note-tab-task-done-glyph: #2f8a5d;
+  --note-tab-task-done-bg: rgba(218, 241, 226, 0.9);
+  --note-tab-task-cancelled-border: rgba(201, 101, 101, 0.4);
+  --note-tab-task-cancelled-glyph: #b44c4c;
+  --note-tab-task-cancelled-bg: rgba(248, 223, 223, 0.9);
   --code-token-comment: #75859a;
   --code-token-string: #2f8a5d;
   --code-token-number: #b87421;
@@ -2943,12 +3890,225 @@ defineExpose({
   padding: 16px 18px;
 }
 
+.note-tab__preview-lens {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 12px;
+}
+
+.note-tab__preview-lens-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px;
+  border: 1px solid rgba(108, 124, 148, 0.22);
+  border-radius: 12px;
+  background: rgba(12, 18, 25, 0.28);
+}
+
+.note-tab__preview-lens-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0.45rem 0.72rem;
+  border: 0;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--text-secondary);
+  font: 600 0.76rem/1.2 var(--font-mono);
+}
+
+.note-tab__preview-lens-button--active {
+  background: rgba(110, 197, 255, 0.14);
+  color: var(--text-primary);
+}
+
+.note-tab__preview-lens-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 1.3rem;
+  padding: 0 0.32rem;
+  border-radius: 999px;
+  background: rgba(110, 197, 255, 0.16);
+  color: var(--text-primary);
+  font-size: 0.72rem;
+}
+
 .note-tab__markdown {
   color: var(--text-primary);
   font-size: calc(var(--note-font-size-px, 14) * 1px);
   line-height: 1.62;
   word-break: break-word;
   font-family: var(--font-mono), 'Segoe UI Emoji', 'Apple Color Emoji', 'Noto Color Emoji', monospace;
+}
+
+.note-tab__tasks {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.note-tab__tasks-filters {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.note-tab__tasks-filter-group,
+.note-tab__tasks-tags,
+.note-tab__task-card-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.note-tab__tasks-filter,
+.note-tab__tasks-tag,
+.note-tab__task-card-tag,
+.note-tab__task-card-action {
+  padding: 0.4rem 0.62rem;
+  border: 1px solid rgba(108, 124, 148, 0.24);
+  border-radius: 9px;
+  background: rgba(16, 24, 34, 0.4);
+  color: var(--text-secondary);
+  font: 600 0.74rem/1.2 var(--font-mono);
+}
+
+.note-tab__tasks-filter--active,
+.note-tab__tasks-tag--active,
+.note-tab__task-card-tag--active {
+  border-color: rgba(110, 197, 255, 0.3);
+  background: rgba(110, 197, 255, 0.14);
+  color: var(--text-primary);
+}
+
+.note-tab__tasks-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.note-tab__task-card {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: flex-start;
+  padding: 12px;
+  border: 1px solid rgba(108, 124, 148, 0.2);
+  border-radius: 12px;
+  background: rgba(14, 21, 29, 0.34);
+}
+
+.note-tab__task-card-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.28em;
+  min-width: 1.28em;
+  height: 1.28em;
+  margin-top: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--note-tab-task-open-border);
+  font-size: calc(var(--note-font-size-px, 14) * 1px);
+  line-height: 1;
+  cursor: pointer;
+  transform: translateY(0.08em);
+}
+
+.note-tab__task-card-toggle:hover,
+.note-tab__task-card-toggle:focus-visible {
+  color: rgba(110, 197, 255, 0.88);
+  outline: none;
+}
+
+.note-tab__task-card-toggle-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1em;
+  height: 1em;
+}
+
+.note-tab__task-card-toggle-icon svg {
+  display: block;
+  width: 1em;
+  height: 1em;
+}
+
+.note-tab__task-card-toggle--in-progress {
+  color: var(--note-tab-task-progress-glyph);
+}
+
+.note-tab__task-card-toggle--waiting {
+  color: var(--note-tab-task-waiting-glyph);
+}
+
+.note-tab__task-card-toggle--done {
+  color: var(--note-tab-task-done-glyph);
+}
+
+.note-tab__task-card-toggle--cancelled {
+  color: var(--note-tab-task-cancelled-glyph);
+}
+
+.note-tab__task-card-body {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  cursor: pointer;
+}
+
+.note-tab__task-card-body:focus-visible {
+  outline: 1px solid rgba(110, 197, 255, 0.34);
+  outline-offset: 4px;
+  border-radius: 8px;
+}
+
+.note-tab__task-card-meta {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  color: var(--text-muted);
+  font: 600 0.72rem/1.2 var(--font-mono);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.note-tab__task-card-state {
+  color: var(--text-primary);
+}
+
+.note-tab__task-card-text {
+  margin: 0;
+  color: var(--text-primary);
+  font-size: calc(var(--note-font-size-px, 14) * 1px);
+  line-height: 1.55;
+}
+
+.note-tab__task-card-actions {
+  display: inline-flex;
+  align-items: flex-start;
+  gap: 8px;
+  align-self: flex-start;
+}
+
+.note-tab__task-card-copy {
+  margin: 0;
+}
+
+.note-tab__task-card--done .note-tab__task-card-text,
+.note-tab__task-card--cancelled .note-tab__task-card-text {
+  text-decoration: line-through;
+  text-decoration-thickness: 1px;
+}
+
+.note-tab__tasks-empty {
+  margin: 0;
+  color: var(--text-muted);
+  font: 500 0.82rem/1.5 var(--font-mono);
 }
 
 .note-tab__markdown :deep(.note-tab__preview-empty),
@@ -3022,13 +4182,98 @@ defineExpose({
 
 .note-tab__markdown :deep(.task-list-item) {
   list-style: none;
-  margin-left: -1.2em;
+  margin-left: 0;
 }
 
-.note-tab__markdown :deep(.task-list-item input[type='checkbox']) {
+.note-tab__markdown :deep(.note-tab__task-item) {
+  position: relative;
+  min-height: 1.25em;
+  padding-left: 1.65em;
+}
+
+.note-tab__markdown :deep(.note-tab__task-content) {
+  display: block;
+  min-width: 0;
+}
+
+.note-tab__markdown :deep(.note-tab__task-content > p:first-child) {
+  margin-top: 0;
+}
+
+.note-tab__markdown :deep(.note-tab__task-content > p:last-child),
+.note-tab__markdown :deep(.note-tab__task-content > ul:last-child),
+.note-tab__markdown :deep(.note-tab__task-content > ol:last-child) {
+  margin-bottom: 0;
+}
+
+.note-tab__markdown :deep(.note-tab__task-item--done) {
+  color: color-mix(in srgb, var(--text-primary) 76%, transparent);
+}
+
+.note-tab__markdown :deep(.note-tab__task-item--cancelled) {
+  color: color-mix(in srgb, var(--text-primary) 68%, transparent);
+}
+
+.note-tab__markdown :deep(.note-tab__task-item--done .note-tab__task-content),
+.note-tab__markdown :deep(.note-tab__task-item--cancelled .note-tab__task-content) {
+  text-decoration: line-through;
+  text-decoration-thickness: 1px;
+}
+
+.note-tab__markdown :deep(.note-tab__task-toggle) {
+  position: absolute;
+  top: 0.12em;
+  left: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.25em;
+  min-width: 1.25em;
+  height: 1.25em;
+  padding: 0;
+  border: 0;
+  background: transparent;
   cursor: pointer;
-  margin-right: 0.42em;
-  accent-color: #66b9f6;
+  color: var(--note-tab-task-open-border);
+  font: inherit;
+  line-height: 1;
+  transform: none;
+}
+
+.note-tab__markdown :deep(.note-tab__task-toggle:hover),
+.note-tab__markdown :deep(.note-tab__task-toggle:focus-visible) {
+  color: rgba(110, 197, 255, 0.88);
+  outline: none;
+}
+
+.note-tab__markdown :deep(.note-tab__task-toggle--in-progress) {
+  color: var(--note-tab-task-progress-glyph);
+}
+
+.note-tab__markdown :deep(.note-tab__task-toggle--waiting) {
+  color: var(--note-tab-task-waiting-glyph);
+}
+
+.note-tab__markdown :deep(.note-tab__task-toggle--done) {
+  color: var(--note-tab-task-done-glyph);
+}
+
+.note-tab__markdown :deep(.note-tab__task-toggle--cancelled) {
+  color: var(--note-tab-task-cancelled-glyph);
+}
+
+.note-tab__markdown :deep(.note-tab__task-toggle-icon) {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.25em;
+  height: 1.25em;
+}
+
+.note-tab__markdown :deep(.note-tab__task-toggle-icon svg) {
+  display: block;
+  width: 1.25em;
+  height: 1.25em;
 }
 
 .note-tab__markdown :deep(.note-tab__callout) {
@@ -3306,7 +4551,9 @@ defineExpose({
   box-shadow: 0 0 0 1px rgba(255, 174, 71, 0.2);
 }
 
-.note-tab__path-menu {
+.note-tab__path-menu,
+.note-tab__task-menu,
+.note-tab__task-copy-menu {
   position: fixed;
   z-index: 50;
   display: grid;
@@ -3318,7 +4565,13 @@ defineExpose({
   box-shadow: 0 18px 34px rgba(0, 0, 0, 0.34);
 }
 
-.note-tab__path-menu-item {
+.note-tab__task-copy-menu {
+  min-width: 176px;
+}
+
+.note-tab__path-menu-item,
+.note-tab__task-menu-item,
+.note-tab__task-copy-menu-item {
   display: flex;
   align-items: center;
   width: 100%;
@@ -3332,9 +4585,26 @@ defineExpose({
 }
 
 .note-tab__path-menu-item:hover,
-.note-tab__path-menu-item:focus-visible {
+.note-tab__path-menu-item:focus-visible,
+.note-tab__task-menu-item:hover,
+.note-tab__task-menu-item:focus-visible,
+.note-tab__task-copy-menu-item:hover,
+.note-tab__task-copy-menu-item:focus-visible {
   background: rgba(36, 51, 66, 0.92);
   outline: none;
+}
+
+.note-tab__task-menu-item {
+  gap: 0.72rem;
+}
+
+.note-tab__task-menu-item--active {
+  background: rgba(36, 51, 66, 0.82);
+}
+
+.note-tab__task-menu-marker {
+  min-width: 2rem;
+  color: var(--text-secondary);
 }
 
 .note-tab__toast {
