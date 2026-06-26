@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import type {
+  AppLanguage,
   BranchInfo,
   BranchSummary,
   GitChange,
@@ -8,6 +9,7 @@ import type {
   GitLogEntry,
   GitLogScope,
 } from '../../shared/bridgegit';
+import { t } from '../i18n';
 import { SHORTCUTS, matchesShortcut, shortcutBindingsRevision } from '../shortcuts';
 import AppConfirmDialog from './AppConfirmDialog.vue';
 import DiffViewer from './DiffViewer.vue';
@@ -15,6 +17,7 @@ import GitHistoryGraph from './GitHistoryGraph.vue';
 
 interface Props {
   modelValue: boolean;
+  appLanguage: AppLanguage;
   sidebarSide: 'left' | 'right';
   sidebarWidth: number;
   workspacePanelFontSize: number;
@@ -44,6 +47,7 @@ interface Props {
 
 const props = defineProps<Props>();
 const shortcutBindingsVersion = shortcutBindingsRevision;
+const tt = (key: string, params?: Record<string, string | number>) => t(props.appLanguage, key, params);
 
 const emit = defineEmits<{
   'update:modelValue': [value: boolean];
@@ -324,16 +328,16 @@ function selectScope(scope: GitLogScope) {
 
 function formatScopeTitle(scope: GitLogScope): string {
   if (scope.kind === 'all') {
-    return 'All Branches';
+    return tt('history.scope.allBranchesTitle');
   }
 
   if (scope.kind === 'head') {
-    return props.currentBranch && props.currentBranch !== 'no repo'
-      ? `Current Branch · ${props.currentBranch}`
-      : 'Current Branch';
+    return tt('history.scope.currentBranchTitle', {
+      branch: props.currentBranch && props.currentBranch !== 'no repo' ? props.currentBranch : '',
+    });
   }
 
-  return scope.branchName?.trim() || 'Selected Branch';
+  return scope.branchName?.trim() || tt('history.scope.selectedBranchTitle');
 }
 
 function formatDetailDate(value: string): string {
@@ -404,15 +408,24 @@ const canSelectNextPreviewFile = computed(() => (
 ));
 const commitCountLabel = computed(() => (
   props.historyQuery.trim()
-    ? `${props.commits.length.toLocaleString()} / ${(props.availableCommitCount ?? props.commits.length).toLocaleString()} shown`
+    ? tt('history.count.shown', {
+        shown: props.commits.length.toLocaleString(),
+        total: (props.availableCommitCount ?? props.commits.length).toLocaleString(),
+      })
     : props.availableCommitCount !== null
-      ? `${props.commits.length.toLocaleString()} / ${props.availableCommitCount.toLocaleString()} commits`
-      : `${props.commits.length.toLocaleString()} commits`
+      ? tt('history.count.commits', {
+          shown: props.commits.length.toLocaleString(),
+          total: props.availableCommitCount.toLocaleString(),
+        })
+      : tt('history.count.commits', { shown: props.commits.length.toLocaleString() })
 ));
 const historyFooterLabel = computed(() => (
   props.availableCommitCount !== null
-    ? `${props.commits.length.toLocaleString()} of ${props.availableCommitCount.toLocaleString()} commits loaded`
-    : `${props.commits.length.toLocaleString()} commits loaded`
+    ? tt('history.count.loaded', {
+        shown: props.commits.length.toLocaleString(),
+        total: props.availableCommitCount.toLocaleString(),
+      })
+    : tt('history.count.loaded', { shown: props.commits.length.toLocaleString() })
 ));
 const historyFooterStatusLabel = computed(() => {
   if (!props.isLoadingMoreCommits) {
@@ -420,32 +433,37 @@ const historyFooterStatusLabel = computed(() => {
   }
 
   if (props.availableCommitCount !== null) {
-    const action = props.paginationMode === 'all' ? 'Loading all commits' : 'Loading more commits';
-    return `${action}... ${props.commits.length.toLocaleString()} / ${props.availableCommitCount.toLocaleString()}`;
+    const key = props.paginationMode === 'all' ? 'history.loading.allProgress' : 'history.loading.moreProgress';
+    return tt(key, {
+      shown: props.commits.length.toLocaleString(),
+      total: props.availableCommitCount.toLocaleString(),
+    });
   }
 
-  return props.paginationMode === 'all' ? 'Loading all commits...' : 'Loading more commits...';
+  return props.paginationMode === 'all' ? tt('history.loading.all') : tt('history.loading.more');
 });
 const loadMoreLabel = computed(() => {
   if (props.isLoadingMoreCommits && props.paginationMode === 'more') {
-    return 'Loading...';
+    return tt('history.loading.short');
   }
 
   return props.availableCommitCount !== null
-    ? `Load Next ${Math.min(100, Math.max(props.availableCommitCount - props.commits.length, 0)).toLocaleString()}`
-    : 'Load More';
+    ? tt('history.loadNext', {
+        count: Math.min(100, Math.max(props.availableCommitCount - props.commits.length, 0)).toLocaleString(),
+      })
+    : tt('history.loadMore');
 });
 const loadAllLabel = computed(() => {
   if (props.isLoadingMoreCommits && props.paginationMode === 'all') {
-    return 'Loading all...';
+    return tt('history.loading.allShort');
   }
 
   if (props.availableCommitCount !== null) {
     const remainingCount = Math.max(props.availableCommitCount - props.commits.length, 0);
-    return remainingCount > 0 ? `Load All ${remainingCount.toLocaleString()} Remaining` : 'Load All';
+    return remainingCount > 0 ? tt('history.loadAllRemaining', { count: remainingCount.toLocaleString() }) : tt('history.loadAll');
   }
 
-  return 'Load All';
+  return tt('history.loadAll');
 });
 const remainingCommitCount = computed(() => (
   props.availableCommitCount !== null
@@ -453,18 +471,17 @@ const remainingCommitCount = computed(() => (
     : 0
 ));
 const loadAllWarningCopy = computed(() => (
-  `This will load the remaining ${remainingCommitCount.value.toLocaleString()} commits into the history view. `
-  + 'In very large repositories this may take a while and make the dialog heavier to render.'
+  tt('history.loadAllWarning.copy', { count: remainingCommitCount.value.toLocaleString() })
 ));
 const loadAllWarningActions = computed(() => ([
   {
     id: 'confirm',
-    label: `Load ${remainingCommitCount.value.toLocaleString()} commits`,
+    label: tt('history.loadAllWarning.action', { count: remainingCommitCount.value.toLocaleString() }),
     tone: 'danger' as const,
   },
   {
     id: 'cancel',
-    label: 'Cancel',
+    label: tt('common.cancel'),
   },
 ]));
 const panelStyle = computed(() => ({
@@ -825,15 +842,15 @@ watch(
         :style="panelStyle"
         role="dialog"
         aria-modal="true"
-        aria-label="Commit history"
+        :aria-label="tt('history.aria')"
       >
         <header class="commit-history-dialog__header">
           <div class="commit-history-dialog__heading">
-            <p class="commit-history-dialog__eyebrow">Repository History</p>
+            <p class="commit-history-dialog__eyebrow">{{ tt('history.eyebrow') }}</p>
             <h2 class="commit-history-dialog__title">{{ historyTitle }}</h2>
             <p class="commit-history-dialog__meta">
               <span>{{ commitCountLabel }}</span>
-              <span v-if="currentBranch && currentBranch !== 'no repo'">current: {{ currentBranch }}</span>
+              <span v-if="currentBranch && currentBranch !== 'no repo'">{{ tt('history.currentBranchMeta', { branch: currentBranch }) }}</span>
               <span v-if="repoPath">{{ repoPath }}</span>
             </p>
           </div>
@@ -841,7 +858,7 @@ watch(
           <button
             class="commit-history-dialog__close"
             type="button"
-            aria-label="Close commit history"
+            :aria-label="tt('history.close')"
             @click="closeDialog"
           >
             ×
@@ -851,7 +868,7 @@ watch(
         <div class="commit-history-dialog__toolbar">
           <label class="commit-history-dialog__search-field">
             <span class="commit-history-dialog__search-label">
-              Search
+              {{ tt('history.search') }}
               <span class="commit-history-dialog__search-shortcut">{{ SHORTCUTS.historySearch.display }}</span>
             </span>
             <input
@@ -859,7 +876,7 @@ watch(
               v-model="searchQuery"
               class="commit-history-dialog__search-input"
               type="text"
-              placeholder="message, hash, author, branch"
+              :placeholder="tt('history.searchPlaceholder')"
               @keydown="handleSearchKeydown"
             >
           </label>
@@ -871,13 +888,13 @@ watch(
                 type="button"
                 @click="toggleScopeMenu"
               >
-                <span>Scope: {{ historyTitle }}</span>
+                <span>{{ tt('history.scopeButton', { scope: historyTitle }) }}</span>
                 <span class="commit-history-dialog__toolbar-caret">{{ isScopeMenuOpen ? '▴' : '▾' }}</span>
               </button>
 
               <div v-if="isScopeMenuOpen" class="commit-history-dialog__scope-popover">
                 <div class="commit-history-dialog__scope-section">
-                  <p class="commit-history-dialog__section-label">Scope</p>
+                  <p class="commit-history-dialog__section-label">{{ tt('history.scope') }}</p>
 
                   <button
                     class="commit-history-dialog__scope-button"
@@ -885,7 +902,7 @@ watch(
                     type="button"
                     @click="selectScope({ kind: 'all' })"
                   >
-                    All branches
+                    {{ tt('history.scope.allBranches') }}
                   </button>
 
                   <button
@@ -895,13 +912,13 @@ watch(
                     type="button"
                     @click="selectScope({ kind: 'head' })"
                   >
-                    <span>Current branch</span>
+                    <span>{{ tt('history.scope.currentBranch') }}</span>
                     <span class="commit-history-dialog__scope-meta">{{ currentBranch }}</span>
                   </button>
                 </div>
 
                 <div v-if="currentBranchInfo" class="commit-history-dialog__scope-section">
-                  <p class="commit-history-dialog__section-label">Checked Out</p>
+                  <p class="commit-history-dialog__section-label">{{ tt('history.scope.checkedOut') }}</p>
                   <button
                     class="commit-history-dialog__branch-button"
                     :class="{ 'commit-history-dialog__branch-button--active': isScopeActive(buildBranchScope(currentBranchInfo)) }"
@@ -909,12 +926,12 @@ watch(
                     @click="selectScope(buildBranchScope(currentBranchInfo))"
                   >
                     <span class="commit-history-dialog__branch-name">{{ currentBranchInfo.shortName }}</span>
-                    <span class="commit-history-dialog__branch-pill">current</span>
+                    <span class="commit-history-dialog__branch-pill">{{ tt('common.current') }}</span>
                   </button>
                 </div>
 
                 <div v-if="localBranches.length" class="commit-history-dialog__scope-section">
-                  <p class="commit-history-dialog__section-label">Local</p>
+                  <p class="commit-history-dialog__section-label">{{ tt('history.scope.local') }}</p>
                   <button
                     v-for="branchItem in localBranches"
                     :key="branchItem.name"
@@ -928,7 +945,7 @@ watch(
                 </div>
 
                 <div v-if="remoteBranches.length" class="commit-history-dialog__scope-section">
-                  <p class="commit-history-dialog__section-label">Remote</p>
+                  <p class="commit-history-dialog__section-label">{{ tt('history.scope.remote') }}</p>
                   <button
                     v-for="branchItem in remoteBranches"
                     :key="branchItem.name"
@@ -952,7 +969,7 @@ watch(
           <aside class="commit-history-dialog__sidebar">
             <header class="commit-history-dialog__sidebar-header">
               <div class="commit-history-dialog__workspace-heading">
-                <p class="commit-history-dialog__section-label">Commit Detail</p>
+                <p class="commit-history-dialog__section-label">{{ tt('history.detail.title') }}</p>
                 <p v-if="selectedCommit" class="commit-history-dialog__workspace-meta">
                   {{ selectedCommit.shortHash }} · {{ selectedCommit.authorName }} · {{ formatDetailDate(selectedCommit.date) }}
                 </p>
@@ -964,10 +981,10 @@ watch(
                   class="commit-history-dialog__action-button"
                   type="button"
                   :disabled="!canEditSelectedCommitMessage || isUpdatingCommitMessage"
-                  :title="canEditSelectedCommitMessage ? 'Edit HEAD commit message' : 'Only the current HEAD commit message can be edited'"
+                  :title="canEditSelectedCommitMessage ? tt('history.detail.editHeadTitle') : tt('history.detail.editHeadUnavailable')"
                   @click="startEditingMessage"
                 >
-                  Edit Message
+                  {{ tt('history.detail.editMessage') }}
                 </button>
 
                 <button
@@ -975,7 +992,7 @@ watch(
                   type="button"
                   @click="openSelectedCommitDiff"
                 >
-                  Open Diff
+                  {{ tt('history.openDiff') }}
                 </button>
               </div>
             </header>
@@ -984,7 +1001,7 @@ watch(
               v-if="isLoadingCommitDetail && !commitDetail"
               class="commit-history-dialog__sidebar-state"
             >
-              Loading commit detail...
+              {{ tt('history.detail.loading') }}
             </div>
 
             <div
@@ -999,7 +1016,7 @@ watch(
               </div>
 
               <section class="commit-history-dialog__section">
-                <p class="commit-history-dialog__detail-kicker">Message</p>
+                <p class="commit-history-dialog__detail-kicker">{{ tt('history.detail.message') }}</p>
 
                 <div v-if="isEditingMessage" class="commit-history-dialog__message-editor">
                   <textarea
@@ -1018,7 +1035,7 @@ watch(
                       :disabled="isUpdatingCommitMessage || !messageDraft.trim()"
                       @click="saveEditedMessage"
                     >
-                      Save
+                      {{ tt('common.save') }}
                     </button>
 
                     <button
@@ -1027,7 +1044,7 @@ watch(
                       :disabled="isUpdatingCommitMessage"
                       @click="cancelEditingMessage"
                     >
-                      Cancel
+                      {{ tt('common.cancel') }}
                     </button>
                   </div>
                 </div>
@@ -1038,9 +1055,9 @@ watch(
               <section class="commit-history-dialog__section">
                 <div class="commit-history-dialog__section-header">
                   <div>
-                    <p class="commit-history-dialog__detail-kicker">Changed Files</p>
+                    <p class="commit-history-dialog__detail-kicker">{{ tt('history.detail.changedFiles') }}</p>
                     <p class="commit-history-dialog__section-meta">
-                      {{ sortedChangedFiles.length }} files
+                      {{ tt('history.detail.fileCount', { count: sortedChangedFiles.length }) }}
                     </p>
                   </div>
 
@@ -1051,7 +1068,7 @@ watch(
                       type="button"
                       @click="changedFileViewMode = 'list'"
                     >
-                      List
+                      {{ tt('history.detail.list') }}
                     </button>
 
                     <button
@@ -1060,13 +1077,13 @@ watch(
                       type="button"
                       @click="changedFileViewMode = 'tree'"
                     >
-                      Tree
+                      {{ tt('history.detail.tree') }}
                     </button>
                   </div>
                 </div>
 
                 <div v-if="!sortedChangedFiles.length" class="commit-history-dialog__section-empty">
-                  No changed files recorded for this commit.
+                  {{ tt('history.detail.noChangedFiles') }}
                 </div>
 
                 <ul
@@ -1088,7 +1105,7 @@ watch(
                       <span class="commit-history-dialog__file-copy">
                         <span class="commit-history-dialog__file-name">{{ fileName(change.path) }}</span>
                         <span class="commit-history-dialog__file-directory">
-                          {{ fileDirectory(change.path) ?? 'repo root' }}
+                          {{ fileDirectory(change.path) ?? tt('history.detail.repoRoot') }}
                         </span>
                       </span>
                       <span
@@ -1141,7 +1158,7 @@ watch(
             </div>
 
             <div v-else class="commit-history-dialog__sidebar-state">
-              Select a commit to inspect its message and changed files.
+              {{ tt('history.detail.selectCommit') }}
             </div>
           </aside>
 
@@ -1149,7 +1166,7 @@ watch(
             class="commit-history-dialog__splitter"
             role="separator"
             aria-orientation="vertical"
-            aria-label="Resize history sidebar"
+            :aria-label="tt('history.resizeSidebar')"
             @pointerdown.prevent="startSidebarResize"
           />
 
@@ -1158,7 +1175,7 @@ watch(
               v-if="isLoading && !commits.length"
               class="commit-history-dialog__workspace-state"
             >
-              Loading commits...
+              {{ tt('history.loadingCommits') }}
             </div>
 
             <div
@@ -1171,6 +1188,7 @@ watch(
             >
               <section class="commit-history-dialog__workspace-history">
                 <GitHistoryGraph
+                  :app-language="appLanguage"
                   :commits="commits"
                   :selected-hash="selectedCommitHash"
                   :simplify-graph="Boolean(historyQuery.trim())"
@@ -1212,17 +1230,18 @@ watch(
                 class="commit-history-dialog__preview-splitter"
                 role="separator"
                 aria-orientation="horizontal"
-                aria-label="Resize file diff preview"
+                :aria-label="tt('history.resizePreview')"
                 @pointerdown.prevent="startPreviewResize"
               />
 
               <section v-if="hasPreviewPanel" class="commit-history-dialog__preview">
                 <div class="commit-history-dialog__preview-viewer">
                   <DiffViewer
+                    :app-language="appLanguage"
                     :repo-path="repoPath"
                     viewer-mode="commit"
                     :view-mode="previewViewMode"
-                    eyebrow-text="Commit Diff"
+                    :eyebrow-text="tt('diff.eyebrow.commit')"
                     title=""
                     :title-meta="null"
                     :has-target="Boolean(previewDiffPath)"
@@ -1237,7 +1256,7 @@ watch(
                     :can-stage-current="false"
                     :can-discard-current="false"
                     :can-open-current-file="Boolean(previewDiffPath)"
-                    stage-action-label="Stage current"
+                    :stage-action-label="tt('stage.current')"
                     :can-collapse="false"
                     collapse-shortcut-display=""
                     @update:view-mode="previewViewMode = $event"
@@ -1253,7 +1272,7 @@ watch(
                         type="button"
                         @click="openPreviewInMainDiff"
                       >
-                        Open Diff
+                        {{ tt('history.openDiff') }}
                       </button>
                     </template>
 
@@ -1261,7 +1280,7 @@ watch(
                       <button
                         class="commit-history-dialog__icon-button"
                         type="button"
-                        aria-label="Close preview"
+                        :aria-label="tt('history.closePreview')"
                         @click="closePreviewDiff"
                       >
                         ×
@@ -1277,9 +1296,9 @@ watch(
 
       <AppConfirmDialog
         :model-value="showLoadAllWarning"
-        dialog-label="Confirm loading all commits"
-        eyebrow="Large History"
-        title="Load all remaining commits?"
+        :dialog-label="tt('history.loadAllWarning.dialogLabel')"
+        :eyebrow="tt('history.loadAllWarning.eyebrow')"
+        :title="tt('history.loadAllWarning.title')"
         :copy="loadAllWarningCopy"
         :actions="loadAllWarningActions"
         @update:model-value="closeLoadAllWarning"

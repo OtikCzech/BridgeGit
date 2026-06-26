@@ -71,6 +71,8 @@ const bridgegitApi = {
   },
   system: {
     beep: () => ipcRenderer.invoke('system:beep') as Promise<void>,
+    openExternalUrl: (url: string) =>
+      ipcRenderer.invoke('system:openExternalUrl', url) as Promise<void>,
   },
   session: {
     load: () => ipcRenderer.invoke('session:load') as Promise<SessionData>,

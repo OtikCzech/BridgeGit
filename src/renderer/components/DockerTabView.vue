@@ -1,19 +1,23 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import type {
+  AppLanguage,
   DockerContainerInfo,
   DockerImageInfo,
   DockerTabActiveView,
 } from '../../shared/bridgegit';
+import { t } from '../i18n';
 
 interface Props {
   active: boolean;
+  appLanguage: AppLanguage;
   activeView: DockerTabActiveView;
   expandedGroupIds: string[];
   projectRoot: string | null;
 }
 
 const props = defineProps<Props>();
+const tt = (key: string, params?: Record<string, string | number>) => t(props.appLanguage, key, params);
 
 const emit = defineEmits<{
   'update:active-view': [view: DockerTabActiveView];
@@ -70,23 +74,23 @@ function getContainerGroupState(groupContainers: DockerContainerInfo[]) {
   if (runningCount === totalCount && totalCount > 0) {
     return {
       tone: 'running' as const,
-      label: 'running',
-      title: `All ${totalCount} containers are running`,
+      label: tt('docker.state.running'),
+      title: tt('docker.group.allRunning', { count: totalCount }),
     };
   }
 
   if (runningCount === 0) {
     return {
       tone: 'stopped' as const,
-      label: 'stopped',
-      title: totalCount === 1 ? 'Container is stopped' : `All ${totalCount} containers are stopped`,
+      label: tt('docker.state.stopped'),
+      title: totalCount === 1 ? tt('docker.group.oneStopped') : tt('docker.group.allStopped', { count: totalCount }),
     };
   }
 
   return {
     tone: 'mixed' as const,
-    label: `${runningCount}/${totalCount} running`,
-    title: `${runningCount} of ${totalCount} containers are running`,
+    label: tt('docker.group.runningRatio', { running: runningCount, total: totalCount }),
+    title: tt('docker.group.someRunning', { running: runningCount, total: totalCount }),
   };
 }
 
@@ -168,7 +172,7 @@ function formatError(error: unknown): string {
   if (error instanceof Error) {
     return error.message;
   }
-  return 'Unknown error';
+  return tt('docker.unknownError');
 }
 
 function setActiveView(view: DockerTabActiveView) {
@@ -183,7 +187,7 @@ async function handleContainerAction(
 ) {
   if (!window.bridgegit?.docker) return;
 
-  if (action === 'remove' && !window.confirm(`Remove container "${container.name}"?`)) {
+  if (action === 'remove' && !window.confirm(tt('docker.confirm.removeContainer', { name: container.name }))) {
     return;
   }
 
@@ -238,7 +242,7 @@ async function handleRemoveImage(image: DockerImageInfo) {
   if (!window.bridgegit?.docker) return;
 
   const label = `${image.repository}:${image.tag}`;
-  if (!window.confirm(`Remove image "${label}"?`)) {
+  if (!window.confirm(tt('docker.confirm.removeImage', { name: label }))) {
     return;
   }
 
@@ -329,7 +333,7 @@ onBeforeUnmount(() => {
           :class="{ 'docker-tab__view-tab--active': activeView === 'containers' }"
           @click="setActiveView('containers')"
         >
-          Containers
+          {{ tt('docker.containers') }}
           <span v-if="dockerAvailable" class="docker-tab__view-count">
             {{ runningContainers }}/{{ totalContainers }}
           </span>
@@ -340,7 +344,7 @@ onBeforeUnmount(() => {
           :class="{ 'docker-tab__view-tab--active': activeView === 'images' }"
           @click="setActiveView('images')"
         >
-          Images
+          {{ tt('docker.images') }}
         </button>
       </div>
 
@@ -349,7 +353,7 @@ onBeforeUnmount(() => {
           type="button"
           class="docker-tab__icon-button"
           :disabled="loading"
-          title="Refresh"
+          :title="tt('docker.refresh')"
           @click="refreshData(false)"
         >
           ↻
@@ -358,17 +362,17 @@ onBeforeUnmount(() => {
     </header>
 
     <div v-if="dockerAvailable === false" class="docker-tab__notice docker-tab__notice--warning">
-      <p>Docker is not available.</p>
-      <p class="docker-tab__notice-hint">Install Docker Desktop or run Docker in WSL.</p>
+      <p>{{ tt('docker.notAvailable') }}</p>
+      <p class="docker-tab__notice-hint">{{ tt('docker.installHint') }}</p>
       <button type="button" class="docker-tab__button" @click="handleRetryDetection">
-        Retry detection
+        {{ tt('docker.retryDetection') }}
       </button>
     </div>
 
     <div v-else-if="lastError" class="docker-tab__notice docker-tab__notice--error">
       <p>{{ lastError }}</p>
       <button type="button" class="docker-tab__button" @click="refreshData(false)">
-        Retry
+        {{ tt('docker.retry') }}
       </button>
     </div>
 
@@ -386,7 +390,7 @@ onBeforeUnmount(() => {
             @click="handleCompose('up')"
           >
             <span v-if="composeBusy === 'up'">…</span>
-            <span v-else>▶ Up</span>
+            <span v-else>▶ {{ tt('docker.compose.up') }}</span>
           </button>
           <button
             type="button"
@@ -395,7 +399,7 @@ onBeforeUnmount(() => {
             @click="handleCompose('restart')"
           >
             <span v-if="composeBusy === 'restart'">…</span>
-            <span v-else>♻ Restart</span>
+            <span v-else>♻ {{ tt('docker.restart') }}</span>
           </button>
           <button
             type="button"
@@ -404,13 +408,13 @@ onBeforeUnmount(() => {
             @click="handleCompose('down')"
           >
             <span v-if="composeBusy === 'down'">…</span>
-            <span v-else>▼ Down</span>
+            <span v-else>▼ {{ tt('docker.compose.down') }}</span>
           </button>
         </div>
       </section>
 
       <div v-if="containers.length === 0 && !loading" class="docker-tab__empty">
-        No containers found.
+        {{ tt('docker.emptyContainers') }}
       </div>
 
       <div v-else class="docker-tab__table-wrapper">
@@ -418,11 +422,11 @@ onBeforeUnmount(() => {
           <thead>
             <tr>
               <th class="docker-tab__col-state"></th>
-              <th class="docker-tab__col-name">Name</th>
-              <th class="docker-tab__col-image">Image</th>
-              <th class="docker-tab__col-status">Status</th>
-              <th class="docker-tab__col-ports">Ports</th>
-              <th class="docker-tab__col-actions">Actions</th>
+              <th class="docker-tab__col-name">{{ tt('docker.table.name') }}</th>
+              <th class="docker-tab__col-image">{{ tt('docker.table.image') }}</th>
+              <th class="docker-tab__col-status">{{ tt('docker.table.status') }}</th>
+              <th class="docker-tab__col-ports">{{ tt('docker.table.ports') }}</th>
+              <th class="docker-tab__col-actions">{{ tt('docker.table.actions') }}</th>
             </tr>
           </thead>
           <tbody>
@@ -459,7 +463,7 @@ onBeforeUnmount(() => {
                         type="button"
                         class="docker-tab__icon-button"
                         :disabled="containerGroupBusyId === group.project"
-                        title="Start all"
+                        :title="tt('docker.startAll')"
                         @click.stop="handleContainerGroupAction(group.project, group.items, 'start')"
                       >
                         ▶
@@ -468,7 +472,7 @@ onBeforeUnmount(() => {
                         type="button"
                         class="docker-tab__icon-button"
                         :disabled="containerGroupBusyId === group.project"
-                        title="Stop all"
+                        :title="tt('docker.stopAll')"
                         @click.stop="handleContainerGroupAction(group.project, group.items, 'stop')"
                       >
                         ⏹
@@ -477,7 +481,7 @@ onBeforeUnmount(() => {
                         type="button"
                         class="docker-tab__icon-button"
                         :disabled="containerGroupBusyId === group.project"
-                        title="Restart all"
+                        :title="tt('docker.restartAll')"
                         @click.stop="handleContainerGroupAction(group.project, group.items, 'restart')"
                       >
                         ♻
@@ -514,7 +518,7 @@ onBeforeUnmount(() => {
                     type="button"
                     class="docker-tab__icon-button"
                     :disabled="containerBusyId === container.id"
-                    title="Stop"
+                    :title="tt('docker.stop')"
                     @click="handleContainerAction(container, 'stop')"
                   >
                     ⏹
@@ -524,7 +528,7 @@ onBeforeUnmount(() => {
                     type="button"
                     class="docker-tab__icon-button"
                     :disabled="containerBusyId === container.id"
-                    title="Start"
+                    :title="tt('docker.start')"
                     @click="handleContainerAction(container, 'start')"
                   >
                     ▶
@@ -533,7 +537,7 @@ onBeforeUnmount(() => {
                     type="button"
                     class="docker-tab__icon-button"
                     :disabled="containerBusyId === container.id || container.state !== 'running'"
-                    title="Restart"
+                    :title="tt('docker.restart')"
                     @click="handleContainerAction(container, 'restart')"
                   >
                     ♻
@@ -541,7 +545,7 @@ onBeforeUnmount(() => {
                   <button
                     type="button"
                     class="docker-tab__icon-button"
-                    title="Logs"
+                    :title="tt('docker.logs')"
                     @click="handleOpenLogs(container)"
                   >
                     ☰
@@ -550,7 +554,7 @@ onBeforeUnmount(() => {
                     type="button"
                     class="docker-tab__icon-button docker-tab__icon-button--danger"
                     :disabled="containerBusyId === container.id"
-                    title="Remove"
+                    :title="tt('docker.remove')"
                     @click="handleContainerAction(container, 'remove')"
                   >
                     ✕
@@ -573,7 +577,7 @@ onBeforeUnmount(() => {
                         {{ isContainerGroupExpanded(STANDALONE_GROUP_ID) ? '▾' : '▸' }}
                       </span>
                       <span class="docker-tab__group-icon">○</span>
-                      <span class="docker-tab__group-name">Standalone</span>
+                      <span class="docker-tab__group-name">{{ tt('docker.standalone') }}</span>
                       <span class="docker-tab__group-count">{{ composeProjects.standalone.length }}</span>
                       <span
                         class="docker-tab__group-state"
@@ -589,7 +593,7 @@ onBeforeUnmount(() => {
                         type="button"
                         class="docker-tab__icon-button"
                         :disabled="containerGroupBusyId === STANDALONE_GROUP_ID"
-                        title="Start all"
+                        :title="tt('docker.startAll')"
                         @click.stop="handleContainerGroupAction(STANDALONE_GROUP_ID, composeProjects.standalone, 'start')"
                       >
                         ▶
@@ -598,7 +602,7 @@ onBeforeUnmount(() => {
                         type="button"
                         class="docker-tab__icon-button"
                         :disabled="containerGroupBusyId === STANDALONE_GROUP_ID"
-                        title="Stop all"
+                        :title="tt('docker.stopAll')"
                         @click.stop="handleContainerGroupAction(STANDALONE_GROUP_ID, composeProjects.standalone, 'stop')"
                       >
                         ⏹
@@ -607,7 +611,7 @@ onBeforeUnmount(() => {
                         type="button"
                         class="docker-tab__icon-button"
                         :disabled="containerGroupBusyId === STANDALONE_GROUP_ID"
-                        title="Restart all"
+                        :title="tt('docker.restartAll')"
                         @click.stop="handleContainerGroupAction(STANDALONE_GROUP_ID, composeProjects.standalone, 'restart')"
                       >
                         ♻
@@ -641,7 +645,7 @@ onBeforeUnmount(() => {
                     type="button"
                     class="docker-tab__icon-button"
                     :disabled="containerBusyId === container.id"
-                    title="Stop"
+                    :title="tt('docker.stop')"
                     @click="handleContainerAction(container, 'stop')"
                   >
                     ⏹
@@ -651,7 +655,7 @@ onBeforeUnmount(() => {
                     type="button"
                     class="docker-tab__icon-button"
                     :disabled="containerBusyId === container.id"
-                    title="Start"
+                    :title="tt('docker.start')"
                     @click="handleContainerAction(container, 'start')"
                   >
                     ▶
@@ -660,7 +664,7 @@ onBeforeUnmount(() => {
                     type="button"
                     class="docker-tab__icon-button"
                     :disabled="containerBusyId === container.id || container.state !== 'running'"
-                    title="Restart"
+                    :title="tt('docker.restart')"
                     @click="handleContainerAction(container, 'restart')"
                   >
                     ♻
@@ -668,7 +672,7 @@ onBeforeUnmount(() => {
                   <button
                     type="button"
                     class="docker-tab__icon-button"
-                    title="Logs"
+                    :title="tt('docker.logs')"
                     @click="handleOpenLogs(container)"
                   >
                     ☰
@@ -677,7 +681,7 @@ onBeforeUnmount(() => {
                     type="button"
                     class="docker-tab__icon-button docker-tab__icon-button--danger"
                     :disabled="containerBusyId === container.id"
-                    title="Remove"
+                    :title="tt('docker.remove')"
                     @click="handleContainerAction(container, 'remove')"
                   >
                     ✕
@@ -692,19 +696,19 @@ onBeforeUnmount(() => {
 
     <div v-if="dockerAvailable && activeView === 'images'" class="docker-tab__content">
       <div v-if="images.length === 0 && !loading" class="docker-tab__empty">
-        No images found.
+        {{ tt('docker.emptyImages') }}
       </div>
 
       <div v-else class="docker-tab__table-wrapper">
         <table class="docker-tab__table">
           <thead>
             <tr>
-              <th class="docker-tab__col-name">Repository</th>
-              <th class="docker-tab__col-tag">Tag</th>
-              <th class="docker-tab__col-id">ID</th>
-              <th class="docker-tab__col-size">Size</th>
-              <th class="docker-tab__col-created">Created</th>
-              <th class="docker-tab__col-actions">Actions</th>
+              <th class="docker-tab__col-name">{{ tt('docker.table.repository') }}</th>
+              <th class="docker-tab__col-tag">{{ tt('docker.table.tag') }}</th>
+              <th class="docker-tab__col-id">{{ tt('docker.table.id') }}</th>
+              <th class="docker-tab__col-size">{{ tt('docker.table.size') }}</th>
+              <th class="docker-tab__col-created">{{ tt('docker.table.created') }}</th>
+              <th class="docker-tab__col-actions">{{ tt('docker.table.actions') }}</th>
             </tr>
           </thead>
           <tbody>
@@ -723,7 +727,7 @@ onBeforeUnmount(() => {
                   type="button"
                   class="docker-tab__icon-button docker-tab__icon-button--danger"
                   :disabled="imageBusyId === image.id"
-                  title="Remove"
+                  :title="tt('docker.remove')"
                   @click="handleRemoveImage(image)"
                 >
                   ✕

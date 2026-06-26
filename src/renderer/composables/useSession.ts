@@ -1,6 +1,7 @@
 import { ref } from 'vue';
 import {
   DEFAULT_SESSION_DATA,
+  cloneClipboardBehaviorSettings,
   cloneClipboardHistoryEntries,
   cloneDismissedWorktreePaths,
   cloneShortcutOverrides,
@@ -36,6 +37,7 @@ function cloneSession(session: SessionData): SessionData {
     projectTitlesByContext: cloneProjectTitlesByContext(session.projectTitlesByContext),
     shortcutOverrides: cloneShortcutOverrides(session.shortcutOverrides),
     workspaceIndicatorVisibility: cloneWorkspaceIndicatorVisibilitySettings(session.workspaceIndicatorVisibility),
+    clipboardBehavior: cloneClipboardBehaviorSettings(session.clipboardBehavior),
     workspaceTabDefaults: cloneWorkspaceTabDefaults(session.workspaceTabDefaults),
     dismissedWorktreePaths: cloneDismissedWorktreePaths(session.dismissedWorktreePaths),
     seenInfoNoteRevisions: cloneSeenInfoNoteRevisions(session.seenInfoNoteRevisions),
@@ -104,6 +106,9 @@ function mergeSession(base: SessionData, patch: SessionPatch): SessionData {
     workspaceIndicatorVisibility: patch.workspaceIndicatorVisibility
       ? cloneWorkspaceIndicatorVisibilitySettings(patch.workspaceIndicatorVisibility)
       : cloneWorkspaceIndicatorVisibilitySettings(base.workspaceIndicatorVisibility),
+    clipboardBehavior: patch.clipboardBehavior
+      ? cloneClipboardBehaviorSettings(patch.clipboardBehavior)
+      : cloneClipboardBehaviorSettings(base.clipboardBehavior),
     workspaceTabDefaults: patch.workspaceTabDefaults
       ? cloneWorkspaceTabDefaults(patch.workspaceTabDefaults)
       : cloneWorkspaceTabDefaults(base.workspaceTabDefaults),

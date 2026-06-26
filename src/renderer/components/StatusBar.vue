@@ -1,4 +1,7 @@
 <script setup lang="ts">
+import type { AppLanguage } from '../../shared/bridgegit';
+import { t } from '../i18n';
+
 type CollapsedPanel = {
   id: 'sidebar' | 'diff' | 'terminal';
   label: string;
@@ -19,6 +22,7 @@ type RepoDockSummary = {
 };
 
 interface Props {
+  appLanguage: AppLanguage;
   branch: string;
   repoName: string;
   changedCount: number;
@@ -29,12 +33,14 @@ interface Props {
   repoDockSummary: RepoDockSummary;
 }
 
-defineProps<Props>();
+const props = defineProps<Props>();
 
 defineEmits<{
   'cycle-diff-placement': [];
   'toggle-panel': [panelId: CollapsedPanel['id']];
 }>();
+
+const tt = (key: string, params?: Record<string, string | number>) => t(props.appLanguage, key, params);
 </script>
 
 <template>
@@ -50,7 +56,7 @@ defineEmits<{
       </div>
 
       <div class="status-bar__item">
-        {{ changedCount }} changed
+        {{ tt('status.changed', { count: changedCount }) }}
       </div>
 
       <div class="status-bar__item status-bar__item--path">
@@ -58,22 +64,25 @@ defineEmits<{
       </div>
     </div>
 
-    <div class="status-bar__dock" aria-label="Collapsed panels">
+    <div class="status-bar__dock" :aria-label="tt('status.collapsedPanels')">
       <button
         v-for="panel in collapsedPanels"
         :key="panel.id"
         class="status-bar__dock-button"
         type="button"
-        :title="`Show ${panel.label} panel ${panel.shortcut}`"
-        :aria-label="`Show ${panel.label} panel`"
+        :title="tt('status.showPanelTitle', { label: panel.label, shortcut: panel.shortcut })"
+        :aria-label="tt('status.showPanel', { label: panel.label })"
         @click="$emit('toggle-panel', panel.id)"
       >
         <span
           v-if="panel.id === 'sidebar'"
           class="status-bar__dock-repo"
           :title="repoDockSummary.isClean
-            ? 'Working tree is clean'
-            : `${repoDockSummary.changed} changed / ${repoDockSummary.untracked} new`"
+            ? tt('status.clean')
+            : tt('status.changedNew', {
+              changed: repoDockSummary.changed,
+              untracked: repoDockSummary.untracked,
+            })"
           aria-hidden="true"
         >
           <span
@@ -112,7 +121,7 @@ defineEmits<{
       <button
         class="status-bar__layout-toggle"
         type="button"
-        :title="`Cycle diff placement (current: ${diffPlacement})`"
+        :title="tt('status.cycleDiffPlacement', { placement: diffPlacement })"
         @click="$emit('cycle-diff-placement')"
       >
         <span

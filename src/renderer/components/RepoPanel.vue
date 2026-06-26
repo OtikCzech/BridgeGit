@@ -3,6 +3,7 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import CopyableErrorNotice from './CopyableErrorNotice.vue';
 import { writeClipboardText } from '../clipboard';
 import type {
+  AppLanguage,
   BranchInfo,
   BranchSummary,
   GitChange,
@@ -23,8 +24,10 @@ import type {
 } from '../../shared/bridgegit';
 import { areRepoPathsEquivalent, normalizeNoteFontSize, resolveWorkspaceFileTabType } from '../../shared/bridgegit';
 import { SHORTCUTS, matchesShortcut, shortcutBindingsRevision } from '../shortcuts';
+import { t } from '../i18n';
 
 interface Props {
+  appLanguage: AppLanguage;
   projectTitle: string;
   repoPath: string | null;
   appearanceTheme: AppAppearance;
@@ -56,6 +59,7 @@ interface Props {
 
 const props = defineProps<Props>();
 const shortcutBindingsVersion = shortcutBindingsRevision;
+const tt = (key: string, params?: Record<string, string | number>) => t(props.appLanguage, key, params);
 
 const emit = defineEmits<{
   (event: 'open-info'): void;
@@ -261,8 +265,8 @@ let copyToastTimer: number | null = null;
 const historyCount = computed(() => props.log?.items.length ?? 0);
 const collapseButtonTitle = computed(() => (
   props.canCollapse
-    ? `Collapse repository panel ${props.collapseShortcutDisplay}`
-    : 'Repository panel cannot be collapsed while it is the last visible panel'
+    ? tt('repo.collapseTitle', { shortcut: props.collapseShortcutDisplay })
+    : tt('repo.cannotCollapse')
 ));
 const hasWorkspaceItems = computed(() => props.workspaceItems.length > 0);
 const currentWorkspaceItem = computed(() => (
@@ -316,7 +320,7 @@ const currentWorkspaceFamilyItems = computed(() => (
     : props.workspaceItems
 ));
 const currentWorkspaceFamilyLabel = computed(() => (
-  currentWorkspaceItem.value ? workspaceFamilyLabel(currentWorkspaceItem.value) : 'Current repo'
+  currentWorkspaceItem.value ? workspaceFamilyLabel(currentWorkspaceItem.value) : tt('repo.currentRepo')
 ));
 const normalizedPinnedWorkspaceIds = computed(() => normalizeWorkspaceIdList(pinnedWorkspaceIds.value));
 const normalizedPendingPinnedWorkspaceIds = computed(() => normalizeWorkspaceIdList(pendingPinnedWorkspaceIds.value));
@@ -349,11 +353,11 @@ const shouldShowWorkspaceFamilySwitcher = computed(() => (
 ));
 const workspaceFilterSummaryName = computed(() => {
   if (isWorkspacePinSelectionActive.value) {
-    return 'Pinning repos';
+    return tt('repo.workspaces.pinningRepos');
   }
 
   if (isPinnedWorkspaceFilterActive.value) {
-    return 'Pinned repos';
+    return tt('repo.workspaces.pinnedRepos');
   }
 
   return currentWorkspaceFamilyLabel.value;
@@ -376,28 +380,28 @@ const sections = computed<Omit<RepoSectionViewModel, 'filteredItems'>[]>(() => {
   return [
     {
       id: 'staged' as SectionId,
-      title: 'Staged',
+      title: tt('repo.section.staged'),
       accent: 'success' as const,
       action: 'unstage' as GroupAction,
       items: source?.staged ?? [],
     },
     {
       id: 'changed' as SectionId,
-      title: 'Changed',
+      title: tt('repo.section.changed'),
       accent: 'warning' as const,
       action: 'stage' as GroupAction,
       items: source?.unstaged ?? [],
     },
     {
       id: 'untracked' as SectionId,
-      title: 'Untracked',
+      title: tt('repo.section.untracked'),
       accent: 'muted' as const,
       action: 'stage' as GroupAction,
       items: source?.untracked ?? [],
     },
     {
       id: 'conflicts' as SectionId,
-      title: 'Conflicts',
+      title: tt('repo.section.conflicts'),
       accent: 'danger' as const,
       action: null,
       items: source?.conflicted ?? [],
@@ -408,7 +412,7 @@ const sections = computed<Omit<RepoSectionViewModel, 'filteredItems'>[]>(() => {
 const fileStatusIndicators = computed<FilesStatusIndicator[]>(() => [
   {
     id: 'changed',
-    label: 'Changed',
+    label: tt('repo.section.changed'),
     active: props.status
       ? Boolean(props.status.staged.length || props.status.unstaged.length)
       : Boolean(currentWorkspaceItem.value?.changedCount),
@@ -416,7 +420,7 @@ const fileStatusIndicators = computed<FilesStatusIndicator[]>(() => [
   },
   {
     id: 'untracked',
-    label: 'Untracked',
+    label: tt('repo.section.untracked'),
     active: props.status
       ? Boolean(props.status.untracked.length)
       : Boolean(currentWorkspaceItem.value?.untrackedCount),
@@ -424,7 +428,7 @@ const fileStatusIndicators = computed<FilesStatusIndicator[]>(() => [
   },
   {
     id: 'conflicts',
-    label: 'Conflicts',
+    label: tt('repo.section.conflicts'),
     active: props.status
       ? Boolean(props.status.conflicted.length)
       : Boolean(currentWorkspaceItem.value?.conflictedCount),
@@ -433,7 +437,7 @@ const fileStatusIndicators = computed<FilesStatusIndicator[]>(() => [
 ]);
 
 const currentBranchLabel = computed(() => (
-  props.status?.currentBranch ?? props.branches?.current ?? 'Detached HEAD'
+  props.status?.currentBranch ?? props.branches?.current ?? tt('repo.detachedHead')
   ));
 const canPull = computed(() => (
   props.isGitRepository
@@ -442,41 +446,41 @@ const canPull = computed(() => (
 ));
 const pullTitle = computed(() => {
   if (!canPull.value) {
-    return 'Pull unavailable without upstream branch';
+    return tt('repo.pull.unavailableNoUpstream');
   }
 
   if (!shouldHighlightPull.value) {
-    return 'Already up to date';
+    return tt('repo.pull.upToDate');
   }
 
-  return `Pull ${props.status?.trackingBranch}`;
+  return tt('repo.pull.branch', { branch: props.status?.trackingBranch ?? '' });
 });
 const pushTitle = computed(() => {
   if (!canPush.value) {
-    return 'Push unavailable in detached HEAD';
+    return tt('repo.push.unavailableDetached');
   }
 
   if (!shouldHighlightPush.value) {
-    return 'Nothing to push';
+    return tt('repo.push.nothing');
   }
 
   if (props.status?.trackingBranch) {
-    return `Push ${props.status.trackingBranch}`;
+    return tt('repo.push.branch', { branch: props.status.trackingBranch });
   }
 
   const currentBranch = props.status?.currentBranch ?? props.branches?.current;
 
   if (currentBranch) {
-    return `Push origin/${currentBranch} and set upstream`;
+    return tt('repo.push.setUpstream', { branch: currentBranch });
   }
 
-  return 'Push current branch';
+  return tt('repo.push.current');
 });
 const aheadBehindLabel = computed(() => (
   `+${props.status?.ahead ?? 0} / -${props.status?.behind ?? 0}`
 ));
 const aheadBehindTitle = computed(() => (
-  `Ahead / behind: +${props.status?.ahead ?? 0} / -${props.status?.behind ?? 0}`
+  tt('repo.aheadBehindTitle', { ahead: props.status?.ahead ?? 0, behind: props.status?.behind ?? 0 })
 ));
 const shouldHighlightPull = computed(() => (
   (props.status?.behind ?? 0) > 0
@@ -509,10 +513,10 @@ const filesFilterToggleTitle = computed(() => {
   shortcutBindingsRevision.value;
 
   return isFilesFilterVisible.value
-    ? `Focus file filter ${SHORTCUTS.repoPanelFilesFilterFocus.display}`
-    : `Open file filter ${SHORTCUTS.repoPanelFilesFilterFocus.display}`;
+    ? tt('repo.files.focusFilter', { shortcut: SHORTCUTS.repoPanelFilesFilterFocus.display })
+    : tt('repo.files.openFilter', { shortcut: SHORTCUTS.repoPanelFilesFilterFocus.display });
 });
-const filesFilterPlaceholder = computed(() => 'Filter files');
+const filesFilterPlaceholder = computed(() => tt('repo.files.filterPlaceholder'));
 const isAllFilesSearchMode = computed(() => hasFilesFilter.value);
 const isAllFilesTreeFilterMode = computed(() => (
   isAllFilesSearchMode.value && fileListMode.value === 'tree'
@@ -535,22 +539,22 @@ const canCreateBranch = computed(() => (
   Boolean(branchFilterQuery.value) && !exactBranchMatch.value
 ));
 const branchSearchPlaceholder = computed(() => (
-  isBranchCreateMode.value ? 'New branch name' : 'Filter branches'
+  isBranchCreateMode.value ? tt('repo.branch.newName') : tt('repo.branch.filter')
 ));
 const branchCreateButtonTitle = computed(() => {
   if (!isBranchCreateMode.value) {
-    return 'Create a new branch';
+    return tt('repo.branch.createNew');
   }
 
   if (!branchFilterQuery.value) {
-    return 'Enter a new branch name';
+    return tt('repo.branch.enterName');
   }
 
   if (exactBranchMatch.value) {
-    return 'Branch already exists';
+    return tt('repo.branch.exists');
   }
 
-  return `Choose how to create branch "${branchFilterQuery.value}"`;
+  return tt('repo.branch.chooseCreate', { branch: branchFilterQuery.value });
 });
 const branchCreateHint = computed(() => {
   if (!isBranchCreateMode.value) {
@@ -558,39 +562,39 @@ const branchCreateHint = computed(() => {
   }
 
   if (!branchFilterQuery.value) {
-    return 'Type a branch name. Press Enter to create it here, or use New Repo for a separate checkout.';
+    return tt('repo.branch.createHint.empty');
   }
 
   if (exactBranchMatch.value) {
-    return `Branch "${exactBranchMatch.value.displayName}" already exists.`;
+    return tt('repo.branch.createHint.exists', { branch: exactBranchMatch.value.displayName });
   }
 
-  return `Press Enter to create branch "${branchFilterQuery.value}" here, or choose New Repo below.`;
+  return tt('repo.branch.createHint.ready', { branch: branchFilterQuery.value });
 });
 
 function branchStatusBadge(branch: BranchInfo): BranchBadge | null {
   switch (branch.syncStatus) {
     case 'local-only':
-      return { label: 'Local only', tone: 'neutral' };
+      return { label: tt('repo.branch.badge.localOnly'), tone: 'neutral' };
     case 'remote-untracked':
-      return { label: 'Remote, no track', tone: 'warning' };
+      return { label: tt('repo.branch.badge.remoteNoTrack'), tone: 'warning' };
     case 'tracked-synced':
-      return { label: 'Up to date', tone: 'success' };
+      return { label: tt('repo.branch.badge.upToDate'), tone: 'success' };
     case 'tracked-ahead':
-      return { label: branch.ahead > 0 ? `Ahead ${branch.ahead}` : 'Ahead', tone: 'warning' };
+      return { label: branch.ahead > 0 ? tt('repo.branch.badge.aheadCount', { count: branch.ahead }) : tt('repo.branch.badge.ahead'), tone: 'warning' };
     case 'tracked-behind':
-      return { label: branch.behind > 0 ? `Behind ${branch.behind}` : 'Behind', tone: 'warning' };
+      return { label: branch.behind > 0 ? tt('repo.branch.badge.behindCount', { count: branch.behind }) : tt('repo.branch.badge.behind'), tone: 'warning' };
     case 'tracked-diverged':
       return {
         label: branch.ahead > 0 || branch.behind > 0
-          ? `Diverged ${branch.ahead}/${branch.behind}`
-          : 'Diverged',
+          ? tt('repo.branch.badge.divergedCount', { ahead: branch.ahead, behind: branch.behind })
+          : tt('repo.branch.badge.diverged'),
         tone: 'danger',
       };
     case 'tracked-gone':
-      return { label: 'Upstream gone', tone: 'danger' };
+      return { label: tt('repo.branch.badge.upstreamGone'), tone: 'danger' };
     case 'remote-only':
-      return { label: branch.remoteName ?? 'Remote', tone: 'neutral' };
+      return { label: branch.remoteName ?? tt('repo.branch.remote'), tone: 'neutral' };
     default:
       return null;
   }
@@ -601,23 +605,23 @@ function branchHelperText(
   worktreeLabel: string | null,
 ): string | null {
   if (branch.checkedOutElsewhere) {
-    return worktreeLabel ? `Checked out in ${worktreeLabel}` : 'Checked out in another repo';
+    return worktreeLabel ? tt('repo.branch.checkedOutIn', { repo: worktreeLabel }) : tt('repo.branch.checkedOutElsewhere');
   }
 
   if (branch.kind === 'remote') {
-    return `Create local tracking branch from ${branch.name}.`;
+    return tt('repo.branch.createTrackingFrom', { branch: branch.name });
   }
 
   if (branch.syncStatus === 'tracked-gone' && branch.upstreamName) {
-    return `Upstream ${branch.upstreamName} no longer exists.`;
+    return tt('repo.branch.upstreamGone', { branch: branch.upstreamName });
   }
 
   if (branch.syncStatus === 'remote-untracked') {
-    return 'Matching remote branch exists, but this local branch does not track it yet.';
+    return tt('repo.branch.remoteUntrackedHint');
   }
 
   if (branch.upstreamName && branch.upstreamName !== `origin/${branch.name}`) {
-    return `Tracks ${branch.upstreamName}.`;
+    return tt('repo.branch.tracks', { branch: branch.upstreamName });
   }
 
   return null;
@@ -640,7 +644,7 @@ function buildBranchListItem(branch: BranchInfo): BranchListItem {
   const badges: BranchBadge[] = [];
 
   if (branch.current) {
-    badges.push({ label: 'Current', tone: 'success' });
+    badges.push({ label: tt('common.current'), tone: 'success' });
   }
 
   const statusBadge = branchStatusBadge(branch);
@@ -684,14 +688,14 @@ const branchSections = computed<BranchListSection[]>(() => {
     localItems.length
       ? {
         id: 'local' as const,
-        title: 'Local',
+        title: tt('repo.branch.local'),
         items: localItems,
       }
       : null,
     remoteItems.length
       ? {
-        id: 'remote' as const,
-        title: 'Remote',
+       id: 'remote' as const,
+        title: tt('repo.branch.remote'),
         items: remoteItems,
       }
       : null,
@@ -818,7 +822,7 @@ const allFilesCountLabel = computed(() => {
   return allFilesSearchResultsWithChanges.value.length.toLocaleString();
 });
 const hiddenFilesToggleTitle = computed(() => (
-  showHiddenAllFiles.value ? 'Hide hidden files' : 'Show hidden files'
+  showHiddenAllFiles.value ? tt('repo.files.hideHidden') : tt('repo.files.showHidden')
 ));
 const sortedItemsBySection = computed<Record<SectionId, GitChange[]>>(() => {
   const nextItems: Record<SectionId, GitChange[]> = {
@@ -1095,7 +1099,7 @@ function buildAllFilesTreeRows(relativePath = '', depth = 0): AllFilesTreeRow[] 
           name: '',
           path: `${entry.path}::empty`,
           depth: depth + 1,
-          message: 'Empty directory',
+          message: tt('repo.files.emptyDirectory'),
         });
         return;
       }
@@ -1243,7 +1247,7 @@ async function ensureDirectoryLoaded(relativePath = '') {
 
     allFilesDirectoryErrors.value = {
       ...allFilesDirectoryErrors.value,
-      [normalizedPath]: error instanceof Error ? error.message : 'Failed to load directory.',
+      [normalizedPath]: error instanceof Error ? error.message : tt('repo.files.loadDirectoryFailed'),
     };
   } finally {
     if (props.repoPath === expectedRepoPath) {
@@ -1558,7 +1562,7 @@ async function runAllFilesSearch(query: string) {
     }
 
     allFilesSearchResults.value = [];
-    allFilesSearchError.value = error instanceof Error ? error.message : 'Failed to search files.';
+    allFilesSearchError.value = error instanceof Error ? error.message : tt('repo.files.searchFailed');
   } finally {
     if (props.repoPath === expectedRepoPath && requestToken === allFilesSearchToken) {
       isSearchingAllFiles.value = false;
@@ -1736,22 +1740,22 @@ function workspaceCountsTitle(workspace: WorkspaceOverviewItem) {
     && workspace.untrackedCount === null
     && workspace.conflictedCount === null
   ) {
-    return 'Repository state not loaded yet';
+    return tt('repo.workspaces.stateNotLoaded');
   }
 
-  return `Changed ${changedCount}, untracked ${untrackedCount}, conflicted ${conflictedCount}`;
+  return tt('repo.workspaces.countsTitle', { changed: changedCount, untracked: untrackedCount, conflicted: conflictedCount });
 }
 
 function workspacePanelsTitle(workspace: WorkspaceOverviewItem) {
   return [
     props.workspaceIndicatorVisibility.repo
-      ? `Repository ${workspaceHasRepoChanges(workspace) ? 'changed' : 'idle'}`
+      ? tt(workspaceHasRepoChanges(workspace) ? 'repo.workspaces.repositoryChanged' : 'repo.workspaces.repositoryIdle')
       : null,
     props.workspaceIndicatorVisibility.activity
-      ? `Panel activity ${workspace.hasPanelActivity ? 'present' : 'idle'}`
+      ? tt(workspace.hasPanelActivity ? 'repo.workspaces.activityPresent' : 'repo.workspaces.activityIdle')
       : null,
     props.workspaceIndicatorVisibility.attention
-      ? `Panel attention ${workspace.hasPanelAttention ? 'present' : 'idle'}`
+      ? tt(workspace.hasPanelAttention ? 'repo.workspaces.attentionPresent' : 'repo.workspaces.attentionIdle')
       : null,
   ].filter(Boolean).join(', ');
 }
@@ -2456,7 +2460,7 @@ async function handleCopyRepoPath() {
 
   await writeClipboardText(buildAbsoluteRepoPath(props.repoPath, fileMenu.value.path));
   closeFileMenu();
-  showCopyToast(fileMenu.value.kind === 'directory' ? 'Directory path copied' : 'File path copied');
+  showCopyToast(fileMenu.value.kind === 'directory' ? tt('repo.toast.directoryPathCopied') : tt('repo.toast.filePathCopied'));
 }
 
 async function handleCopyProjectPath() {
@@ -2466,17 +2470,17 @@ async function handleCopyProjectPath() {
 
   await writeClipboardText(normalizePathSeparators(fileMenu.value.path));
   closeFileMenu();
-  showCopyToast(fileMenu.value.kind === 'directory' ? 'Project directory path copied' : 'Project file path copied');
+  showCopyToast(fileMenu.value.kind === 'directory' ? tt('repo.toast.projectDirectoryPathCopied') : tt('repo.toast.projectFilePathCopied'));
 }
 
 function fileDiscardTitle() {
   if (!fileMenu.value?.change) {
-    return 'Discard file changes?';
+    return tt('repo.discard.title');
   }
 
   return fileMenu.value.change.type === 'untracked'
-    ? `Delete untracked file ${fileName(fileMenu.value.change.path)}?`
-    : `Discard changes in ${fileName(fileMenu.value.change.path)}?`;
+    ? tt('repo.discard.deleteUntrackedTitle', { file: fileName(fileMenu.value.change.path) })
+    : tt('repo.discard.discardChangesTitle', { file: fileName(fileMenu.value.change.path) });
 }
 
 function fileDiscardCopy() {
@@ -2486,11 +2490,11 @@ function fileDiscardCopy() {
 
   switch (fileMenu.value.change.type) {
     case 'untracked':
-      return 'This will delete the untracked file from disk.';
+      return tt('repo.discard.deleteUntrackedCopy');
     case 'renamed':
-      return 'This will restore the rename back to the last committed state and drop staged or unstaged changes for this file.';
+      return tt('repo.discard.renamedCopy');
     default:
-      return 'This will restore the file to the last committed state and drop staged or unstaged changes for this file.';
+      return tt('repo.discard.defaultCopy');
   }
 }
 
@@ -2674,7 +2678,7 @@ async function handleCopyWorkspaceBranchName() {
 
   await writeClipboardText(branchName);
   closeWorkspaceMenu();
-  showCopyToast('Branch name copied');
+  showCopyToast(tt('repo.toast.branchNameCopied'));
 }
 
 function handleWorkspaceRemoveStart() {
@@ -3089,16 +3093,16 @@ function sectionCollapsedCopy(section: RepoSectionViewModel) {
   const visibleCount = section.filteredItems.length;
 
   if (hasFilesFilter.value) {
-    return `${visibleCount.toLocaleString()} matching ${visibleCount === 1 ? 'file' : 'files'} hidden`;
+    return tt('repo.files.matchingHidden', { count: visibleCount.toLocaleString(), noun: visibleCount === 1 ? tt('repo.files.file') : tt('repo.files.files') });
   }
 
-  return `${section.items.length.toLocaleString()} hidden ${section.items.length === 1 ? 'file' : 'files'}`;
+  return tt('repo.files.hiddenCount', { count: section.items.length.toLocaleString(), noun: section.items.length === 1 ? tt('repo.files.file') : tt('repo.files.files') });
 }
 
 function noVisibleChangedFilesCopy() {
   return hasFilesFilter.value
-    ? 'No changed files match the current filter.'
-    : 'Working tree is clean.';
+    ? tt('repo.files.noChangedMatch')
+    : tt('repo.files.clean');
 }
 
 watch(
@@ -3456,8 +3460,8 @@ onBeforeUnmount(() => {
             class="repo-panel__project-settings"
             :class="props.hasUnreadInfo ? 'repo-panel__project-settings--info-unread' : 'repo-panel__project-settings--info-read'"
             type="button"
-            aria-label="Open message center"
-            title="Message Center"
+            :aria-label="tt('repo.openMessageCenter')"
+            :title="tt('repo.messageCenter')"
             @click="emit('open-info')"
           >
             <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -3468,8 +3472,8 @@ onBeforeUnmount(() => {
           <button
             class="repo-panel__project-settings"
             type="button"
-            aria-label="Open project settings"
-            :title="`Project settings ${SHORTCUTS.settingsOpen.display}`"
+            :aria-label="tt('repo.openProjectSettings')"
+            :title="tt('repo.projectSettingsTitle', { shortcut: SHORTCUTS.settingsOpen.display })"
             @click="emit('open-settings')"
           >
             <span aria-hidden="true">⚙</span>
@@ -3480,7 +3484,7 @@ onBeforeUnmount(() => {
             type="button"
             :disabled="!canCollapse"
             :title="collapseButtonTitle"
-            aria-label="Collapse repository panel"
+            :aria-label="tt('repo.collapseAria')"
             @click="emit('toggle-collapse')"
           >
             <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -3495,15 +3499,15 @@ onBeforeUnmount(() => {
     <section v-if="hasWorkspaceItems" class="repo-panel__workspaces">
       <div class="repo-panel__workspaces-header">
         <div class="repo-panel__workspaces-heading">
-          <span class="repo-panel__label">Workspaces</span>
+          <span class="repo-panel__label">{{ tt('repo.workspaces.label') }}</span>
         </div>
 
         <div class="repo-panel__workspaces-actions">
           <button
             class="repo-panel__mini-action repo-panel__mini-action--icon"
             type="button"
-            aria-label="Open Docker dialog"
-            :title="`Open Docker ${SHORTCUTS.dockerDialogOpen.display}`"
+            :aria-label="tt('repo.openDocker')"
+            :title="tt('repo.openDockerTitle', { shortcut: SHORTCUTS.dockerDialogOpen.display })"
             @click="emit('open-docker')"
           >
             <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -3516,8 +3520,8 @@ onBeforeUnmount(() => {
           <button
             class="repo-panel__mini-action repo-panel__mini-action--icon"
             type="button"
-            aria-label="Open repository"
-            title="Open repository"
+            :aria-label="tt('repo.openRepository')"
+            :title="tt('repo.openRepository')"
             @click="emit('open-repo')"
           >
             <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -3530,8 +3534,8 @@ onBeforeUnmount(() => {
             class="repo-panel__mini-action repo-panel__mini-action--icon"
             :class="{ 'repo-panel__mini-action--active': isWorkspaceFilterActive || isWorkspacePinSelectionActive }"
             type="button"
-            :aria-label="isWorkspaceFilterActive || isWorkspacePinSelectionActive ? 'Show all workspaces' : 'Show only current repo family'"
-            :title="isWorkspaceFilterActive || isWorkspacePinSelectionActive ? 'Show all workspaces' : 'Show only current repo family'"
+            :aria-label="isWorkspaceFilterActive || isWorkspacePinSelectionActive ? tt('repo.workspaces.showAll') : tt('repo.workspaces.showCurrentFamily')"
+            :title="isWorkspaceFilterActive || isWorkspacePinSelectionActive ? tt('repo.workspaces.showAll') : tt('repo.workspaces.showCurrentFamily')"
             @click="handleWorkspaceFamilyFocusToggle"
           >
             <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -3544,7 +3548,7 @@ onBeforeUnmount(() => {
       <div v-if="shouldShowWorkspaceFamilySwitcher" class="repo-panel__workspace-family-switcher">
         <div class="repo-panel__workspace-family-summary">
           <span class="repo-panel__workspace-family-name">{{ workspaceFilterSummaryName }}</span>
-          <span class="repo-panel__workspace-family-count">{{ workspaceFilterSummaryCount }} repos</span>
+          <span class="repo-panel__workspace-family-count">{{ tt('repo.workspaces.repoCount', { count: workspaceFilterSummaryCount }) }}</span>
         </div>
       </div>
 
@@ -3612,7 +3616,7 @@ onBeforeUnmount(() => {
                 class="repo-panel__commit-box repo-panel__commit-box--ready repo-panel__worktree-callout"
               >
                 <div class="repo-panel__worktree-copy">
-                  <span class="repo-panel__label">New worktree detected</span>
+                  <span class="repo-panel__label">{{ tt('repo.worktree.detected') }}</span>
                   <strong class="repo-panel__worktree-branch">
                     {{ detectedWorktreeLabel(detectedWorktree) }}
                   </strong>
@@ -3627,14 +3631,14 @@ onBeforeUnmount(() => {
                     type="button"
                     @click="emit('add-detected-worktree', detectedWorktree.path)"
                   >
-                    Add as repo
+                    {{ tt('repo.worktree.addAsRepo') }}
                   </button>
                   <button
                     class="repo-panel__worktree-dismiss"
                     type="button"
                     @click="emit('dismiss-detected-worktree', detectedWorktree.path)"
                   >
-                    Dismiss
+                    {{ tt('repo.worktree.dismiss') }}
                   </button>
                 </div>
               </section>
@@ -3644,12 +3648,12 @@ onBeforeUnmount(() => {
                 class="repo-panel__commit-box repo-panel__worktree-callout"
               >
                 <div class="repo-panel__worktree-copy">
-                  <span class="repo-panel__label">Git not initialized</span>
+                  <span class="repo-panel__label">{{ tt('repo.gitNotInitialized.label') }}</span>
                   <strong class="repo-panel__worktree-branch">
-                    This folder is not a Git repository
+                    {{ tt('repo.gitNotInitialized.title') }}
                   </strong>
                   <span class="repo-panel__worktree-path">
-                    All files works normally. Initialize Git to enable branches, status and commit flow.
+                    {{ tt('repo.gitNotInitialized.copy') }}
                   </span>
                 </div>
 
@@ -3660,7 +3664,7 @@ onBeforeUnmount(() => {
                     :disabled="props.isLoading"
                     @click="emit('init-git')"
                   >
-                    Initialize Git repository
+                    {{ tt('repo.gitNotInitialized.action') }}
                   </button>
                 </div>
               </section>
@@ -3676,9 +3680,9 @@ onBeforeUnmount(() => {
                         type="button"
                         :disabled="!gitActionsEnabled"
                         :title="props.isGitRepository
-                          ? `Switch branch (${currentBranchLabel})`
-                          : 'Initialize Git repository to enable branches'"
-                        aria-label="Switch branch"
+                          ? tt('repo.branch.switchTitle', { branch: currentBranchLabel })
+                          : tt('repo.branch.initToEnable')"
+                        :aria-label="tt('repo.branch.switch')"
                         :aria-expanded="isBranchMenuOpen"
                         aria-haspopup="dialog"
                         @click="toggleBranchMenu"
@@ -3703,8 +3707,8 @@ onBeforeUnmount(() => {
                           :class="{ 'repo-panel__action--active': shouldHighlightPull }"
                           type="button"
                           :disabled="!gitActionsEnabled || !canPull || !shouldHighlightPull"
-                          :title="props.isGitRepository ? pullTitle : 'Initialize Git repository to enable pull'"
-                          :aria-label="props.isGitRepository ? pullTitle : 'Pull unavailable until Git is initialized'"
+                          :title="props.isGitRepository ? pullTitle : tt('repo.pull.initToEnable')"
+                          :aria-label="props.isGitRepository ? pullTitle : tt('repo.pull.unavailableNotInitialized')"
                           @click="emit('pull')"
                         >
                           <span
@@ -3747,11 +3751,11 @@ onBeforeUnmount(() => {
                           type="button"
                           :disabled="!gitActionsEnabled"
                           :title="historyCount
-                            ? `Commit history (${historyCount.toLocaleString()}) ${SHORTCUTS.historyOpen.display}`
+                            ? tt('repo.history.withCountTitle', { count: historyCount.toLocaleString(), shortcut: SHORTCUTS.historyOpen.display })
                             : (props.isGitRepository
-                              ? `Commit history ${SHORTCUTS.historyOpen.display}`
-                              : 'Initialize Git repository to enable history')"
-                          aria-label="Toggle commit history"
+                              ? tt('repo.history.title', { shortcut: SHORTCUTS.historyOpen.display })
+                              : tt('repo.history.initToEnable'))"
+                          :aria-label="tt('repo.history.toggle')"
                           @click="emit('toggle-history')"
                         >
                           <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -3765,8 +3769,8 @@ onBeforeUnmount(() => {
                           class="repo-panel__action"
                           type="button"
                           :disabled="isLoading"
-                          title="Refresh repository status"
-                          aria-label="Refresh repository status"
+                          :title="tt('repo.refresh')"
+                          :aria-label="tt('repo.refresh')"
                           @click="emit('refresh')"
                         >
                           <span
@@ -3791,7 +3795,7 @@ onBeforeUnmount(() => {
                   v-if="props.isGitRepository && isBranchMenuOpen"
                   class="repo-panel__branch-menu"
                   role="dialog"
-                  aria-label="Branches"
+                  :aria-label="tt('repo.branch.branches')"
                 >
                   <div class="repo-panel__branch-search-row">
                     <input
@@ -3841,7 +3845,7 @@ onBeforeUnmount(() => {
                       :disabled="isLoading"
                       @click="handleCreateBranch('current-repo')"
                     >
-                      Create Here
+                      {{ tt('repo.branch.createHere') }}
                     </button>
                     <button
                       class="repo-panel__branch-create-action repo-panel__branch-create-action--primary"
@@ -3849,7 +3853,7 @@ onBeforeUnmount(() => {
                       :disabled="isLoading"
                       @click="handleCreateBranch('new-repo')"
                     >
-                      New Repo
+                      {{ tt('repo.branch.newRepo') }}
                     </button>
                   </div>
 
@@ -3922,7 +3926,7 @@ onBeforeUnmount(() => {
                   </div>
 
                   <div v-else-if="!isBranchCreateMode" class="repo-panel__branch-empty">
-                    No branches match the current filter.
+                    {{ tt('repo.branch.empty') }}
                   </div>
                 </section>
               </div>
@@ -3932,6 +3936,7 @@ onBeforeUnmount(() => {
               >
                 <CopyableErrorNotice
                   class="repo-panel__error"
+                  :app-language="appLanguage"
                   :message="visibleError"
                   :detail="visibleErrorTitle"
                 />
@@ -3955,7 +3960,7 @@ onBeforeUnmount(() => {
                     @click="toggleFilesSection"
                   >
                     <span class="repo-panel__files-toggle-main">
-                      <span class="repo-panel__label">Files</span>
+                        <span class="repo-panel__label">{{ tt('repo.files.label') }}</span>
                     </span>
                     <span class="repo-panel__files-toggle-meta">
                       <span
@@ -3977,14 +3982,14 @@ onBeforeUnmount(() => {
                     </span>
                   </button>
                   <div v-if="isFilesExpanded" class="repo-panel__files-toolbar-actions">
-                    <div class="repo-panel__view-toggle" role="group" aria-label="File list view mode">
+                    <div class="repo-panel__view-toggle" role="group" :aria-label="tt('repo.files.viewMode')">
                       <button
                         class="repo-panel__view-button"
                         :class="{ 'repo-panel__view-button--active': fileListMode === 'list' }"
                         type="button"
                         @click="fileListMode = 'list'"
                       >
-                        List
+                        {{ tt('repo.files.list') }}
                       </button>
                       <button
                         class="repo-panel__view-button"
@@ -3992,7 +3997,7 @@ onBeforeUnmount(() => {
                         type="button"
                         @click="fileListMode = 'tree'"
                       >
-                        Tree
+                        {{ tt('repo.files.tree') }}
                       </button>
                     </div>
                     <button
@@ -4049,7 +4054,7 @@ onBeforeUnmount(() => {
                     >
                       <span class="repo-panel__group-title">
                         <span class="repo-panel__group-dot repo-panel__group-dot--all" />
-                        All files
+                        {{ tt('repo.files.allFiles') }}
                       </span>
                       <span class="repo-panel__group-chevron" aria-hidden="true">
                         {{ isAllFilesExpanded ? '▾' : '▸' }}
@@ -4075,8 +4080,8 @@ onBeforeUnmount(() => {
                         v-if="!isAllFilesSearchMode && !shouldLoadAllFiles"
                         class="repo-panel__mini-action repo-panel__mini-action--icon"
                         type="button"
-                        aria-label="Load files"
-                        title="Load files"
+                        :aria-label="tt('repo.files.load')"
+                        :title="tt('repo.files.load')"
                         @click.stop="requestAllFilesLoad"
                       >
                         <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -4088,8 +4093,8 @@ onBeforeUnmount(() => {
                       <span
                         v-if="(isAllFilesSearchMode && isSearchingAllFiles) || (!isAllFilesSearchMode && allFilesDirectoryLoading[''])"
                         class="repo-panel__group-loader"
-                        aria-label="Loading file tree"
-                        title="Loading file tree"
+                        :aria-label="tt('repo.files.loadingTree')"
+                        :title="tt('repo.files.loadingTree')"
                       />
                       <span v-if="allFilesCountLabel" class="repo-panel__group-count">{{ allFilesCountLabel }}</span>
                     </div>
@@ -4098,12 +4103,13 @@ onBeforeUnmount(() => {
                   <div v-if="!isAllFilesExpanded" />
 
                   <div v-else-if="shouldShowAllFilesSearchHint" class="repo-panel__clean">
-                    Type at least 2 characters to search files.
+                    {{ tt('repo.files.searchHint') }}
                   </div>
 
                   <CopyableErrorNotice
                     v-else-if="visibleAllFilesSearchError"
                     class="repo-panel__error"
+                    :app-language="appLanguage"
                     :message="visibleAllFilesSearchError"
                   />
 
@@ -4111,14 +4117,14 @@ onBeforeUnmount(() => {
                     v-else-if="isAllFilesSearchMode && isSearchingAllFiles && allFilesSearchResults === null"
                     class="repo-panel__group-collapsed-copy"
                   >
-                    Searching files…
+                    {{ tt('repo.files.searching') }}
                   </p>
 
                   <p
                     v-else-if="!isAllFilesSearchMode && allFilesDirectoryLoading[''] && !hasAllFilesDirectoryLoaded('')"
                     class="repo-panel__group-collapsed-copy"
                   >
-                    Loading file tree…
+                    {{ tt('repo.files.loadingTreeEllipsis') }}
                   </p>
 
                   <div v-else-if="!shouldLoadAllFiles" />
@@ -4175,6 +4181,7 @@ onBeforeUnmount(() => {
                   <CopyableErrorNotice
                     v-else-if="allFilesRootError"
                     class="repo-panel__error"
+                    :app-language="appLanguage"
                     :message="allFilesRootError"
                   />
 
@@ -4203,8 +4210,8 @@ onBeforeUnmount(() => {
                         <span
                           v-if="row.isLoading"
                           class="repo-panel__group-loader"
-                          aria-label="Loading directory"
-                          title="Loading directory"
+                          :aria-label="tt('repo.files.loadingDirectory')"
+                          :title="tt('repo.files.loadingDirectory')"
                         />
                         <span
                           v-else-if="row.item"
@@ -4259,21 +4266,21 @@ onBeforeUnmount(() => {
                   </ul>
 
                   <div v-else-if="isAllFilesSearchMode" class="repo-panel__clean">
-                    No files match the current filter.
+                    {{ tt('repo.files.noMatch') }}
                   </div>
 
                   <div v-else class="repo-panel__clean">
-                    No files found.
+                    {{ tt('repo.files.noneFound') }}
                   </div>
                 </section>
 
                 <template v-if="!areFileDetailsLoaded">
                   <div v-if="isNonGitRepository" class="repo-panel__clean">
-                    Change tracking requires a Git repository.
+                    {{ tt('repo.files.trackingRequiresGit') }}
                   </div>
 
                   <div v-else class="repo-panel__clean">
-                    Opened files view is loading repository details…
+                    {{ tt('repo.files.loadingDetails') }}
                   </div>
                 </template>
 
@@ -4311,7 +4318,7 @@ onBeforeUnmount(() => {
                           :disabled="isLoading || !section.filteredItems.length"
                           @click="triggerAction(section.action, getSectionActionPaths(section.filteredItems))"
                         >
-                          {{ section.action === 'stage' ? 'Stage all' : 'Unstage all' }}
+                          {{ section.action === 'stage' ? tt('repo.files.stageAll') : tt('repo.files.unstageAll') }}
                         </button>
                       </div>
                     </header>
@@ -4322,9 +4329,9 @@ onBeforeUnmount(() => {
                       :class="{ 'repo-panel__commit-box--ready': canCommit }"
                     >
                       <div class="repo-panel__commit-box-header">
-                        <span class="repo-panel__commit-label">Commit</span>
+                        <span class="repo-panel__commit-label">{{ tt('repo.commit.label') }}</span>
                         <span class="repo-panel__commit-hint">
-                          {{ section.items.length.toLocaleString() }} staged
+                          {{ tt('repo.commit.stagedCount', { count: section.items.length.toLocaleString() }) }}
                         </span>
                       </div>
 
@@ -4336,7 +4343,7 @@ onBeforeUnmount(() => {
                           type="text"
                           :disabled="isLoading"
                           :value="commitMessage"
-                          placeholder="feat(scope): short commit message"
+                          :placeholder="tt('repo.commit.placeholder')"
                           @input="handleCommitMessageUpdate"
                           @keydown.enter.prevent="handleCommitSubmit"
                         />
@@ -4346,8 +4353,8 @@ onBeforeUnmount(() => {
                           :class="{ 'repo-panel__commit--active': canCommit }"
                           type="button"
                           :disabled="!canCommit"
-                          title="Commit staged changes"
-                          aria-label="Commit staged changes"
+                          :title="tt('repo.commit.action')"
+                          :aria-label="tt('repo.commit.action')"
                           @click="handleCommitSubmit"
                         >
                           <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -4434,13 +4441,13 @@ onBeforeUnmount(() => {
     </section>
 
     <div v-if="!hasWorkspaceItems && !repoPath" class="repo-panel__empty">
-      <span class="repo-panel__eyebrow">Source Control</span>
-      <h2 class="repo-panel__title">Choose a repository</h2>
+      <span class="repo-panel__eyebrow">{{ tt('repo.empty.eyebrow') }}</span>
+      <h2 class="repo-panel__title">{{ tt('repo.empty.title') }}</h2>
       <p class="repo-panel__empty-copy">
-        Open any local Git repository to populate branches, changed files, and commit actions.
+        {{ tt('repo.empty.copy') }}
       </p>
       <button class="repo-panel__commit" type="button" @click="emit('open-repo')">
-        Open Repo
+        {{ tt('repo.empty.openRepo') }}
       </button>
     </div>
 
@@ -4449,7 +4456,7 @@ onBeforeUnmount(() => {
       class="repo-panel__file-menu"
       :style="{ left: `${fileMenu.x}px`, top: `${fileMenu.y}px` }"
       role="menu"
-      aria-label="File actions"
+      :aria-label="tt('repo.menu.fileActions')"
     >
       <template v-if="fileMenuMode === 'actions'">
         <button
@@ -4459,7 +4466,7 @@ onBeforeUnmount(() => {
           role="menuitem"
           @click="handleShowFileDiff"
         >
-          Show diff
+          {{ tt('repo.menu.showDiff') }}
         </button>
         <button
           v-if="fileMenu.canOpenFile"
@@ -4468,7 +4475,7 @@ onBeforeUnmount(() => {
           role="menuitem"
           @click="handleOpenWorkspaceFile"
         >
-          Open file
+          {{ tt('repo.menu.openFile') }}
         </button>
         <button
           class="repo-panel__file-menu-item"
@@ -4476,7 +4483,7 @@ onBeforeUnmount(() => {
           role="menuitem"
           @click="handleCopyRepoPath"
         >
-          Copy path
+          {{ tt('repo.menu.copyPath') }}
         </button>
         <button
           class="repo-panel__file-menu-item"
@@ -4484,7 +4491,7 @@ onBeforeUnmount(() => {
           role="menuitem"
           @click="handleCopyProjectPath"
         >
-          Copy project path
+          {{ tt('repo.menu.copyProjectPath') }}
         </button>
         <button
           v-if="fileMenu.canDiscard"
@@ -4493,7 +4500,7 @@ onBeforeUnmount(() => {
           role="menuitem"
           @click="handleFileDiscardStart"
         >
-          Discard file changes
+          {{ tt('repo.menu.discardFileChanges') }}
         </button>
       </template>
 
@@ -4510,14 +4517,14 @@ onBeforeUnmount(() => {
             type="button"
             @click="handleFileDiscard"
           >
-            Discard
+            {{ tt('repo.menu.discard') }}
           </button>
           <button
             class="repo-panel__file-menu-item"
             type="button"
             @click="closeFileMenu"
           >
-            Cancel
+            {{ tt('common.cancel') }}
           </button>
         </div>
       </div>
@@ -4534,7 +4541,7 @@ onBeforeUnmount(() => {
       class="repo-panel__workspace-menu"
       :style="{ left: `${workspaceMenu.x}px`, top: `${workspaceMenu.y}px` }"
       role="menu"
-      aria-label="Workspace actions"
+      :aria-label="tt('repo.menu.workspaceActions')"
     >
       <template v-if="workspaceMenuMode === 'actions'">
         <button
@@ -4543,7 +4550,7 @@ onBeforeUnmount(() => {
           role="menuitem"
           @click="handleWorkspaceRenameStart"
         >
-          Rename
+          {{ tt('repo.menu.rename') }}
         </button>
         <button
           class="repo-panel__file-menu-item"
@@ -4551,7 +4558,7 @@ onBeforeUnmount(() => {
           role="menuitem"
           @click="handleWorkspaceRepoChange"
         >
-          Change repository folder…
+          {{ tt('repo.menu.changeRepositoryFolder') }}
         </button>
         <button
           v-if="workspaceMenu.branch"
@@ -4560,7 +4567,7 @@ onBeforeUnmount(() => {
           role="menuitem"
           @click="handleCopyWorkspaceBranchName"
         >
-          Copy branch name
+          {{ tt('repo.menu.copyBranchName') }}
         </button>
         <div
           v-if="workspaceMenu.worktreeRole === 'linked'"
@@ -4574,7 +4581,7 @@ onBeforeUnmount(() => {
           role="menuitem"
           @click="handleWorkspaceWorktreeMerge"
         >
-          Merge into primary branch
+          {{ tt('repo.menu.mergeIntoPrimary') }}
         </button>
         <button
           v-if="workspaceMenu.worktreeRole === 'linked'"
@@ -4583,7 +4590,7 @@ onBeforeUnmount(() => {
           role="menuitem"
           @click="handleWorkspaceWorktreeRemoveStart"
         >
-          Remove worktree
+          {{ tt('repo.menu.removeWorktree') }}
         </button>
         <button
           v-if="workspaceMenu.worktreeRole === 'linked'"
@@ -4592,7 +4599,7 @@ onBeforeUnmount(() => {
           role="menuitem"
           @click="handleWorkspaceWorktreeRemoveAndDeleteBranchStart"
         >
-          Remove worktree and delete branch
+          {{ tt('repo.menu.removeWorktreeDeleteBranch') }}
         </button>
         <div class="repo-panel__menu-divider" aria-hidden="true" />
         <button
@@ -4601,7 +4608,7 @@ onBeforeUnmount(() => {
           role="menuitem"
           @click="handleWorkspaceRemoveStart"
         >
-          Remove from list
+          {{ tt('repo.menu.removeFromList') }}
         </button>
       </template>
 
@@ -4611,7 +4618,7 @@ onBeforeUnmount(() => {
         @submit.prevent="handleWorkspaceRenameSubmit"
       >
         <label class="repo-panel__workspace-rename-label" for="workspace-rename-input">
-          Workspace title
+          {{ tt('repo.menu.workspaceTitle') }}
         </label>
         <input
           id="workspace-rename-input"
@@ -4627,14 +4634,14 @@ onBeforeUnmount(() => {
             class="repo-panel__file-menu-item"
             type="submit"
           >
-            Save
+            {{ tt('common.save') }}
           </button>
           <button
             class="repo-panel__file-menu-item"
             type="button"
             @click="closeWorkspaceMenu"
           >
-            Cancel
+            {{ tt('common.cancel') }}
           </button>
         </div>
       </form>
@@ -4642,10 +4649,10 @@ onBeforeUnmount(() => {
       <div v-else class="repo-panel__workspace-remove-confirm">
         <template v-if="workspaceMenuMode === 'worktree-remove-confirm'">
           <p class="repo-panel__workspace-remove-copy">
-            Remove worktree <strong>{{ workspaceMenu.title }}</strong>?
+            {{ tt('repo.menu.confirmRemoveWorktree', { title: workspaceMenu.title }) }}
           </p>
           <p class="repo-panel__workspace-remove-note">
-            Removes the linked checkout folder from disk and this repo from the sidebar.
+            {{ tt('repo.menu.confirmRemoveWorktreeCopy') }}
           </p>
           <div class="repo-panel__workspace-rename-actions">
             <button
@@ -4653,23 +4660,23 @@ onBeforeUnmount(() => {
               type="button"
               @click="handleWorkspaceWorktreeRemove"
             >
-              Remove worktree
+              {{ tt('repo.menu.removeWorktree') }}
             </button>
             <button
               class="repo-panel__file-menu-item"
               type="button"
               @click="closeWorkspaceMenu"
             >
-              Cancel
+              {{ tt('common.cancel') }}
             </button>
           </div>
         </template>
         <template v-else-if="workspaceMenuMode === 'worktree-remove-delete-confirm'">
           <p class="repo-panel__workspace-remove-copy">
-            Remove worktree <strong>{{ workspaceMenu.title }}</strong> and delete branch <strong>{{ workspaceMenu.branch ?? 'unknown' }}</strong>?
+            {{ tt('repo.menu.confirmRemoveWorktreeDeleteBranch', { title: workspaceMenu.title, branch: workspaceMenu.branch ?? tt('repo.unknown') }) }}
           </p>
           <p class="repo-panel__workspace-remove-note">
-            Safe only. The primary repo must already be on its primary branch, and this branch must already be merged.
+            {{ tt('repo.menu.confirmRemoveWorktreeDeleteBranchCopy') }}
           </p>
           <div class="repo-panel__workspace-rename-actions">
             <button
@@ -4677,23 +4684,23 @@ onBeforeUnmount(() => {
               type="button"
               @click="handleWorkspaceWorktreeRemoveAndDeleteBranch"
             >
-              Remove and delete branch
+              {{ tt('repo.menu.removeAndDeleteBranch') }}
             </button>
             <button
               class="repo-panel__file-menu-item"
               type="button"
               @click="closeWorkspaceMenu"
             >
-              Cancel
+              {{ tt('common.cancel') }}
             </button>
           </div>
         </template>
         <template v-else>
         <p class="repo-panel__workspace-remove-copy">
-          Remove <strong>{{ workspaceMenu.title }}</strong> from the workspace list?
+          {{ tt('repo.menu.confirmRemoveWorkspace', { title: workspaceMenu.title }) }}
         </p>
         <p class="repo-panel__workspace-remove-note">
-          The repository on disk stays untouched. Local tabs and layout for this workspace will be forgotten.
+          {{ tt('repo.menu.confirmRemoveWorkspaceCopy') }}
         </p>
         <div class="repo-panel__workspace-rename-actions">
           <button
@@ -4701,14 +4708,14 @@ onBeforeUnmount(() => {
             type="button"
             @click="handleWorkspaceRemove"
           >
-            Remove
+            {{ tt('repo.menu.remove') }}
           </button>
           <button
             class="repo-panel__file-menu-item"
             type="button"
             @click="closeWorkspaceMenu"
           >
-            Cancel
+            {{ tt('common.cancel') }}
           </button>
         </div>
         </template>
@@ -4720,7 +4727,7 @@ onBeforeUnmount(() => {
       class="repo-panel__file-menu repo-panel__branch-item-menu"
       :style="{ left: `${branchItemMenu.x}px`, top: `${branchItemMenu.y}px` }"
       role="menu"
-      aria-label="Branch actions"
+      :aria-label="tt('repo.menu.branchActions')"
     >
       <template v-if="branchItemMenuMode === 'actions'">
         <button
@@ -4729,16 +4736,16 @@ onBeforeUnmount(() => {
           role="menuitem"
           @click="handleBranchDeleteStart"
         >
-          Delete branch
+          {{ tt('repo.menu.deleteBranch') }}
         </button>
       </template>
 
       <div v-else class="repo-panel__workspace-remove-confirm">
         <p class="repo-panel__workspace-remove-copy">
-          Delete branch <strong>{{ branchItemMenu.branch.name }}</strong>?
+          {{ tt('repo.menu.confirmDeleteBranch', { branch: branchItemMenu.branch.name }) }}
         </p>
         <p class="repo-panel__workspace-remove-note">
-          Deletes only the local branch. Git will refuse if it is not safely merged yet.
+          {{ tt('repo.menu.confirmDeleteBranchCopy') }}
         </p>
         <div class="repo-panel__workspace-rename-actions">
           <button
@@ -4746,14 +4753,14 @@ onBeforeUnmount(() => {
             type="button"
             @click="handleBranchDelete"
           >
-            Delete branch
+            {{ tt('repo.menu.deleteBranch') }}
           </button>
           <button
             class="repo-panel__file-menu-item"
             type="button"
             @click="closeBranchItemMenu"
           >
-            Cancel
+            {{ tt('common.cancel') }}
           </button>
         </div>
       </div>

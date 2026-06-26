@@ -1,9 +1,11 @@
 <script setup lang="ts">
 import { computed, nextTick, ref, watch } from 'vue';
-import type { GitCommitRef, GitLogEntry } from '../../shared/bridgegit';
+import type { AppLanguage, GitCommitRef, GitLogEntry } from '../../shared/bridgegit';
+import { t } from '../i18n';
 import { SHORTCUTS, shortcutBindingsRevision } from '../shortcuts';
 
 interface Props {
+  appLanguage: AppLanguage;
   commits: GitLogEntry[];
   selectedHash: string | null;
   matchedHashes?: string[];
@@ -43,6 +45,7 @@ interface GraphRow {
 }
 
 const props = defineProps<Props>();
+const tt = (key: string, params?: Record<string, string | number>) => t(props.appLanguage, key, params);
 
 const emit = defineEmits<{
   select: [hash: string];
@@ -265,13 +268,13 @@ function refKindLabel(ref: GitCommitRef): string {
     case 'head':
       return 'HEAD';
     case 'local-branch':
-      return ref.current ? 'Current branch' : 'Local branch';
+      return ref.current ? tt('history.graph.currentBranch') : tt('history.graph.localBranch');
     case 'remote-branch':
-      return 'Remote branch';
+      return tt('history.graph.remoteBranch');
     case 'tag':
-      return 'Tag';
+      return tt('history.graph.tag');
     default:
-      return 'Ref';
+      return tt('history.graph.ref');
   }
 }
 
@@ -458,7 +461,7 @@ watch(
     <header class="git-history__header">
       <div class="git-history__title-row">
         <div class="git-history__title-main">
-          <span class="git-history__label">History</span>
+          <span class="git-history__label">{{ tt('history.graph.title') }}</span>
 
           <div v-if="selectedCommit" class="git-history__selection-inline">
             <span class="git-history__selection-hash">{{ selectedCommit.shortHash }}</span>
@@ -471,10 +474,10 @@ watch(
             v-if="selectedCommit"
             class="git-history__open-diff"
             type="button"
-            :title="`Open selected commit diff ${SHORTCUTS.commitOpenDiff.display}`"
+            :title="tt('history.graph.openSelectedDiffTitle', { shortcut: SHORTCUTS.commitOpenDiff.display })"
             @click="emit('open-diff', selectedCommit.hash)"
           >
-            Open Diff
+            {{ tt('history.openDiff') }}
           </button>
 
           <span class="git-history__count">{{ commits.length.toLocaleString() }}</span>
@@ -489,7 +492,7 @@ watch(
     </header>
 
     <div v-if="!commits.length" class="git-history__empty">
-      No commits yet.
+      {{ tt('history.graph.noCommits') }}
     </div>
 
     <ol ref="listRef" v-else class="git-history__list">

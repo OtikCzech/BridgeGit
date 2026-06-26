@@ -2,19 +2,19 @@
 
 This note is the default place for release updates and small product messages inside BridgeGit.
 
-## New in 0.9.0
+## New in 1.0.0
 
-- switch notes between `Preview` and `Tasks` so markdown checklists become a faster triage and execution flow
-- move tasks through richer states like `in progress`, `waiting`, `done` and `cancelled` directly from preview and task cards
-- copy full task lines or plain task text from the tasks lens without opening the raw markdown first
-- use broader repo-panel context actions in `All files`, including path copy helpers and better hidden-file handling
-- copy the current branch name straight from the workspace menu when you need it in a shell, note or external tool
+- BridgeGit now has full app localization with English as the default language
+- choose the app language first in `Settings -> General`
+- use Czech, Spanish, German, French, Portuguese, Polish, Ukrainian, Chinese, Japanese or Korean UI translations
+- keep the main workspace, repo panel, diff viewer, Docker dialog, commit history, notes, code tabs and terminal labels in the selected language
+- paste from the terminal context menu without the previous duplicate insert edge case
 
-## Also in the 0.9.x line
+## Also in the 1.0.0 release
 
-- Mermaid note previews refresh more reliably during editing instead of leaving stale diagrams behind
-- WSL note links open more cleanly from the integrated terminal
-- editor selection highlighting stays aligned with the active theme for less visual noise across theme switches
+- clipboard behavior can be adjusted from General settings
+- editor and notes selection handling is steadier during copy and paste workflows
+- the bundled release note now follows the app version, so the envelope button highlights this update once after install
 
 ## Quick Start
 

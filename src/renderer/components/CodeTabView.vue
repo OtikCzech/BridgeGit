@@ -29,6 +29,7 @@ import {
   type CodeNavigationRequest,
   type CodeNavigationTarget,
   type GitTextSearchMatch,
+  type AppLanguage,
   normalizeNoteFontSize,
   type ResolvedEditorTheme,
   type ThemeVariant,
@@ -55,10 +56,12 @@ import {
   resolveCodeNavigationResolutionAtOffset,
 } from '../navigation/codeNavigation';
 import { useClipboardHistoryTarget } from '../composables/useClipboardHistoryTarget';
+import { t } from '../i18n';
 import { SHORTCUTS, matchesShortcut, shortcutBindingsRevision } from '../shortcuts';
 
 interface Props {
   active: boolean;
+  appLanguage: AppLanguage;
   busy: boolean;
   content: string;
   externalChange: WorkspaceExternalFileChangeState | null;
@@ -69,11 +72,14 @@ interface Props {
   navigationRequest: CodeNavigationRequest | null;
   editorTheme: ResolvedEditorTheme;
   themeVariant: ThemeVariant;
+  rightClickPasteEnabled: boolean;
+  selectionAutoCopyEnabled: boolean;
   cursor?: WorkspaceEditorCursorState;
 }
 
 const props = defineProps<Props>();
 const shortcutBindingsVersion = shortcutBindingsRevision;
+const tt = (key: string, params?: Record<string, string | number>) => t(props.appLanguage, key, params);
 
 const emit = defineEmits<{
   'dismiss-external-change': [];
@@ -165,35 +171,35 @@ const hasReferencesPanel = computed(() => (
 ));
 const referencesCountLabel = computed(() => {
   const count = referencesMatches.value.length;
-  return `${count} ${count === 1 ? 'match' : 'matches'}`;
+  return tt('code.references.count', { count });
 });
 const externalChangeCopy = computed(() => {
   if (props.externalChange === 'unavailable') {
     return {
-      title: 'File is no longer available on disk.',
+      title: tt('code.external.unavailable.title'),
       body: props.isDirty
-        ? 'Reload is unavailable until the file becomes readable again. Saving now would overwrite your local copy later.'
-        : 'The editor is showing the last loaded version. Reload becomes available once the file is readable again.',
+        ? tt('code.external.unavailable.dirty')
+        : tt('code.external.unavailable.clean'),
       actionLabel: null,
     };
   }
 
   if (props.externalChange === 'session-dirty') {
     return {
-      title: 'This tab restored unsaved session changes.',
-      body: 'The editor content differs from the file currently saved on disk. Reload to discard the restored version, or keep working and save when ready.',
-      actionLabel: 'Refresh from disk',
+      title: tt('code.external.sessionDirty.title'),
+      body: tt('code.external.sessionDirty.body'),
+      actionLabel: tt('code.refreshFromDisk'),
     };
   }
 
   return {
     title: props.isDirty
-      ? 'File changed on disk.'
-      : 'A newer version of this file is available.',
+      ? tt('code.external.changedDirty.title')
+      : tt('code.external.changedClean.title'),
     body: props.isDirty
-      ? 'Reload will replace your current unsaved edits with the version from disk.'
-      : 'Reload this tab to sync it with the latest file content from disk.',
-    actionLabel: 'Refresh from disk',
+      ? tt('code.external.changedDirty.body')
+      : tt('code.external.changedClean.body'),
+    actionLabel: tt('code.refreshFromDisk'),
   };
 });
 
@@ -389,7 +395,7 @@ async function copyFilePathText(text: string, successMessage: string) {
     await writeClipboard(text);
     showCopyToast(successMessage);
   } catch {
-    showCopyToast('Copy failed');
+    showCopyToast(tt('code.toast.copyFailed'));
   }
 }
 
@@ -404,20 +410,20 @@ function getFilePathMenuPosition(event: MouseEvent) {
 }
 
 async function copyFullPath() {
-  await copyFilePathText(props.filePath, 'Path copied');
+  await copyFilePathText(props.filePath, tt('code.toast.pathCopied'));
 }
 
 async function copyFileName() {
-  await copyFilePathText(fileNameLabel.value, 'Name copied');
+  await copyFilePathText(fileNameLabel.value, tt('code.toast.nameCopied'));
 }
 
 async function copyProjectRelativePath() {
   if (!projectRelativePathLabel.value) {
-    showCopyToast('Project root not available');
+    showCopyToast(tt('code.toast.projectRootUnavailable'));
     return;
   }
 
-  await copyFilePathText(projectRelativePathLabel.value, 'Project path copied');
+  await copyFilePathText(projectRelativePathLabel.value, tt('code.toast.projectPathCopied'));
 }
 
 function closeFilePathMenu() {
@@ -513,7 +519,7 @@ async function findReferencesForSymbol(
   currentTarget?: CodeNavigationTarget | null,
 ) {
   if (!props.projectRoot || !window.bridgegit?.git) {
-    showCopyToast('Project search is unavailable');
+    showCopyToast(tt('code.toast.projectSearchUnavailable'));
     return;
   }
 
@@ -576,7 +582,7 @@ async function findReferencesForSymbol(
       return;
     }
 
-    referencesSearchError.value = error instanceof Error ? error.message : 'Failed to search references.';
+    referencesSearchError.value = error instanceof Error ? error.message : tt('code.references.searchFailed');
   } finally {
     if (requestToken === referencesSearchToken) {
       referencesSearchBusy.value = false;
@@ -593,7 +599,7 @@ async function findReferencesAtCursor() {
   const symbol = getCodeNavigationSymbolAtOffset(props.content, cursorOffset);
 
   if (!symbol) {
-    showCopyToast('Place the cursor on a symbol first');
+    showCopyToast(tt('code.toast.placeCursorOnSymbol'));
     return;
   }
 
@@ -631,7 +637,7 @@ function handleDocumentPointerUp() {
   }
 
   selectionCopyPendingAfterPointer = false;
-  scheduleSelectionCopy();
+  scheduleSelectionCopy(editorView, { force: true });
 }
 
 function clearPendingSelectionCopy() {
@@ -655,7 +661,15 @@ function getSelectedCodeText(view: EditorView | null = editorView) {
   return view.state.sliceDoc(selection.from, selection.to);
 }
 
-function scheduleSelectionCopy(view: EditorView | null = editorView) {
+function scheduleSelectionCopy(view: EditorView | null = editorView, { force = false }: { force?: boolean } = {}) {
+  if (!props.selectionAutoCopyEnabled) {
+    lastCopiedSelection = null;
+    selectionCopyPendingAfterKeyboard = false;
+    selectionCopyPendingAfterPointer = false;
+    clearPendingSelectionCopy();
+    return;
+  }
+
   if (selectionKeyboardActive) {
     selectionCopyPendingAfterKeyboard = true;
     return;
@@ -663,6 +677,10 @@ function scheduleSelectionCopy(view: EditorView | null = editorView) {
 
   if (selectionPointerActive) {
     selectionCopyPendingAfterPointer = true;
+    return;
+  }
+
+  if (!force) {
     return;
   }
 
@@ -685,16 +703,23 @@ function scheduleSelectionCopy(view: EditorView | null = editorView) {
     try {
       await writeClipboard(currentSelection);
       lastCopiedSelection = currentSelection;
-      showCopyToast('Copied');
+      showCopyToast(tt('code.toast.copied'));
     } catch {
-      showCopyToast('Copy failed');
+      showCopyToast(tt('code.toast.copyFailed'));
     }
   }, 90);
 }
 
-async function pasteClipboardIntoEditor(view: EditorView, eventText?: string | null) {
+async function pasteClipboardIntoEditor(
+  view: EditorView,
+  eventText?: string | null,
+  options: {
+    forceSystemRead?: boolean;
+  } = {},
+) {
   const clipboardText = await readSharedClipboardText({
     eventText,
+    forceSystemRead: options.forceSystemRead,
     preferPreviousDistinctOf: getSelectedCodeText(view),
   });
 
@@ -880,9 +905,15 @@ function createEditor() {
           return false;
         },
         contextmenu: (event, view) => {
+          if (!props.rightClickPasteEnabled) {
+            return false;
+          }
+
           event.preventDefault();
           event.stopPropagation();
-          void pasteClipboardIntoEditor(view);
+          void pasteClipboardIntoEditor(view, null, {
+            forceSystemRead: true,
+          });
           return true;
         },
         paste: (event, view) => {
@@ -1070,7 +1101,7 @@ function handleDocumentKeyup(event: KeyboardEvent) {
 
       if (selectionCopyPendingAfterKeyboard) {
         selectionCopyPendingAfterKeyboard = false;
-        scheduleSelectionCopy();
+        scheduleSelectionCopy(editorView, { force: true });
       }
     }
   }
@@ -1191,8 +1222,8 @@ onBeforeUnmount(() => {
           <button
             class="code-tab__file-path-button"
             type="button"
-            :title="`${filePath}\nClick to copy path from project root\nRight-click for more options`"
-            aria-label="Copy file path"
+            :title="tt('code.pathButtonTitle', { path: filePath })"
+            :aria-label="tt('code.copyFilePath')"
             aria-haspopup="menu"
             @click="handleFilePathClick"
             @contextmenu="openFilePathMenu"
@@ -1203,8 +1234,8 @@ onBeforeUnmount(() => {
             class="code-tab__action code-tab__action--inline"
             type="button"
             :disabled="busy"
-            title="Find in file [Ctrl+F]"
-            aria-label="Find in file"
+            :title="tt('code.findInFileTitle')"
+            :aria-label="tt('code.findInFile')"
             @click="openSearch"
           >
             <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -1215,8 +1246,8 @@ onBeforeUnmount(() => {
             class="code-tab__action code-tab__action--inline"
             type="button"
             :disabled="busy"
-            :title="`Find references ${SHORTCUTS.codeFindReferences.display}`"
-            aria-label="Find references"
+            :title="tt('code.findReferencesTitle', { shortcut: SHORTCUTS.codeFindReferences.display })"
+            :aria-label="tt('code.findReferences')"
             @click="findReferencesAtCursor"
           >
             <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -1231,8 +1262,8 @@ onBeforeUnmount(() => {
           class="code-tab__action"
           type="button"
           :disabled="busy"
-          title="Open file"
-          aria-label="Open file"
+          :title="tt('code.openFile')"
+          :aria-label="tt('code.openFile')"
           @click="emit('open-file')"
         >
           <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -1244,8 +1275,8 @@ onBeforeUnmount(() => {
           class="code-tab__action"
           type="button"
           :disabled="busy"
-          title="Save file [Ctrl+S]"
-          aria-label="Save file"
+          :title="tt('code.saveFileTitle')"
+          :aria-label="tt('code.saveFile')"
           @click="emit('save-file')"
         >
           <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -1257,8 +1288,8 @@ onBeforeUnmount(() => {
           class="code-tab__action"
           type="button"
           :disabled="busy"
-          title="Save file as [Ctrl+Shift+S]"
-          aria-label="Save file as"
+          :title="tt('code.saveFileAsTitle')"
+          :aria-label="tt('code.saveFileAs')"
           @click="emit('save-file-as')"
         >
           <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -1272,12 +1303,12 @@ onBeforeUnmount(() => {
         <span
           v-if="isLargeFile"
           class="code-tab__metric code-tab__metric--warning"
-          :title="`Syntax highlighting is reduced above ${CODE_EDITOR_LARGE_FILE_CHAR_LIMIT.toLocaleString()} characters.`"
+          :title="tt('code.largeFileTitle', { count: CODE_EDITOR_LARGE_FILE_CHAR_LIMIT.toLocaleString() })"
         >
-          Large file mode
+          {{ tt('code.largeFileMode') }}
         </span>
-        <span class="code-tab__metric">{{ lineCount.toLocaleString() }} lines</span>
-        <span class="code-tab__metric">{{ characterCount }} chars</span>
+        <span class="code-tab__metric">{{ tt('code.lines', { count: lineCount.toLocaleString() }) }}</span>
+        <span class="code-tab__metric">{{ tt('code.chars', { count: characterCount }) }}</span>
         <span class="code-tab__metric">{{ fontSize }} px</span>
       </div>
     </div>
@@ -1303,7 +1334,7 @@ onBeforeUnmount(() => {
           :disabled="busy"
           @click="emit('dismiss-external-change')"
         >
-          Keep current
+          {{ tt('code.keepCurrent') }}
         </button>
       </div>
     </div>
@@ -1314,17 +1345,17 @@ onBeforeUnmount(() => {
         <div class="code-tab__references-header">
           <div class="code-tab__references-copy">
             <strong>
-              <template v-if="referencesQuery">References for {{ referencesQuery }}</template>
-              <template v-else>References</template>
+              <template v-if="referencesQuery">{{ tt('code.references.for', { query: referencesQuery }) }}</template>
+              <template v-else>{{ tt('code.references.title') }}</template>
             </strong>
-            <span v-if="referencesSearchBusy">Searching saved project files…</span>
+            <span v-if="referencesSearchBusy">{{ tt('code.references.searching') }}</span>
             <span v-else-if="referencesSearchError">{{ referencesSearchError }}</span>
             <span v-else-if="referencesQuery">{{ referencesCountLabel }}</span>
           </div>
           <button
             class="code-tab__references-close"
             type="button"
-            aria-label="Close references"
+            :aria-label="tt('code.references.close')"
             @click="closeReferencesPanel"
           >
             <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -1334,7 +1365,7 @@ onBeforeUnmount(() => {
         </div>
 
         <div v-if="!referencesSearchBusy && !referencesSearchError && !referencesMatches.length" class="code-tab__references-empty">
-          No references found in saved project files.
+          {{ tt('code.references.empty') }}
         </div>
 
         <div v-else class="code-tab__references-list">
@@ -1352,7 +1383,7 @@ onBeforeUnmount(() => {
         </div>
 
         <div v-if="isDirty" class="code-tab__references-note">
-          References are searched in the version currently saved on disk.
+          {{ tt('code.references.savedVersionNote') }}
         </div>
       </section>
     </div>
@@ -1362,7 +1393,7 @@ onBeforeUnmount(() => {
       class="code-tab__path-menu"
       :style="{ left: `${filePathMenu.x}px`, top: `${filePathMenu.y}px` }"
       role="menu"
-      aria-label="Copy file path"
+      :aria-label="tt('code.copyFilePath')"
     >
       <button
         class="code-tab__path-menu-item"
@@ -1370,7 +1401,7 @@ onBeforeUnmount(() => {
         role="menuitem"
         @click="handleCopyFullPathMenuClick"
       >
-        Copy full path
+        {{ tt('code.copyFullPath') }}
       </button>
       <button
         class="code-tab__path-menu-item"
@@ -1379,7 +1410,7 @@ onBeforeUnmount(() => {
         :disabled="!projectRelativePathLabel"
         @click="handleCopyProjectRelativePathMenuClick"
       >
-        Copy path from project root
+        {{ tt('code.copyProjectPath') }}
       </button>
       <button
         class="code-tab__path-menu-item"
@@ -1387,7 +1418,7 @@ onBeforeUnmount(() => {
         role="menuitem"
         @click="handleRevealInAllFilesMenuClick"
       >
-        Reveal in All files
+        {{ tt('code.revealInAllFiles') }}
       </button>
       <button
         class="code-tab__path-menu-item"
@@ -1395,7 +1426,7 @@ onBeforeUnmount(() => {
         role="menuitem"
         @click="handleCopyFileNameMenuClick"
       >
-        Copy file name
+        {{ tt('code.copyFileName') }}
       </button>
     </div>
 

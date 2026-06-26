@@ -67,6 +67,7 @@ declare global {
       };
       system: {
         beep: () => Promise<void>;
+        openExternalUrl: (url: string) => Promise<void>;
       };
       session: {
         load: () => Promise<SessionData>;

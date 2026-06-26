@@ -2,6 +2,8 @@
 import { computed, ref, watch } from 'vue';
 import type {
   AppAppearance,
+  AppLanguage,
+  ClipboardBehaviorSettings,
   EditorTheme,
   ResolvedEditorTheme,
   ShortcutOverrides,
@@ -20,6 +22,8 @@ import {
   MIN_NOTE_FONT_SIZE,
   MIN_SHELL_FONT_SIZE,
   cloneShortcutOverrides,
+  cloneClipboardBehaviorSettings,
+  normalizeAppLanguage,
   normalizeNoteFontSize,
   normalizeShellFontSize,
 } from '../../shared/bridgegit';
@@ -31,6 +35,7 @@ import {
   getDefaultShortcutDefinition,
   isShortcutOverrideRedundant,
 } from '../shortcuts';
+import { APP_LANGUAGE_OPTIONS, t } from '../i18n';
 import { playNotificationBeep } from '../utils/notification-audio';
 
 type SettingsSectionId = 'general' | 'shortcuts' | 'commands' | 'layout';
@@ -43,11 +48,13 @@ interface Props {
   hasUnreadInfoNote: boolean;
   sidebarSide: PanelLayout['sidebarSide'];
   diffPlacement: PanelLayout['diffPlacement'];
+  appLanguage: AppLanguage;
   appAppearance: AppAppearance;
   editorTheme: EditorTheme;
   shortcutOverrides: ShortcutOverrides;
   workspacePanelFontSize: number;
   workspaceIndicatorVisibility: WorkspaceIndicatorVisibilitySettings;
+  clipboardBehavior: ClipboardBehaviorSettings;
   workspaceTabDefaults: WorkspaceTabDefaults;
   worktreeDetectionIntervalMs: WorktreeDetectionInterval;
   soundNotificationsEnabled: boolean;
@@ -78,37 +85,6 @@ interface NoteViewModeOption {
   copy: string;
 }
 
-const SETTINGS_SECTIONS: SettingsSection[] = [
-  {
-    id: 'general',
-    label: 'General',
-    copy: 'Project level identity and shared defaults.',
-  },
-  {
-    id: 'shortcuts',
-    label: 'Shortcuts',
-    copy: 'Current keyboard bindings available in the app.',
-  },
-  {
-    id: 'commands',
-    label: 'Commands',
-    copy: 'Reusable shell presets for terminal automation.',
-  },
-  {
-    id: 'layout',
-    label: 'Layout',
-    copy: 'Preferred arrangement for repository and diff panels.',
-  },
-];
-
-const WORKTREE_DETECTION_INTERVAL_OPTIONS: WorktreeDetectionIntervalOption[] = [
-  { value: null, label: 'Off', copy: 'Only check when you refresh the repository manually.' },
-  { value: 60_000, label: '1 minute', copy: 'Frequent background checks while the window stays visible.' },
-  { value: 180_000, label: '3 minutes', copy: 'Balanced default for occasional worktree creation.' },
-  { value: 300_000, label: '5 minutes', copy: 'Lighter background polling for long-running sessions.' },
-  { value: 900_000, label: '15 minutes', copy: 'Minimal automatic checks with manual refresh as the main trigger.' },
-];
-
 const APP_APPEARANCE_OPTIONS: ThemeOption<AppAppearance>[] = [
   { value: 'bridgegit-dark', label: 'BridgeGit Dark', copy: 'Current default look across the whole app.' },
   { value: 'bridgegit-light', label: 'BridgeGit Light', copy: 'Lighter workspace for brighter environments.' },
@@ -126,12 +102,6 @@ const EDITOR_THEME_OPTIONS: ThemeOption<EditorTheme>[] = [
   { value: 'nord', label: 'Nord', copy: 'Cool dark editor palette with softer blues and lower glare.' },
 ];
 
-const NOTE_VIEW_MODE_OPTIONS: NoteViewModeOption[] = [
-  { value: 'source', label: 'Edit', copy: 'Open notes directly in the editor.' },
-  { value: 'split', label: 'Edit + preview', copy: 'Keep editor and preview visible together.' },
-  { value: 'preview', label: 'Preview', copy: 'Open notes in preview-first mode.' },
-];
-
 const props = defineProps<Props>();
 
 const emit = defineEmits<{
@@ -144,11 +114,13 @@ const activeSection = ref<SettingsSectionId>('general');
 const draftTitle = ref(props.projectTitle);
 const draftSidebarSide = ref<PanelLayout['sidebarSide']>(props.sidebarSide);
 const draftDiffPlacement = ref<PanelLayout['diffPlacement']>(props.diffPlacement);
+const draftAppLanguage = ref<AppLanguage>(normalizeAppLanguage(props.appLanguage));
 const draftAppAppearance = ref<AppAppearance>(props.appAppearance);
 const draftEditorTheme = ref<EditorTheme>(props.editorTheme);
 const draftShortcutOverrides = ref<ShortcutOverrides>(cloneShortcutOverrides(props.shortcutOverrides));
 const draftWorkspacePanelFontSize = ref(normalizeNoteFontSize(props.workspacePanelFontSize));
 const draftWorkspaceIndicatorVisibility = ref<WorkspaceIndicatorVisibilitySettings>({ ...props.workspaceIndicatorVisibility });
+const draftClipboardBehavior = ref<ClipboardBehaviorSettings>(cloneClipboardBehaviorSettings(props.clipboardBehavior));
 const draftWorkspaceTabDefaults = ref<WorkspaceTabDefaults>({ ...props.workspaceTabDefaults });
 const draftWorktreeDetectionIntervalMs = ref<string>(serializeWorktreeDetectionInterval(props.worktreeDetectionIntervalMs));
 const draftSoundNotificationsEnabled = ref(props.soundNotificationsEnabled);
@@ -159,6 +131,45 @@ const WORKSPACE_TAB_FONT_SIZE_MIN = Math.max(MIN_SHELL_FONT_SIZE, MIN_NOTE_FONT_
 const WORKSPACE_TAB_FONT_SIZE_MAX = Math.min(MAX_SHELL_FONT_SIZE, MAX_NOTE_FONT_SIZE);
 const WORKSPACE_PANEL_FONT_SIZE_MIN = MIN_NOTE_FONT_SIZE;
 const WORKSPACE_PANEL_FONT_SIZE_MAX = MAX_NOTE_FONT_SIZE;
+
+const tt = (key: string, params?: Record<string, string | number>) => t(draftAppLanguage.value, key, params);
+
+const settingsSections = computed<SettingsSection[]>(() => [
+  {
+    id: 'general',
+    label: tt('settings.nav.general.label'),
+    copy: tt('settings.nav.general.copy'),
+  },
+  {
+    id: 'shortcuts',
+    label: tt('settings.nav.shortcuts.label'),
+    copy: tt('settings.nav.shortcuts.copy'),
+  },
+  {
+    id: 'commands',
+    label: tt('settings.nav.commands.label'),
+    copy: tt('settings.nav.commands.copy'),
+  },
+  {
+    id: 'layout',
+    label: tt('settings.nav.layout.label'),
+    copy: tt('settings.nav.layout.copy'),
+  },
+]);
+
+const worktreeDetectionIntervalOptions = computed<WorktreeDetectionIntervalOption[]>(() => [
+  { value: null, label: tt('settings.worktree.off'), copy: tt('settings.worktree.off.copy') },
+  { value: 60_000, label: tt('settings.worktree.1m'), copy: tt('settings.worktree.1m.copy') },
+  { value: 180_000, label: tt('settings.worktree.3m'), copy: tt('settings.worktree.3m.copy') },
+  { value: 300_000, label: tt('settings.worktree.5m'), copy: tt('settings.worktree.5m.copy') },
+  { value: 900_000, label: tt('settings.worktree.15m'), copy: tt('settings.worktree.15m.copy') },
+]);
+
+const noteViewModeOptions = computed<NoteViewModeOption[]>(() => [
+  { value: 'source', label: tt('settings.noteMode.source'), copy: tt('settings.noteMode.source.copy') },
+  { value: 'split', label: tt('settings.noteMode.split'), copy: tt('settings.noteMode.split.copy') },
+  { value: 'preview', label: tt('settings.noteMode.preview'), copy: tt('settings.noteMode.preview.copy') },
+]);
 
 function cloneTerminalCommandStep(step: TerminalCommandStep): TerminalCommandStep {
   return { ...step };
@@ -242,11 +253,13 @@ function resetDraft() {
   draftTitle.value = props.projectTitle;
   draftSidebarSide.value = props.sidebarSide;
   draftDiffPlacement.value = props.diffPlacement;
+  draftAppLanguage.value = normalizeAppLanguage(props.appLanguage);
   draftAppAppearance.value = props.appAppearance;
   draftEditorTheme.value = props.editorTheme;
   draftShortcutOverrides.value = cloneShortcutOverrides(props.shortcutOverrides);
   draftWorkspacePanelFontSize.value = normalizeNoteFontSize(props.workspacePanelFontSize);
   draftWorkspaceIndicatorVisibility.value = { ...props.workspaceIndicatorVisibility };
+  draftClipboardBehavior.value = cloneClipboardBehaviorSettings(props.clipboardBehavior);
   draftWorkspaceTabDefaults.value = { ...props.workspaceTabDefaults };
   draftWorktreeDetectionIntervalMs.value = serializeWorktreeDetectionInterval(props.worktreeDetectionIntervalMs);
   draftSoundNotificationsEnabled.value = props.soundNotificationsEnabled;
@@ -349,6 +362,15 @@ watch(
 );
 
 watch(
+  () => props.appLanguage,
+  (value) => {
+    if (!props.modelValue) {
+      draftAppLanguage.value = normalizeAppLanguage(value);
+    }
+  },
+);
+
+watch(
   () => props.appAppearance,
   (value) => {
     if (!props.modelValue) {
@@ -390,6 +412,16 @@ watch(
   (value) => {
     if (!props.modelValue) {
       draftWorkspaceIndicatorVisibility.value = { ...value };
+    }
+  },
+  { deep: true },
+);
+
+watch(
+  () => props.clipboardBehavior,
+  (value) => {
+    if (!props.modelValue) {
+      draftClipboardBehavior.value = cloneClipboardBehaviorSettings(value);
     }
   },
   { deep: true },
@@ -475,16 +507,19 @@ function handleSubmit() {
     projectTitle: draftTitle.value.trim(),
     sidebarSide: draftSidebarSide.value,
     diffPlacement: draftDiffPlacement.value,
+    appLanguage: normalizeAppLanguage(draftAppLanguage.value),
     appAppearance: draftAppAppearance.value,
     editorTheme: draftEditorTheme.value,
     shortcutOverrides: cloneShortcutOverrides(draftShortcutOverrides.value),
     workspacePanelFontSize: normalizeNoteFontSize(draftWorkspacePanelFontSize.value),
     workspaceIndicatorVisibility: { ...draftWorkspaceIndicatorVisibility.value },
+    clipboardBehavior: cloneClipboardBehaviorSettings(draftClipboardBehavior.value),
     workspaceTabDefaults: {
       shellFontSize: normalizeShellFontSize(draftWorkspaceTabDefaults.value.shellFontSize),
       noteFontSize: normalizeNoteFontSize(draftWorkspaceTabDefaults.value.noteFontSize),
       noteViewMode: draftWorkspaceTabDefaults.value.noteViewMode,
       noteLineNumbers: draftWorkspaceTabDefaults.value.noteLineNumbers !== false,
+      noteLineWrapping: draftWorkspaceTabDefaults.value.noteLineWrapping !== false,
     },
     worktreeDetectionIntervalMs: parseWorktreeDetectionInterval(draftWorktreeDetectionIntervalMs.value),
     soundNotificationsEnabled: draftSoundNotificationsEnabled.value,
@@ -552,7 +587,23 @@ function toggleCommandPreset(presetId: string) {
 }
 
 function formatPresetTarget(target: TerminalCommandPreset['target']): string {
-  return target === 'new-tab' ? 'New shell tab' : 'Active shell tab';
+  return target === 'new-tab' ? tt('settings.commands.newShellTab') : tt('settings.commands.activeShellTab');
+}
+
+function formatPresetFallbackName(index: number): string {
+  return tt('settings.commands.commandFallback', { index });
+}
+
+function formatStepCount(count: number): string {
+  return tt('settings.commands.stepCount', { count });
+}
+
+function formatStepLabel(index: number): string {
+  return tt('settings.commands.stepLabel', { index });
+}
+
+function formatRemoveStepLabel(index: number): string {
+  return tt('settings.commands.removeStep', { index });
 }
 
 function hasShortcutOverride(shortcutId: string): boolean {
@@ -656,14 +707,14 @@ function handleShortcutCapture(shortcutId: string, event: KeyboardEvent) {
         class="settings-dialog__panel"
         role="dialog"
         aria-modal="true"
-        aria-label="Project settings"
+        :aria-label="tt('settings.aria.projectSettings')"
         @keydown.capture="handleDialogKeydown"
       >
         <header class="settings-dialog__header">
           <div class="settings-dialog__header-copy">
-            <p class="settings-dialog__eyebrow">Settings</p>
+            <p class="settings-dialog__eyebrow">{{ tt('settings.header.eyebrow') }}</p>
             <div class="settings-dialog__title-row">
-              <h2 class="settings-dialog__title">Project settings</h2>
+              <h2 class="settings-dialog__title">{{ tt('settings.header.title') }}</h2>
               <code class="settings-dialog__version-badge">v{{ appVersion }}</code>
             </div>
           </div>
@@ -671,7 +722,7 @@ function handleShortcutCapture(shortcutId: string, event: KeyboardEvent) {
           <button
             class="settings-dialog__close"
             type="button"
-            aria-label="Close settings"
+            :aria-label="tt('settings.aria.close')"
             @click="closeDialog"
           >
             ×
@@ -679,9 +730,9 @@ function handleShortcutCapture(shortcutId: string, event: KeyboardEvent) {
         </header>
 
         <form class="settings-dialog__form" @submit.prevent="handleSubmit">
-          <aside class="settings-dialog__sidebar" aria-label="Settings sections">
+          <aside class="settings-dialog__sidebar" :aria-label="tt('settings.aria.sections')">
             <button
-              v-for="section in SETTINGS_SECTIONS"
+              v-for="section in settingsSections"
               :key="section.id"
               class="settings-dialog__nav-item"
               :class="{ 'settings-dialog__nav-item--active': section.id === activeSection }"
@@ -697,16 +748,35 @@ function handleShortcutCapture(shortcutId: string, event: KeyboardEvent) {
             <section v-show="activeSection === 'general'" class="settings-dialog__section">
               <header class="settings-dialog__section-header">
                 <div>
-                  <p class="settings-dialog__section-eyebrow">General</p>
-                  <h3 class="settings-dialog__section-title">Project identity</h3>
+                  <p class="settings-dialog__section-eyebrow">{{ tt('settings.general.eyebrow') }}</p>
+                  <h3 class="settings-dialog__section-title">{{ tt('settings.general.title') }}</h3>
                 </div>
                 <p class="settings-dialog__section-copy">
-                  Local metadata used by the repository panel and settings.
+                  {{ tt('settings.general.copy') }}
                 </p>
               </header>
 
+              <div class="settings-dialog__hint-card">
+                <span class="settings-dialog__hint-label">{{ tt('settings.general.language.label') }}</span>
+                <label class="settings-dialog__field">
+                  <span class="settings-dialog__label">{{ tt('settings.general.language.field') }}</span>
+                  <select v-model="draftAppLanguage" class="settings-dialog__select">
+                    <option
+                      v-for="option in APP_LANGUAGE_OPTIONS"
+                      :key="option.value"
+                      :value="option.value"
+                    >
+                      {{ option.label }}
+                    </option>
+                  </select>
+                </label>
+                <p class="settings-dialog__hint-copy">
+                  {{ APP_LANGUAGE_OPTIONS.find((option) => option.value === draftAppLanguage)?.copy }}
+                </p>
+              </div>
+
               <label class="settings-dialog__field">
-                <span class="settings-dialog__label">Displayed title</span>
+                <span class="settings-dialog__label">{{ tt('settings.general.title.field') }}</span>
                 <input
                   v-model="draftTitle"
                   class="settings-dialog__input"
@@ -722,9 +792,9 @@ function handleShortcutCapture(shortcutId: string, event: KeyboardEvent) {
                 <label class="settings-dialog__checkbox-toggle">
                   <input v-model="draftSoundNotificationsEnabled" type="checkbox">
                   <span class="settings-dialog__checkbox-content">
-                    <span class="settings-dialog__checkbox-title">Sound notifications</span>
+                    <span class="settings-dialog__checkbox-title">{{ tt('settings.general.sound.title') }}</span>
                     <span class="settings-dialog__checkbox-copy">
-                      Play a short beep when shell activity finishes while the terminal is not focused.
+                      {{ tt('settings.general.sound.copy') }}
                     </span>
                   </span>
                 </label>
@@ -732,38 +802,38 @@ function handleShortcutCapture(shortcutId: string, event: KeyboardEvent) {
                 <button
                   class="settings-dialog__button settings-dialog__button--ghost settings-dialog__checkbox-preview"
                   type="button"
-                  title="Play notification sound"
+                  :title="tt('settings.general.sound.playTitle')"
                   @click="previewNotificationSound"
                 >
-                  Play
+                  {{ tt('common.play') }}
                 </button>
               </div>
 
               <div class="settings-dialog__hint-card settings-dialog__hint-card--inline">
-                <span class="settings-dialog__hint-label">Workspace dots</span>
+                <span class="settings-dialog__hint-label">{{ tt('settings.general.workspaceDots') }}</span>
                 <div class="settings-dialog__checkbox-list">
                   <label class="settings-dialog__checkbox">
                     <input v-model="draftWorkspaceIndicatorVisibility.repo" type="checkbox">
-                    <span>Repository dot</span>
+                    <span>{{ tt('settings.general.repoDot') }}</span>
                   </label>
                   <label class="settings-dialog__checkbox">
                     <input v-model="draftWorkspaceIndicatorVisibility.activity" type="checkbox">
-                    <span>Activity dot</span>
+                    <span>{{ tt('settings.general.activityDot') }}</span>
                   </label>
                   <label class="settings-dialog__checkbox">
                     <input v-model="draftWorkspaceIndicatorVisibility.attention" type="checkbox">
-                    <span>Attention dot</span>
+                    <span>{{ tt('settings.general.attentionDot') }}</span>
                   </label>
                 </div>
               </div>
 
               <div class="settings-dialog__hint-card">
-                <span class="settings-dialog__hint-label">Behavior</span>
+                <span class="settings-dialog__hint-label">{{ tt('settings.general.behavior') }}</span>
                 <div class="settings-dialog__field">
-                  <span class="settings-dialog__label">Worktree detection</span>
+                  <span class="settings-dialog__label">{{ tt('settings.general.worktreeDetection') }}</span>
                   <select v-model="draftWorktreeDetectionIntervalMs" class="settings-dialog__select">
                     <option
-                      v-for="option in WORKTREE_DETECTION_INTERVAL_OPTIONS"
+                      v-for="option in worktreeDetectionIntervalOptions"
                       :key="option.label"
                       :value="serializeWorktreeDetectionInterval(option.value)"
                     >
@@ -772,32 +842,57 @@ function handleShortcutCapture(shortcutId: string, event: KeyboardEvent) {
                   </select>
                 </div>
                 <p class="settings-dialog__hint-copy">
-                  {{ WORKTREE_DETECTION_INTERVAL_OPTIONS.find((option) => (
+                  {{ worktreeDetectionIntervalOptions.find((option) => (
                     serializeWorktreeDetectionInterval(option.value) === draftWorktreeDetectionIntervalMs
                   ))?.copy }}
                 </p>
                 <p class="settings-dialog__hint-copy">
-                  Leave the title empty to follow the current repository name automatically.
+                  {{ tt('settings.general.autoTitleHint') }}
                 </p>
               </div>
 
               <div class="settings-dialog__hint-card">
-                <span class="settings-dialog__hint-label">About</span>
+                <span class="settings-dialog__hint-label">{{ tt('settings.general.clipboard') }}</span>
+                <div class="settings-dialog__checkbox-list settings-dialog__checkbox-list--stacked">
+                  <label class="settings-dialog__checkbox settings-dialog__checkbox--card settings-dialog__checkbox--stacked-card">
+                    <input v-model="draftClipboardBehavior.rightClickPaste" type="checkbox">
+                    <span class="settings-dialog__checkbox-content">
+                      <span class="settings-dialog__checkbox-title">{{ tt('settings.general.rightClickPaste.title') }}</span>
+                      <span class="settings-dialog__checkbox-copy">
+                        {{ tt('settings.general.rightClickPaste.copy') }}
+                      </span>
+                    </span>
+                  </label>
+
+                  <label class="settings-dialog__checkbox settings-dialog__checkbox--card settings-dialog__checkbox--stacked-card">
+                    <input v-model="draftClipboardBehavior.selectionAutoCopy" type="checkbox">
+                    <span class="settings-dialog__checkbox-content">
+                      <span class="settings-dialog__checkbox-title">{{ tt('settings.general.autoCopy.title') }}</span>
+                      <span class="settings-dialog__checkbox-copy">
+                        {{ tt('settings.general.autoCopy.copy') }}
+                      </span>
+                    </span>
+                  </label>
+                </div>
+              </div>
+
+              <div class="settings-dialog__hint-card">
+                <span class="settings-dialog__hint-label">{{ tt('settings.general.about') }}</span>
                 <div class="settings-dialog__meta-list">
                   <div class="settings-dialog__meta-row">
-                    <span class="settings-dialog__label">BridgeGit version</span>
+                    <span class="settings-dialog__label">{{ tt('settings.general.version') }}</span>
                     <code class="settings-dialog__meta-value">v{{ appVersion }}</code>
                   </div>
                   <div class="settings-dialog__meta-row">
-                    <span class="settings-dialog__label">Message center revision</span>
+                    <span class="settings-dialog__label">{{ tt('settings.general.messageRevision') }}</span>
                     <code class="settings-dialog__meta-value">{{ infoNoteRevision }}</code>
                   </div>
                 </div>
                 <div class="settings-dialog__message-list">
                   <button class="settings-dialog__message-item" type="button" @click="emit('open-info')">
                     <span class="settings-dialog__message-item-copyblock">
-                      <span class="settings-dialog__message-item-title">Welcome update</span>
-                      <span class="settings-dialog__message-item-copy">Bundled release note for BridgeGit v{{ appVersion }}</span>
+                      <span class="settings-dialog__message-item-title">{{ tt('settings.general.welcomeUpdate') }}</span>
+                      <span class="settings-dialog__message-item-copy">{{ tt('settings.general.welcomeCopy', { version: appVersion }) }}</span>
                     </span>
                     <span
                       class="settings-dialog__info-status"
@@ -805,15 +900,15 @@ function handleShortcutCapture(shortcutId: string, event: KeyboardEvent) {
                         ? 'settings-dialog__info-status--unread'
                         : 'settings-dialog__info-status--read'"
                     >
-                      {{ hasUnreadInfoNote ? 'Unread' : 'Read' }}
+                      {{ hasUnreadInfoNote ? tt('common.unread') : tt('common.read') }}
                     </span>
                   </button>
                 </div>
                 <p class="settings-dialog__hint-copy">
-                  The in-app release note is bundled with the app version and stays highlighted in the envelope button until it is shown once.
+                  {{ tt('settings.general.releaseNoteHint') }}
                 </p>
                 <button class="settings-dialog__button settings-dialog__button--ghost" type="button" @click="emit('open-info')">
-                  Open message center
+                  {{ tt('settings.general.openMessageCenter') }}
                 </button>
               </div>
             </section>
@@ -824,24 +919,24 @@ function handleShortcutCapture(shortcutId: string, event: KeyboardEvent) {
             >
               <header class="settings-dialog__section-header">
                 <div>
-                  <p class="settings-dialog__section-eyebrow">Shortcuts</p>
-                  <h3 class="settings-dialog__section-title">Keyboard shortcuts</h3>
+                  <p class="settings-dialog__section-eyebrow">{{ tt('settings.shortcuts.eyebrow') }}</p>
+                  <h3 class="settings-dialog__section-title">{{ tt('settings.shortcuts.title') }}</h3>
                 </div>
                 <p class="settings-dialog__section-copy">
-                  Default bindings stay in place until you override them here.
+                  {{ tt('settings.shortcuts.copy') }}
                 </p>
               </header>
 
               <div class="settings-dialog__hint-card settings-dialog__hint-card--inline">
-                <span class="settings-dialog__hint-label">Mouse zoom</span>
+                <span class="settings-dialog__hint-label">{{ tt('settings.shortcuts.mouseZoom') }}</span>
                 <p class="settings-dialog__hint-copy">
-                  Hold <code>Ctrl</code> and use the mouse wheel over shell, note, code, or the workspace sidebar to change font size.
+                  {{ tt('settings.shortcuts.mouseZoomCopy') }}
                 </p>
               </div>
 
               <div class="settings-dialog__section-actions">
                 <p class="settings-dialog__section-note">
-                  Click <code>Record</code>, press the new shortcut, use <code>Backspace</code> to clear, or <code>Esc</code> to cancel recording.
+                  {{ tt('settings.shortcuts.recordHelp') }}
                 </p>
                 <button
                   class="settings-dialog__button settings-dialog__button--ghost"
@@ -849,12 +944,12 @@ function handleShortcutCapture(shortcutId: string, event: KeyboardEvent) {
                   :disabled="!hasShortcutOverrides"
                   @click="resetAllShortcutOverrides"
                 >
-                  Reset all
+                  {{ tt('settings.shortcuts.resetAll') }}
                 </button>
               </div>
 
               <div v-if="hasShortcutConflicts" class="settings-dialog__hint-card settings-dialog__hint-card--danger">
-                <span class="settings-dialog__hint-label">Shortcut conflicts</span>
+                <span class="settings-dialog__hint-label">{{ tt('settings.shortcuts.conflicts') }}</span>
                 <div class="settings-dialog__conflict-list">
                   <p
                     v-for="conflict in draftShortcutConflicts"
@@ -890,10 +985,10 @@ function handleShortcutCapture(shortcutId: string, event: KeyboardEvent) {
                         <span class="settings-dialog__shortcut-label">{{ shortcut.label }}</span>
                         <span class="settings-dialog__shortcut-meta">
                           <span v-if="hasShortcutOverride(shortcut.id)">
-                            Custom · default {{ getShortcutDefaultDisplay(shortcut.id) }}
+                            {{ tt('settings.shortcuts.customDefault', { value: getShortcutDefaultDisplay(shortcut.id) }) }}
                           </span>
                           <span v-else>
-                            Default
+                            {{ tt('common.default') }}
                           </span>
                           <span
                             v-if="draftShortcutConflictIds.has(shortcut.id)"
@@ -912,13 +1007,13 @@ function handleShortcutCapture(shortcutId: string, event: KeyboardEvent) {
                             : 'settings-dialog__button--ghost'"
                           type="button"
                           :title="recordingShortcutId === shortcut.id
-                            ? 'Press the new shortcut now'
-                            : `Record shortcut for ${shortcut.label}`"
+                            ? tt('settings.shortcuts.pressKeysTitle')
+                            : tt('settings.shortcuts.recordTitle', { label: shortcut.label })"
                           @click="startShortcutRecording(shortcut.id)"
                           @keydown="handleShortcutCapture(shortcut.id, $event)"
                           @blur="stopShortcutRecording(shortcut.id)"
                         >
-                          {{ recordingShortcutId === shortcut.id ? 'Press keys…' : shortcut.display }}
+                          {{ recordingShortcutId === shortcut.id ? tt('settings.shortcuts.pressKeys') : shortcut.display }}
                         </button>
 
                         <button
@@ -927,7 +1022,7 @@ function handleShortcutCapture(shortcutId: string, event: KeyboardEvent) {
                           :disabled="!hasShortcutOverride(shortcut.id)"
                           @click="clearShortcutOverride(shortcut.id)"
                         >
-                          Reset
+                          {{ tt('common.reset') }}
                         </button>
                       </div>
                     </div>
@@ -942,27 +1037,27 @@ function handleShortcutCapture(shortcutId: string, event: KeyboardEvent) {
             >
               <header class="settings-dialog__section-header">
                 <div>
-                  <p class="settings-dialog__section-eyebrow">Commands</p>
-                  <h3 class="settings-dialog__section-title">Terminal presets</h3>
+                  <p class="settings-dialog__section-eyebrow">{{ tt('settings.commands.eyebrow') }}</p>
+                  <h3 class="settings-dialog__section-title">{{ tt('settings.commands.title') }}</h3>
                 </div>
                 <p class="settings-dialog__section-copy">
-                  Build reusable shell sequences with write, wait and delay steps.
+                  {{ tt('settings.commands.copy') }}
                 </p>
               </header>
 
               <div class="settings-dialog__section-actions">
                 <p class="settings-dialog__section-note">
-                  Assign a slot like <code>[Ctrl+Alt+1]</code> to run a preset instantly.
+                  {{ tt('settings.commands.slotCopy') }}
                 </p>
                 <button class="settings-dialog__button settings-dialog__button--secondary" type="button" @click="addCommandPreset">
-                  Add preset
+                  {{ tt('settings.commands.addPreset') }}
                 </button>
               </div>
 
               <div v-if="!draftCommandPresets.length" class="settings-dialog__empty">
-                <p class="settings-dialog__empty-title">No presets yet</p>
+                <p class="settings-dialog__empty-title">{{ tt('settings.commands.emptyTitle') }}</p>
                 <p class="settings-dialog__empty-copy">
-                  Add your first preset for flows like <code>wsl</code>, wait for prompt, then <code>npm run build</code>.
+                  {{ tt('settings.commands.emptyCopy') }}
                 </p>
               </div>
 
@@ -982,12 +1077,12 @@ function handleShortcutCapture(shortcutId: string, event: KeyboardEvent) {
                     >
                       <span class="settings-dialog__command-summary-copy">
                         <span class="settings-dialog__command-summary-title">
-                          {{ preset.name.trim() || `Command ${draftCommandPresets.indexOf(preset) + 1}` }}
+                          {{ preset.name.trim() || formatPresetFallbackName(draftCommandPresets.indexOf(preset) + 1) }}
                         </span>
                         <span class="settings-dialog__command-summary-meta">
                           {{ formatPresetTarget(preset.target) }} ·
-                          {{ preset.steps.length }} {{ preset.steps.length === 1 ? 'step' : 'steps' }} ·
-                          {{ preset.shortcutSlot ? formatCommandSlotShortcut(preset.shortcutSlot) : 'No shortcut' }}
+                          {{ formatStepCount(preset.steps.length) }} ·
+                          {{ preset.shortcutSlot ? formatCommandSlotShortcut(preset.shortcutSlot) : tt('settings.commands.noShortcut') }}
                         </span>
                       </span>
                       <span
@@ -1006,7 +1101,7 @@ function handleShortcutCapture(shortcutId: string, event: KeyboardEvent) {
                     <button
                       class="settings-dialog__icon-button settings-dialog__icon-button--danger"
                       type="button"
-                      aria-label="Remove preset"
+                      :aria-label="tt('settings.commands.removePreset')"
                       @click="removeCommandPreset(preset.id)"
                     >
                       <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -1019,7 +1114,7 @@ function handleShortcutCapture(shortcutId: string, event: KeyboardEvent) {
 
                   <div v-show="expandedCommandPresetId === preset.id" class="settings-dialog__command-body">
                     <label class="settings-dialog__field">
-                      <span class="settings-dialog__label">Preset name</span>
+                      <span class="settings-dialog__label">{{ tt('settings.commands.presetName') }}</span>
                       <input
                         v-model="preset.name"
                         class="settings-dialog__input"
@@ -1032,17 +1127,17 @@ function handleShortcutCapture(shortcutId: string, event: KeyboardEvent) {
 
                     <div class="settings-dialog__grid">
                       <label class="settings-dialog__field">
-                        <span class="settings-dialog__label">Run target</span>
+                        <span class="settings-dialog__label">{{ tt('settings.commands.runTarget') }}</span>
                         <select v-model="preset.target" class="settings-dialog__select">
-                          <option value="active-tab">Active shell tab</option>
-                          <option value="new-tab">New shell tab</option>
+                          <option value="active-tab">{{ tt('settings.commands.activeShellTab') }}</option>
+                          <option value="new-tab">{{ tt('settings.commands.newShellTab') }}</option>
                         </select>
                       </label>
 
                       <label class="settings-dialog__field">
-                        <span class="settings-dialog__label">Reserved shortcut</span>
+                        <span class="settings-dialog__label">{{ tt('settings.commands.reservedShortcut') }}</span>
                         <select v-model="preset.shortcutSlot" class="settings-dialog__select">
-                          <option :value="null">No shortcut</option>
+                          <option :value="null">{{ tt('settings.commands.noShortcut') }}</option>
                           <option v-for="slot in 9" :key="slot" :value="slot">
                             {{ formatCommandSlotShortcut(slot) }}
                           </option>
@@ -1058,7 +1153,7 @@ function handleShortcutCapture(shortcutId: string, event: KeyboardEvent) {
                       >
                         <div class="settings-dialog__step-header">
                           <div class="settings-dialog__step-title-row">
-                            <span class="settings-dialog__step-index">Step {{ stepIndex + 1 }}</span>
+                            <span class="settings-dialog__step-index">{{ formatStepLabel(stepIndex + 1) }}</span>
                             <select
                               class="settings-dialog__select settings-dialog__select--compact settings-dialog__step-select"
                               :value="step.type"
@@ -1068,9 +1163,9 @@ function handleShortcutCapture(shortcutId: string, event: KeyboardEvent) {
                                 ($event.target as HTMLSelectElement).value as TerminalCommandStep['type'],
                               )"
                             >
-                              <option value="write">Write</option>
-                              <option value="wait-for-prompt">Wait</option>
-                              <option value="delay">Delay</option>
+                              <option value="write">{{ tt('settings.commands.write') }}</option>
+                              <option value="wait-for-prompt">{{ tt('settings.commands.wait') }}</option>
+                              <option value="delay">{{ tt('settings.commands.delay') }}</option>
                             </select>
                           </div>
 
@@ -1079,8 +1174,8 @@ function handleShortcutCapture(shortcutId: string, event: KeyboardEvent) {
                               class="settings-dialog__icon-button settings-dialog__icon-button--danger"
                               type="button"
                               :disabled="preset.steps.length <= 1"
-                              :aria-label="`Remove step ${stepIndex + 1}`"
-                              :title="`Remove step ${stepIndex + 1}`"
+                              :aria-label="formatRemoveStepLabel(stepIndex + 1)"
+                              :title="formatRemoveStepLabel(stepIndex + 1)"
                               @click="removeStep(preset.id, step.id)"
                             >
                               <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -1094,7 +1189,7 @@ function handleShortcutCapture(shortcutId: string, event: KeyboardEvent) {
 
                         <template v-if="step.type === 'write'">
                           <label class="settings-dialog__field">
-                            <span class="settings-dialog__label">Text to send</span>
+                            <span class="settings-dialog__label">{{ tt('settings.commands.textToSend') }}</span>
                             <textarea
                               v-model="step.value"
                               class="settings-dialog__textarea"
@@ -1105,13 +1200,13 @@ function handleShortcutCapture(shortcutId: string, event: KeyboardEvent) {
 
                           <label class="settings-dialog__checkbox">
                             <input v-model="step.submit" type="checkbox">
-                            <span>Submit step with [Enter]</span>
+                            <span>{{ tt('settings.commands.submitEnter') }}</span>
                           </label>
                         </template>
 
                         <template v-else-if="step.type === 'wait-for-prompt'">
                           <label class="settings-dialog__field">
-                            <span class="settings-dialog__label">Prompt pattern</span>
+                            <span class="settings-dialog__label">{{ tt('settings.commands.promptPattern') }}</span>
                             <input
                               v-model="step.pattern"
                               class="settings-dialog__input"
@@ -1122,13 +1217,13 @@ function handleShortcutCapture(shortcutId: string, event: KeyboardEvent) {
                           </label>
 
                           <p class="settings-dialog__step-copy">
-                            Use a regular expression that matches the shell prompt before the next step runs.
+                            {{ tt('settings.commands.promptCopy') }}
                           </p>
                         </template>
 
                         <template v-else>
                           <label class="settings-dialog__field">
-                            <span class="settings-dialog__label">Delay in milliseconds</span>
+                            <span class="settings-dialog__label">{{ tt('settings.commands.delayMs') }}</span>
                             <input
                               v-model.number="step.delayMs"
                               class="settings-dialog__input"
@@ -1140,7 +1235,7 @@ function handleShortcutCapture(shortcutId: string, event: KeyboardEvent) {
                           </label>
 
                           <p class="settings-dialog__step-copy">
-                            Use delay only when prompt detection is not reliable enough.
+                            {{ tt('settings.commands.delayCopy') }}
                           </p>
                         </template>
                       </div>
@@ -1148,13 +1243,13 @@ function handleShortcutCapture(shortcutId: string, event: KeyboardEvent) {
 
                     <div class="settings-dialog__step-toolbar">
                       <button class="settings-dialog__button settings-dialog__button--ghost" type="button" @click="addStep(preset.id, 'write')">
-                        Add write
+                        {{ tt('settings.commands.addWrite') }}
                       </button>
                       <button class="settings-dialog__button settings-dialog__button--ghost" type="button" @click="addStep(preset.id, 'wait-for-prompt')">
-                        Add wait
+                        {{ tt('settings.commands.addWait') }}
                       </button>
                       <button class="settings-dialog__button settings-dialog__button--ghost" type="button" @click="addStep(preset.id, 'delay')">
-                        Add delay
+                        {{ tt('settings.commands.addDelay') }}
                       </button>
                     </div>
                   </div>
@@ -1165,18 +1260,18 @@ function handleShortcutCapture(shortcutId: string, event: KeyboardEvent) {
             <section v-show="activeSection === 'layout'" class="settings-dialog__section">
               <header class="settings-dialog__section-header">
                 <div>
-                  <p class="settings-dialog__section-eyebrow">Layout</p>
-                  <h3 class="settings-dialog__section-title">Repository and diff placement</h3>
+                  <p class="settings-dialog__section-eyebrow">{{ tt('settings.layout.eyebrow') }}</p>
+                  <h3 class="settings-dialog__section-title">{{ tt('settings.layout.title') }}</h3>
                 </div>
                 <p class="settings-dialog__section-copy">
-                  Choose where the repository panel sits and where the diff panel should open.
+                  {{ tt('settings.layout.copy') }}
                 </p>
               </header>
 
               <div class="settings-dialog__layout-group">
                 <div class="settings-dialog__layout-group-header">
-                  <span class="settings-dialog__hint-label">Repository panel</span>
-                  <p class="settings-dialog__layout-group-copy">Choose which side the repository panel uses.</p>
+                  <span class="settings-dialog__hint-label">{{ tt('settings.layout.repoPanel') }}</span>
+                  <p class="settings-dialog__layout-group-copy">{{ tt('settings.layout.repoPanelCopy') }}</p>
                 </div>
 
                 <div class="settings-dialog__layout-options settings-dialog__layout-options--two">
@@ -1185,8 +1280,8 @@ function handleShortcutCapture(shortcutId: string, event: KeyboardEvent) {
                     :class="{ 'settings-dialog__layout-card--active': draftSidebarSide === 'left' }"
                   >
                     <input v-model="draftSidebarSide" type="radio" value="left">
-                    <span class="settings-dialog__layout-title">Left</span>
-                    <span class="settings-dialog__layout-copy">Keep repository navigation on the left side.</span>
+                    <span class="settings-dialog__layout-title">{{ tt('common.left') }}</span>
+                    <span class="settings-dialog__layout-copy">{{ tt('settings.layout.repoLeftCopy') }}</span>
                   </label>
 
                   <label
@@ -1194,16 +1289,16 @@ function handleShortcutCapture(shortcutId: string, event: KeyboardEvent) {
                     :class="{ 'settings-dialog__layout-card--active': draftSidebarSide === 'right' }"
                   >
                     <input v-model="draftSidebarSide" type="radio" value="right">
-                    <span class="settings-dialog__layout-title">Right</span>
-                    <span class="settings-dialog__layout-copy">Move repository navigation to the right side.</span>
+                    <span class="settings-dialog__layout-title">{{ tt('common.right') }}</span>
+                    <span class="settings-dialog__layout-copy">{{ tt('settings.layout.repoRightCopy') }}</span>
                   </label>
                 </div>
               </div>
 
               <div class="settings-dialog__layout-group">
                 <div class="settings-dialog__layout-group-header">
-                  <span class="settings-dialog__hint-label">Diff panel</span>
-                  <p class="settings-dialog__layout-group-copy">Choose where the diff sits relative to tabs.</p>
+                  <span class="settings-dialog__hint-label">{{ tt('settings.layout.diffPanel') }}</span>
+                  <p class="settings-dialog__layout-group-copy">{{ tt('settings.layout.diffPanelCopy') }}</p>
                 </div>
 
                 <div class="settings-dialog__layout-options settings-dialog__layout-options--four">
@@ -1212,8 +1307,8 @@ function handleShortcutCapture(shortcutId: string, event: KeyboardEvent) {
                     :class="{ 'settings-dialog__layout-card--active': draftDiffPlacement === 'left' }"
                   >
                     <input v-model="draftDiffPlacement" type="radio" value="left">
-                    <span class="settings-dialog__layout-title">Left</span>
-                    <span class="settings-dialog__layout-copy">Diff on the left, tabs on the right.</span>
+                    <span class="settings-dialog__layout-title">{{ tt('common.left') }}</span>
+                    <span class="settings-dialog__layout-copy">{{ tt('settings.layout.diffLeftCopy') }}</span>
                   </label>
 
                   <label
@@ -1221,8 +1316,8 @@ function handleShortcutCapture(shortcutId: string, event: KeyboardEvent) {
                     :class="{ 'settings-dialog__layout-card--active': draftDiffPlacement === 'right' }"
                   >
                     <input v-model="draftDiffPlacement" type="radio" value="right">
-                    <span class="settings-dialog__layout-title">Right</span>
-                    <span class="settings-dialog__layout-copy">Diff on the right, tabs on the left.</span>
+                    <span class="settings-dialog__layout-title">{{ tt('common.right') }}</span>
+                    <span class="settings-dialog__layout-copy">{{ tt('settings.layout.diffRightCopy') }}</span>
                   </label>
 
                   <label
@@ -1230,8 +1325,8 @@ function handleShortcutCapture(shortcutId: string, event: KeyboardEvent) {
                     :class="{ 'settings-dialog__layout-card--active': draftDiffPlacement === 'top' }"
                   >
                     <input v-model="draftDiffPlacement" type="radio" value="top">
-                    <span class="settings-dialog__layout-title">Top</span>
-                    <span class="settings-dialog__layout-copy">Diff above tabs for vertically stacked work.</span>
+                    <span class="settings-dialog__layout-title">{{ tt('common.top') }}</span>
+                    <span class="settings-dialog__layout-copy">{{ tt('settings.layout.diffTopCopy') }}</span>
                   </label>
 
                   <label
@@ -1239,17 +1334,17 @@ function handleShortcutCapture(shortcutId: string, event: KeyboardEvent) {
                     :class="{ 'settings-dialog__layout-card--active': draftDiffPlacement === 'bottom' }"
                   >
                     <input v-model="draftDiffPlacement" type="radio" value="bottom">
-                    <span class="settings-dialog__layout-title">Bottom</span>
-                    <span class="settings-dialog__layout-copy">Diff below tabs for top-first browsing.</span>
+                    <span class="settings-dialog__layout-title">{{ tt('common.bottom') }}</span>
+                    <span class="settings-dialog__layout-copy">{{ tt('settings.layout.diffBottomCopy') }}</span>
                   </label>
                 </div>
               </div>
 
               <div class="settings-dialog__grid">
                 <div class="settings-dialog__hint-card">
-                  <span class="settings-dialog__hint-label">Application</span>
+                  <span class="settings-dialog__hint-label">{{ tt('settings.layout.application') }}</span>
                   <div class="settings-dialog__field">
-                    <span class="settings-dialog__label">Appearance</span>
+                    <span class="settings-dialog__label">{{ tt('settings.layout.appearance') }}</span>
                     <select v-model="draftAppAppearance" class="settings-dialog__select">
                       <option
                         v-for="option in APP_APPEARANCE_OPTIONS"
@@ -1269,21 +1364,21 @@ function handleShortcutCapture(shortcutId: string, event: KeyboardEvent) {
                     :data-preview-editor-theme="resolvedPreviewEditorTheme"
                   >
                     <div class="settings-dialog__preview-header">
-                      <span class="settings-dialog__preview-eyebrow">Theme preview</span>
+                      <span class="settings-dialog__preview-eyebrow">{{ tt('settings.layout.themePreview') }}</span>
                       <span class="settings-dialog__preview-meta">
-                        {{ draftEditorTheme === 'follow-app' ? 'Editor follows app' : 'Editor override' }}
+                        {{ draftEditorTheme === 'follow-app' ? tt('settings.layout.editorFollows') : tt('settings.layout.editorOverride') }}
                       </span>
                     </div>
                     <div class="settings-dialog__theme-preview">
                       <div class="settings-dialog__theme-preview-tabs">
-                        <span class="settings-dialog__theme-tab settings-dialog__theme-tab--active">Notes</span>
-                        <span class="settings-dialog__theme-tab">Shell</span>
-                        <span class="settings-dialog__theme-tab">Code</span>
+                        <span class="settings-dialog__theme-tab settings-dialog__theme-tab--active">{{ tt('settings.layout.notes') }}</span>
+                        <span class="settings-dialog__theme-tab">{{ tt('settings.layout.shell') }}</span>
+                        <span class="settings-dialog__theme-tab">{{ tt('settings.layout.code') }}</span>
                       </div>
                       <div class="settings-dialog__theme-preview-actions">
                         <span class="settings-dialog__theme-button settings-dialog__theme-button--icon">+</span>
                         <span class="settings-dialog__theme-button settings-dialog__theme-button--icon">⚙</span>
-                        <span class="settings-dialog__theme-button settings-dialog__theme-button--active">Save</span>
+                        <span class="settings-dialog__theme-button settings-dialog__theme-button--active">{{ tt('common.save') }}</span>
                       </div>
                       <div class="settings-dialog__theme-preview-editor">
                         <span class="settings-dialog__theme-preview-line settings-dialog__theme-preview-line--keyword">const</span>
@@ -1295,9 +1390,9 @@ function handleShortcutCapture(shortcutId: string, event: KeyboardEvent) {
                 </div>
 
                 <div class="settings-dialog__hint-card">
-                  <span class="settings-dialog__hint-label">Editor</span>
+                  <span class="settings-dialog__hint-label">{{ tt('settings.layout.editor') }}</span>
                   <div class="settings-dialog__field">
-                    <span class="settings-dialog__label">Code tab theme</span>
+                    <span class="settings-dialog__label">{{ tt('settings.layout.codeTabTheme') }}</span>
                     <select v-model="draftEditorTheme" class="settings-dialog__select">
                       <option
                         v-for="option in EDITOR_THEME_OPTIONS"
@@ -1315,9 +1410,9 @@ function handleShortcutCapture(shortcutId: string, event: KeyboardEvent) {
               </div>
 
               <div class="settings-dialog__hint-card">
-                <span class="settings-dialog__hint-label">New tabs</span>
+                <span class="settings-dialog__hint-label">{{ tt('settings.layout.newTabs') }}</span>
                 <label class="settings-dialog__field">
-                  <span class="settings-dialog__label">Default font size for shell, note and code</span>
+                  <span class="settings-dialog__label">{{ tt('settings.layout.defaultFontSize') }}</span>
                   <input
                     v-model.number="draftUnifiedWorkspaceTabFontSize"
                     class="settings-dialog__input"
@@ -1335,28 +1430,28 @@ function handleShortcutCapture(shortcutId: string, event: KeyboardEvent) {
                   :data-preview-editor-theme="resolvedPreviewEditorTheme"
                 >
                   <div class="settings-dialog__preview-header">
-                    <span class="settings-dialog__preview-eyebrow">Preview</span>
+                    <span class="settings-dialog__preview-eyebrow">{{ tt('settings.layout.preview') }}</span>
                     <span class="settings-dialog__preview-meta">{{ draftUnifiedWorkspaceTabFontSize }} px</span>
                   </div>
                   <div class="settings-dialog__preview-surface settings-dialog__preview-surface--stacked">
-                    <span class="settings-dialog__preview-label">Shell · Note · Code</span>
+                    <span class="settings-dialog__preview-label">{{ tt('settings.layout.previewTabTypes') }}</span>
                     <code class="settings-dialog__preview-code">$ git status</code>
                     <code class="settings-dialog__preview-code"># Release checklist</code>
                     <code class="settings-dialog__preview-code">const bridge = 'ready';</code>
                   </div>
                 </div>
                 <p class="settings-dialog__hint-copy">
-                  Used for newly created shell, note and code tabs. Existing tabs keep their current zoom from <code>Ctrl + wheel</code>.
+                  {{ tt('settings.layout.newTabsCopy') }}
                 </p>
               </div>
 
               <div class="settings-dialog__hint-card">
-                <span class="settings-dialog__hint-label">Notes</span>
+                <span class="settings-dialog__hint-label">{{ tt('settings.layout.notes') }}</span>
                 <label class="settings-dialog__field">
-                  <span class="settings-dialog__label">Default note open mode</span>
+                  <span class="settings-dialog__label">{{ tt('settings.layout.noteMode') }}</span>
                   <select v-model="draftWorkspaceTabDefaults.noteViewMode" class="settings-dialog__select">
                     <option
-                      v-for="option in NOTE_VIEW_MODE_OPTIONS"
+                      v-for="option in noteViewModeOptions"
                       :key="option.value"
                       :value="option.value"
                     >
@@ -1365,21 +1460,25 @@ function handleShortcutCapture(shortcutId: string, event: KeyboardEvent) {
                   </select>
                 </label>
                 <p class="settings-dialog__hint-copy">
-                  {{ NOTE_VIEW_MODE_OPTIONS.find((option) => option.value === draftWorkspaceTabDefaults.noteViewMode)?.copy }}
+                  {{ noteViewModeOptions.find((option) => option.value === draftWorkspaceTabDefaults.noteViewMode)?.copy }}
                 </p>
                 <label class="settings-dialog__checkbox">
                   <input v-model="draftWorkspaceTabDefaults.noteLineNumbers" type="checkbox">
-                  <span>Show line numbers in notes by default</span>
+                  <span>{{ tt('settings.layout.noteLineNumbers') }}</span>
+                </label>
+                <label class="settings-dialog__checkbox">
+                  <input v-model="draftWorkspaceTabDefaults.noteLineWrapping" type="checkbox">
+                  <span>{{ tt('settings.layout.noteLineWrapping') }}</span>
                 </label>
                 <p class="settings-dialog__hint-copy">
-                  New notes tabs use this open mode. The line-number toggle also applies to currently open notes editors.
+                  {{ tt('settings.layout.noteCopy') }}
                 </p>
               </div>
 
               <div class="settings-dialog__hint-card">
-                <span class="settings-dialog__hint-label">Workspace panel</span>
+                <span class="settings-dialog__hint-label">{{ tt('settings.layout.workspacePanel') }}</span>
                 <label class="settings-dialog__field">
-                  <span class="settings-dialog__label">Workspace panel font size</span>
+                  <span class="settings-dialog__label">{{ tt('settings.layout.workspacePanelFont') }}</span>
                   <input
                     v-model.number="draftWorkspacePanelFontSize"
                     class="settings-dialog__input"
@@ -1396,18 +1495,18 @@ function handleShortcutCapture(shortcutId: string, event: KeyboardEvent) {
                   :data-preview-appearance="draftAppAppearance"
                 >
                   <div class="settings-dialog__preview-header">
-                    <span class="settings-dialog__preview-eyebrow">Preview</span>
+                    <span class="settings-dialog__preview-eyebrow">{{ tt('settings.layout.preview') }}</span>
                     <span class="settings-dialog__preview-meta">{{ draftWorkspacePanelFontSize }} px</span>
                   </div>
                   <div class="settings-dialog__preview-surface settings-dialog__preview-surface--stacked">
-                    <span class="settings-dialog__preview-label">Repository · Workspaces · Files</span>
+                    <span class="settings-dialog__preview-label">{{ tt('settings.layout.previewWorkspaceItems') }}</span>
                     <code class="settings-dialog__preview-code">BridgeGit</code>
                     <code class="settings-dialog__preview-code">feature/editor-theme · 3 / 1 / 0</code>
                     <code class="settings-dialog__preview-code">src/renderer/components/RepoPanel.vue</code>
                   </div>
                 </div>
                 <p class="settings-dialog__hint-copy">
-                  Controls the left repository/workspace panel. You can also adjust it directly with <code>Ctrl + wheel</code> over the sidebar.
+                  {{ tt('settings.layout.workspacePanelCopy') }}
                 </p>
               </div>
             </section>
@@ -2398,6 +2497,16 @@ function handleShortcutCapture(shortcutId: string, event: KeyboardEvent) {
   border: 1px solid rgba(108, 124, 148, 0.14);
   border-radius: 14px;
   background: var(--settings-card-bg);
+}
+
+.settings-dialog__checkbox--stacked-card {
+  flex-wrap: nowrap;
+  justify-content: flex-start;
+}
+
+.settings-dialog__checkbox--stacked-card .settings-dialog__checkbox-content {
+  min-width: 0;
+  flex: 1 1 auto;
 }
 
 .settings-dialog__checkbox-toggle {

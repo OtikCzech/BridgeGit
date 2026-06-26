@@ -1,15 +1,18 @@
 <script setup lang="ts">
-import type { DockerTabActiveView } from '../../shared/bridgegit';
+import type { AppLanguage, DockerTabActiveView } from '../../shared/bridgegit';
+import { t } from '../i18n';
 import DockerTabView from './DockerTabView.vue';
 
 interface Props {
   modelValue: boolean;
+  appLanguage: AppLanguage;
   activeView: DockerTabActiveView;
   expandedGroupIds: string[];
   projectRoot: string | null;
 }
 
 const props = defineProps<Props>();
+const tt = (key: string, params?: Record<string, string | number>) => t(props.appLanguage, key, params);
 
 const emit = defineEmits<{
   'update:modelValue': [value: boolean];
@@ -33,17 +36,17 @@ function closeDialog() {
       class="docker-dialog__panel"
       role="dialog"
       aria-modal="true"
-      aria-label="Docker"
+      :aria-label="tt('docker.title')"
     >
       <header class="docker-dialog__header">
         <div class="docker-dialog__heading">
-          <h2 class="docker-dialog__title">Docker</h2>
+          <h2 class="docker-dialog__title">{{ tt('docker.title') }}</h2>
         </div>
 
         <button
           type="button"
           class="docker-dialog__close"
-          aria-label="Close Docker dialog"
+          :aria-label="tt('docker.close')"
           @click="closeDialog"
         >
           ×
@@ -53,6 +56,7 @@ function closeDialog() {
       <div class="docker-dialog__body">
         <DockerTabView
           :active="modelValue"
+          :app-language="appLanguage"
           :active-view="props.activeView"
           :expanded-group-ids="props.expandedGroupIds"
           :project-root="projectRoot"

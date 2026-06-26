@@ -8,7 +8,9 @@ import {
   GLOBAL_WORKSPACE_ID,
   GLOBAL_WORKSPACE_SESSION_KEY,
   type ClipboardHistoryEntry,
+  type ClipboardBehaviorSettings,
   getDefaultTerminalCommandPresets,
+  normalizeAppLanguage,
   normalizeAppAppearance,
   normalizeEditorTheme,
   normalizeNoteFontSize,
@@ -68,6 +70,11 @@ interface PartialShortcutOverride {
   alt?: boolean;
   shift?: boolean;
   ctrlOrMeta?: boolean;
+}
+
+interface PartialClipboardBehaviorSettings {
+  rightClickPaste?: boolean;
+  selectionAutoCopy?: boolean;
 }
 
 interface LegacyTerminalTabState {
@@ -1110,6 +1117,7 @@ function normalizeWorkspaceTabDefaults(
     noteFontSize: normalizeNoteFontSize(workspaceTabDefaults?.noteFontSize),
     noteViewMode: normalizeNoteTabViewMode(workspaceTabDefaults?.noteViewMode),
     noteLineNumbers: workspaceTabDefaults?.noteLineNumbers !== false,
+    noteLineWrapping: workspaceTabDefaults?.noteLineWrapping !== false,
   };
 }
 
@@ -1266,6 +1274,9 @@ function normalizeSession(session: LegacySessionData): SessionData {
     activity: session.workspaceIndicatorVisibility?.activity ?? DEFAULT_SESSION_DATA.workspaceIndicatorVisibility.activity,
     attention: session.workspaceIndicatorVisibility?.attention ?? DEFAULT_SESSION_DATA.workspaceIndicatorVisibility.attention,
   };
+  const clipboardBehavior = normalizeClipboardBehavior(
+    session.clipboardBehavior as PartialClipboardBehaviorSettings | undefined,
+  );
 
   return {
     persistenceRevision,
@@ -1282,10 +1293,12 @@ function normalizeSession(session: LegacySessionData): SessionData {
     projectTitle,
     projectTitleMode,
     projectTitlesByContext,
+    appLanguage: normalizeAppLanguage(session.appLanguage),
     appAppearance: normalizeAppAppearance(session.appAppearance),
     editorTheme: normalizeEditorTheme(session.editorTheme),
     shortcutOverrides: normalizeShortcutOverrides(session.shortcutOverrides as Record<string, PartialShortcutOverride> | undefined),
     workspaceIndicatorVisibility,
+    clipboardBehavior,
     workspaceTabDefaults,
     worktreeDetectionIntervalMs: normalizeWorktreeDetectionInterval(session.worktreeDetectionIntervalMs),
     dismissedWorktreePaths: normalizeDismissedWorktreePaths(session.dismissedWorktreePaths),
@@ -1300,6 +1313,15 @@ function normalizeSession(session: LegacySessionData): SessionData {
     terminalCommandPresets,
     dockerDialogState: normalizeDockerDialogState(session.dockerDialogState),
     workspaceSessions,
+  };
+}
+
+function normalizeClipboardBehavior(
+  clipboardBehavior: PartialClipboardBehaviorSettings | undefined,
+): ClipboardBehaviorSettings {
+  return {
+    rightClickPaste: clipboardBehavior?.rightClickPaste ?? DEFAULT_SESSION_DATA.clipboardBehavior.rightClickPaste,
+    selectionAutoCopy: clipboardBehavior?.selectionAutoCopy ?? DEFAULT_SESSION_DATA.clipboardBehavior.selectionAutoCopy,
   };
 }
 

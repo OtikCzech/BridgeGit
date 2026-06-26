@@ -12,6 +12,7 @@ import {
 } from 'vue';
 import type {
   AppAppearance,
+  AppLanguage,
   CodeNavigationRequest,
   CodeNavigationTarget,
   GitTextSearchMatch,
@@ -38,6 +39,7 @@ import {
 } from '../../shared/bridgegit';
 import { useColumnSplitter } from '../composables/useColumnSplitter';
 import { useTerminal } from '../composables/useTerminal';
+import { t } from '../i18n';
 import { SHORTCUTS, formatCommandSlotShortcut, shortcutBindingsRevision } from '../shortcuts';
 import { playNotificationBeep } from '../utils/notification-audio';
 import AppConfirmDialog from './AppConfirmDialog.vue';
@@ -58,6 +60,7 @@ interface WorkspaceNavigationTarget extends CodeNavigationTarget {
 
 interface Props {
   workspaceId: string;
+  appLanguage: AppLanguage;
   cwd: string;
   projectRoot: string | null;
   appearanceTheme: AppAppearance;
@@ -65,6 +68,8 @@ interface Props {
   editorThemeVariant: ThemeVariant;
   editorTheme: ResolvedEditorTheme;
   presets: TerminalCommandPreset[];
+  rightClickPasteEnabled: boolean;
+  selectionAutoCopyEnabled: boolean;
   soundNotificationsEnabled: boolean;
   workspaceTabDefaults: WorkspaceTabDefaults;
   tabs: WorkspaceTabState[];
@@ -80,15 +85,16 @@ interface Props {
 
 const props = defineProps<Props>();
 const shortcutBindingsVersion = shortcutBindingsRevision;
+const tt = (key: string, params?: Record<string, string | number>) => t(props.appLanguage, key, params);
 const CREATION_MENU_ACTION_ORDER = ['shell', 'note', 'open-file'] as const;
 type FindInFilesMode = 'find' | 'replace';
 type CreationMenuActionId = (typeof CREATION_MENU_ACTION_ORDER)[number];
 type MultiDisplayTabState = WorkspaceShellTabState | WorkspaceNoteTabState | WorkspaceCodeTabState;
 const ALL_TABS_TYPE_FILTER_OPTIONS = [
-  { value: 'all', label: 'All' },
-  { value: 'shell', label: 'Shell' },
-  { value: 'note', label: 'Notes' },
-  { value: 'code', label: 'Code' },
+  { value: 'all', key: 'terminal.tabs.type.all' },
+  { value: 'shell', key: 'terminal.tabs.type.shell' },
+  { value: 'note', key: 'terminal.tabs.type.notes' },
+  { value: 'code', key: 'terminal.tabs.type.code' },
 ] as const;
 type AllTabsTypeFilterValue = (typeof ALL_TABS_TYPE_FILTER_OPTIONS)[number]['value'];
 
@@ -241,10 +247,10 @@ const findInFilesDialogStyle = computed(() => ({
   '--terminal-panel-find-result-font-size-px': String(normalizeNoteFontSize(props.workspaceTabDefaults.noteFontSize)),
 }));
 const findInFilesDialogTitle = computed(() => (
-  findInFilesMode.value === 'replace' ? 'Replace in Files' : 'Find in Files'
+  findInFilesMode.value === 'replace' ? tt('terminal.find.replaceTitle') : tt('terminal.find.title')
 ));
 const findInFilesDialogLabel = computed(() => (
-  findInFilesMode.value === 'replace' ? 'Replace in files' : 'Find in files'
+  findInFilesMode.value === 'replace' ? tt('terminal.find.replaceLabel') : tt('terminal.find.label')
 ));
 const sortedPresets = computed(() => (
   [...props.presets].sort((left, right) => {
@@ -324,8 +330,8 @@ function editorPaneGridRow(row: number): string {
 }
 const collapseButtonTitle = computed(() => (
   props.canCollapse
-    ? `Collapse tabs panel ${props.collapseShortcutDisplay}`
-    : 'Tabs panel cannot be collapsed while it is the last visible panel'
+    ? tt('terminal.collapseTitle', { shortcut: props.collapseShortcutDisplay })
+    : tt('terminal.cannotCollapse')
 ));
 const creationMenuActions = computed(() => {
   shortcutBindingsRevision.value;
@@ -333,19 +339,19 @@ const creationMenuActions = computed(() => {
   return [
     {
       id: 'shell' as const,
-      label: 'New shell tab',
+      label: tt('terminal.newShellTab'),
       shortcutDisplay: SHORTCUTS.terminalNewTab.display,
       key: 's',
     },
     {
       id: 'note' as const,
-      label: 'New notes tab',
+      label: tt('terminal.newNotesTab'),
       shortcutDisplay: SHORTCUTS.workspaceNoteTab.display,
       key: 'n',
     },
     {
       id: 'open-file' as const,
-      label: 'Open file',
+      label: tt('code.openFile'),
       shortcutDisplay: SHORTCUTS.workspaceOpenFile.display,
       key: 'o',
     },
@@ -382,7 +388,7 @@ const allTabsResults = computed(() => {
     .filter((entry) => !normalizedQuery || entry.searchText.includes(normalizedQuery));
 });
 const activeAllTabsTypeFilterLabel = computed(() => (
-  ALL_TABS_TYPE_FILTER_OPTIONS.find((option) => option.value === allTabsTypeFilter.value)?.label ?? 'All'
+  tt(ALL_TABS_TYPE_FILTER_OPTIONS.find((option) => option.value === allTabsTypeFilter.value)?.key ?? 'terminal.tabs.type.all')
 ));
 const pendingCloseDialogEyebrow = computed(() => {
   const dialog = pendingCloseDialog.value;
@@ -393,19 +399,19 @@ const pendingCloseDialogEyebrow = computed(() => {
 
   if (dialog.mode === 'bulk') {
     if (dialog.dirtyCount > 0) {
-      return 'Unsaved changes';
+      return tt('terminal.unsavedChanges');
     }
 
     if (dialog.shellPendingCount > 0) {
-      return 'Running command';
+      return tt('terminal.runningCommand');
     }
 
-    return dialog.shellAttentionCount > 0 ? 'Shell attention' : 'Shell activity';
+    return dialog.shellAttentionCount > 0 ? tt('terminal.shellAttention') : tt('terminal.shellActivity');
   }
 
   return dialog.kind === 'shell'
-    ? (dialog.hasPendingCommand ? 'Running command' : 'Shell activity')
-    : (dialog.kind === 'code' ? 'Unsaved file' : 'Unsaved note');
+    ? (dialog.hasPendingCommand ? tt('terminal.runningCommand') : tt('terminal.shellActivity'))
+    : (dialog.kind === 'code' ? tt('terminal.unsavedFile') : tt('terminal.unsavedNote'));
 });
 const pendingCloseDialogTitle = computed(() => {
   const dialog = pendingCloseDialog.value;
@@ -416,7 +422,7 @@ const pendingCloseDialogTitle = computed(() => {
 
   return dialog.mode === 'bulk'
     ? dialog.title
-    : `Close ${dialog.title}?`;
+    : tt('terminal.closeTitleQuestion', { title: dialog.title });
 });
 const pendingCloseDialogCopy = computed(() => {
   const dialog = pendingCloseDialog.value;
@@ -428,15 +434,15 @@ const pendingCloseDialogCopy = computed(() => {
   if (dialog.mode === 'single') {
     return dialog.kind === 'note'
       ? (dialog.hasSavedFile
-        ? 'This note has unsaved changes. Save it before closing, save a copy under a new file name, or discard the changes.'
-        : 'This scratch note has unsaved changes. Save it before closing or discard the changes.')
+        ? tt('terminal.closeUnsavedNote')
+        : tt('terminal.closeUnsavedScratchNote'))
       : dialog.kind === 'code'
-        ? 'This file has unsaved changes. Save it before closing, save a copy under a new file name, or discard the changes.'
+        ? tt('terminal.closeUnsavedFile')
         : (dialog.hasPendingCommand
-          ? 'A shell command still looks active. Close this tab anyway?'
+          ? tt('terminal.closePendingShell')
           : dialog.hasAttention
-          ? 'This shell tab still needs attention. Close it anyway?'
-          : 'This shell tab still shows recent activity. Close it anyway?');
+          ? tt('terminal.closeAttentionShell')
+          : tt('terminal.closeActiveShell'));
   }
 
   const warnings: string[] = [];
@@ -444,40 +450,40 @@ const pendingCloseDialogCopy = computed(() => {
   if (dialog.dirtyCount > 0) {
     warnings.push(
       dialog.dirtyCount === 1
-        ? '1 tab has unsaved changes'
-        : `${dialog.dirtyCount} tabs have unsaved changes`,
+        ? tt('terminal.warningOneDirty')
+        : tt('terminal.warningDirtyCount', { count: dialog.dirtyCount }),
     );
   }
 
   if (dialog.shellAttentionCount > 0) {
     warnings.push(
       dialog.shellAttentionCount === 1
-        ? '1 shell tab still needs attention'
-        : `${dialog.shellAttentionCount} shell tabs still need attention`,
+        ? tt('terminal.warningOneAttention')
+        : tt('terminal.warningAttentionCount', { count: dialog.shellAttentionCount }),
     );
   }
 
   if (dialog.shellPendingCount > 0) {
     warnings.push(
       dialog.shellPendingCount === 1
-        ? '1 shell tab still looks active'
-        : `${dialog.shellPendingCount} shell tabs still look active`,
+        ? tt('terminal.warningOnePending')
+        : tt('terminal.warningPendingCount', { count: dialog.shellPendingCount }),
     );
   }
 
   if (dialog.shellActivityCount > 0) {
     warnings.push(
       dialog.shellActivityCount === 1
-        ? '1 shell tab still shows recent activity'
-        : `${dialog.shellActivityCount} shell tabs still show recent activity`,
+        ? tt('terminal.warningOneActivity')
+        : tt('terminal.warningActivityCount', { count: dialog.shellActivityCount }),
     );
   }
 
   if (!warnings.length) {
-    return 'Close selected tabs?';
+    return tt('terminal.closeSelectedTabs');
   }
 
-  return `${warnings.join(' and ')}. Close them anyway?`;
+  return tt('terminal.closeWarningsAnyway', { warnings: warnings.join(` ${tt('terminal.and')} `) });
 });
 const pendingCloseDialogCanSave = computed(() => {
   const dialog = pendingCloseDialog.value;
@@ -491,16 +497,16 @@ const pendingCloseDialogCanSaveAs = computed(() => {
   return Boolean(dialog && dialog.mode === 'single' && dialog.kind !== 'shell' && dialog.hasSavedFile);
 });
 const pendingCloseDialogSaveLabel = computed(() => (
-  pendingCloseDialog.value?.mode === 'bulk' ? 'Save all' : 'Save'
+  pendingCloseDialog.value?.mode === 'bulk' ? tt('terminal.saveAll') : tt('common.save')
 ));
 const pendingCloseDialogDiscardLabel = computed(() => {
   const dialog = pendingCloseDialog.value;
 
   if (!dialog) {
-    return 'Discard';
+    return tt('terminal.discard');
   }
 
-  return dialog.mode === 'bulk' || dialog.kind === 'shell' ? 'Close anyway' : 'Discard';
+  return dialog.mode === 'bulk' || dialog.kind === 'shell' ? tt('terminal.closeAnyway') : tt('terminal.discard');
 });
 const pendingCloseDialogActions = computed(() => {
   const actions: Array<{ id: string; label: string; tone?: 'default' | 'primary' | 'danger' }> = [];
@@ -515,7 +521,7 @@ const pendingCloseDialogActions = computed(() => {
     if (pendingCloseDialogCanSaveAs.value) {
       actions.push({
         id: 'saveAs',
-        label: 'Save As',
+        label: tt('terminal.saveAs'),
       });
     }
   }
@@ -527,7 +533,7 @@ const pendingCloseDialogActions = computed(() => {
   });
   actions.push({
     id: 'cancel',
-    label: 'Cancel',
+    label: tt('common.cancel'),
   });
 
   return actions;
@@ -540,8 +546,8 @@ const pendingFindInFilesReplaceDialogTitle = computed(() => {
   }
 
   return dialog.scope === 'document'
-    ? 'Replace in document?'
-    : 'Replace all?';
+    ? tt('terminal.replaceInDocumentQuestion')
+    : tt('terminal.replaceAllQuestion');
 });
 const pendingFindInFilesReplaceDialogCopy = computed(() => {
   const dialog = pendingFindInFilesReplaceDialog.value;
@@ -550,20 +556,17 @@ const pendingFindInFilesReplaceDialogCopy = computed(() => {
     return '';
   }
 
-  const matchLabel = dialog.matchCount === 1 ? 'match' : 'matches';
-  const fileLabel = dialog.fileCount === 1 ? 'file' : 'files';
-
-  return `${dialog.matchCount} ${matchLabel} in ${dialog.fileCount} ${fileLabel}.`;
+  return tt('terminal.replaceDialogCopy', { matches: dialog.matchCount, files: dialog.fileCount });
 });
 const pendingFindInFilesReplaceDialogActions = computed(() => ([
   {
     id: 'confirm',
-    label: 'Replace',
+    label: tt('terminal.replace'),
     tone: 'danger' as const,
   },
   {
     id: 'cancel',
-    label: 'Cancel',
+    label: tt('common.cancel'),
   },
 ]));
 const quickOpenProjectKey = computed(() => getQuickOpenProjectKey());
@@ -602,30 +605,30 @@ const isQuickOpenFileListLoading = computed(() => {
 });
 const quickOpenMeta = computed(() => {
   if (!props.projectRoot) {
-    return 'Open a repository to search files.';
+    return tt('terminal.quickOpenNoRepo');
   }
 
   if (!quickOpenSearchQuery.value.trim()) {
     if (isQuickOpenFileListLoading.value && !quickOpenRecentFilePaths.value.length) {
-      return 'Indexing repository files for quick open…';
+      return tt('terminal.quickOpenIndexing');
     }
 
     if (quickOpenRecentFilePaths.value.length || quickOpenRecentQueries.value.length) {
-      return 'Recent files and searches for the current repository.';
+      return tt('terminal.quickOpenRecentMeta');
     }
 
-    return 'Search file paths in the current repository.';
+    return tt('terminal.quickOpenSearchMeta');
   }
 
   if (isSearchingQuickOpen.value && !quickOpenResults.value.length) {
-    return isQuickOpenFileListLoading.value ? 'Indexing files…' : 'Searching…';
+    return isQuickOpenFileListLoading.value ? tt('terminal.indexingFiles') : tt('terminal.searching');
   }
 
   if (quickOpenTotalResultCount.value > quickOpenResults.value.length) {
-    return `${quickOpenTotalResultCount.value.toLocaleString()} matches, showing first ${quickOpenResults.value.length.toLocaleString()}`;
+    return tt('terminal.matchesShowingFirst', { total: quickOpenTotalResultCount.value.toLocaleString(), shown: quickOpenResults.value.length.toLocaleString() });
   }
 
-  return `${quickOpenTotalResultCount.value.toLocaleString()} matches`;
+  return tt('terminal.matches', { count: quickOpenTotalResultCount.value.toLocaleString() });
 });
 const quickOpenEmptyState = computed(() => {
   if (quickOpenError.value) {
@@ -637,15 +640,15 @@ const quickOpenEmptyState = computed(() => {
   }
 
   if (quickOpenSearchQuery.value.trim()) {
-    return 'No files match the current search.';
+    return tt('terminal.noFilesMatch');
   }
 
   if (isQuickOpenFileListLoading.value) {
-    return 'Indexing repository files for quick open…';
+    return tt('terminal.quickOpenIndexing');
   }
 
   if (quickOpenRecentQueries.value.length) {
-    return 'Use a recent search or start typing to search repository files.';
+    return tt('terminal.useRecentOrType');
   }
 
   return quickOpenMeta.value;
@@ -685,27 +688,34 @@ const findInFilesMeta = computed(() => {
   }
 
   if (!props.projectRoot) {
-    return 'Open a repository to search text across files.';
+    return tt('terminal.findNoRepo');
   }
 
   if (!findInFilesSearchQuery.value.trim()) {
-    return 'Search text in the current repository.';
+    return tt('terminal.findSearchMeta');
   }
 
   if (isSearchingFindInFiles.value && !findInFilesResults.value.length) {
-    return 'Searching repository files…';
+    return tt('terminal.searchingRepositoryFiles');
   }
 
   const fileCount = new Set(findInFilesResults.value.map((match) => match.path)).size;
 
   if (findInFilesResults.value.length > findInFilesVisibleResults.value.length) {
-    return `${findInFilesResults.value.length.toLocaleString()} matches in ${fileCount.toLocaleString()} files, showing first ${findInFilesVisibleResults.value.length.toLocaleString()}`;
+    return tt('terminal.matchesInFilesShowingFirst', {
+      matches: findInFilesResults.value.length.toLocaleString(),
+      files: fileCount.toLocaleString(),
+      shown: findInFilesVisibleResults.value.length.toLocaleString(),
+    });
   }
 
-  return `${findInFilesResults.value.length.toLocaleString()} matches in ${fileCount.toLocaleString()} files`;
+  return tt('terminal.matchesInFiles', {
+    matches: findInFilesResults.value.length.toLocaleString(),
+    files: fileCount.toLocaleString(),
+  });
 });
 const findInFilesScopeLabel = computed(() => (
-  findInFilesIncludeUntracked.value ? 'With untracked' : 'Tracked only'
+  findInFilesIncludeUntracked.value ? tt('terminal.withUntracked') : tt('terminal.trackedOnly')
 ));
 const canReplaceSelectedFindInFilesMatch = computed(() => (
   findInFilesMode.value === 'replace'
@@ -746,10 +756,10 @@ const findInFilesEmptyState = computed(() => {
 
   if (findInFilesSearchQuery.value.trim()) {
     if (isSearchingFindInFiles.value) {
-      return 'Searching repository files…';
+      return tt('terminal.searchingRepositoryFiles');
     }
 
-    return 'No matches found for the current search.';
+    return tt('terminal.noMatchesFound');
   }
 
   return findInFilesMeta.value;
@@ -764,14 +774,18 @@ const findInFilesPreviewMeta = computed(() => {
   }
 
   if (isLoadingFindInFilesPreview.value) {
-    return 'Loading preview…';
+    return tt('terminal.loadingPreview');
   }
 
   if (!selectedFindInFilesMatch.value) {
-    return 'Select a result to preview matching lines.';
+    return tt('terminal.selectResultPreview');
   }
 
-  return `${findInFilesPreviewPath.value ?? selectedFindInFilesMatch.value.path} • line ${selectedFindInFilesMatch.value.line}:${selectedFindInFilesMatch.value.column}`;
+  return tt('terminal.previewLineMeta', {
+    path: findInFilesPreviewPath.value ?? selectedFindInFilesMatch.value.path,
+    line: selectedFindInFilesMatch.value.line,
+    column: selectedFindInFilesMatch.value.column,
+  });
 });
 
 function isShellTab(tab: WorkspaceTabState): tab is WorkspaceShellTabState {
@@ -2086,20 +2100,20 @@ function tabTitleTooltip(tab: WorkspaceTabState) {
   }
 
   return isEditableTabDirty(tab)
-    ? `${tab.filePath}\nUnsaved changes`
+    ? `${tab.filePath}\n${tt('terminal.unsavedChanges')}`
     : tab.filePath;
 }
 
 function getTabTypeLabel(tab: WorkspaceTabState) {
   if (isShellTab(tab)) {
-    return 'Shell';
+    return tt('terminal.tabs.type.shell');
   }
 
   if (isNoteTab(tab)) {
-    return 'Notes';
+    return tt('terminal.tabs.type.notes');
   }
 
-  return 'Code';
+  return tt('terminal.tabs.type.code');
 }
 
 function getTabSecondaryMeta(tab: WorkspaceTabState) {
@@ -3707,7 +3721,7 @@ async function runQuickOpenSearch(query: string) {
 
     quickOpenResults.value = [];
     quickOpenTotalResultCount.value = 0;
-    quickOpenError.value = error instanceof Error ? error.message : 'Failed to search files.';
+    quickOpenError.value = error instanceof Error ? error.message : tt('terminal.failedSearchFiles');
   } finally {
     if (props.projectRoot === expectedProjectRoot && requestToken === quickOpenSearchToken) {
       isSearchingQuickOpen.value = false;
@@ -3795,7 +3809,7 @@ async function runFindInFilesSearch(query: string) {
 
     findInFilesResults.value = [];
     findInFilesSelectedMatchKey.value = null;
-    findInFilesError.value = error instanceof Error ? error.message : 'Failed to search files.';
+    findInFilesError.value = error instanceof Error ? error.message : tt('terminal.failedSearchFiles');
   } finally {
     if (props.projectRoot === expectedProjectRoot && requestToken === findInFilesSearchToken) {
       isSearchingFindInFiles.value = false;
@@ -3923,7 +3937,7 @@ async function loadFindInFilesPreview(matchKey: string | null) {
     }
 
     findInFilesPreviewLines.value = [];
-    findInFilesPreviewError.value = error instanceof Error ? error.message : 'Failed to load preview.';
+    findInFilesPreviewError.value = error instanceof Error ? error.message : tt('terminal.failedLoadPreview');
   } finally {
     if (token === findInFilesPreviewToken) {
       isLoadingFindInFilesPreview.value = false;
@@ -4033,12 +4047,12 @@ async function replaceFindInFilesMatches(matches: GitTextSearchMatch[]) {
   const query = findInFilesSearchQuery.value.trim();
 
   if (!query) {
-    findInFilesError.value = 'Enter search text first.';
+    findInFilesError.value = tt('terminal.enterSearchTextFirst');
     return false;
   }
 
   if (!matches.length) {
-    findInFilesError.value = 'No matches available for replace.';
+    findInFilesError.value = tt('terminal.noMatchesForReplace');
     return false;
   }
 
@@ -4052,8 +4066,8 @@ async function replaceFindInFilesMatches(matches: GitTextSearchMatch[]) {
     )];
 
     findInFilesError.value = blockedFiles.length === 1
-      ? `Save or reload the dirty tab for ${formatFindInFilesFileList(blockedFiles)} before replace.`
-      : `Save or reload dirty tabs before replace: ${formatFindInFilesFileList(blockedFiles)}.`;
+      ? tt('terminal.saveOrReloadDirtyTabFor', { files: formatFindInFilesFileList(blockedFiles) })
+      : tt('terminal.saveOrReloadDirtyTabs', { files: formatFindInFilesFileList(blockedFiles) });
     return false;
   }
 
@@ -4067,18 +4081,19 @@ async function replaceFindInFilesMatches(matches: GitTextSearchMatch[]) {
       replacement: findInFilesReplaceQuery.value,
       matches,
     });
-    const affectedFileLabel = result.affectedFiles.length === 1 ? 'file' : 'files';
-
     clearFindInFilesPreviewCache(result.affectedFiles);
     await reloadCleanEditableTabsForFilePaths(result.affectedFiles);
     await runFindInFilesSearch(query);
 
     findInFilesReplaceSummary.value = result.replacedCount > 0
-      ? `Replaced ${result.replacedCount.toLocaleString()} matches in ${result.affectedFiles.length.toLocaleString()} ${affectedFileLabel}.`
-      : 'No matches were replaced. The files may have changed since the search results were collected.';
+      ? tt('terminal.replacedMatchesSummary', {
+        matches: result.replacedCount.toLocaleString(),
+        files: result.affectedFiles.length.toLocaleString(),
+      })
+      : tt('terminal.noMatchesReplaced');
     return result.replacedCount > 0;
   } catch (error) {
-    findInFilesError.value = error instanceof Error ? error.message : 'Failed to replace matches.';
+    findInFilesError.value = error instanceof Error ? error.message : tt('terminal.failedReplaceMatches');
     return false;
   } finally {
     isReplacingFindInFiles.value = false;
@@ -5095,10 +5110,10 @@ function saveEditing(tabId: string) {
   const fallbackTitle = activeTab
     ? (
       isEditableTab(activeTab)
-        ? getPathLeafName(activeTab.filePath ?? '') || (activeTab.type === 'note' ? 'Notes' : 'Code')
-        : 'Shell'
+        ? getPathLeafName(activeTab.filePath ?? '') || (activeTab.type === 'note' ? tt('terminal.tabs.type.notes') : tt('terminal.tabs.type.code'))
+        : tt('terminal.tabs.type.shell')
     )
-    : 'Shell';
+    : tt('terminal.tabs.type.shell');
   const nextTitle = draftTitle.value.trim() || fallbackTitle;
   const nextTabs = tabs.value.map((tab) => (
     tab.id === tabId
@@ -5589,7 +5604,7 @@ defineExpose({
     :data-shortcut-bindings-version="shortcutBindingsVersion"
   >
     <header class="terminal-panel__tabs-header">
-      <div class="terminal-panel__tabs" role="tablist" aria-label="Tabs panel">
+      <div class="terminal-panel__tabs" role="tablist" :aria-label="tt('terminal.tabsPanel')">
         <div
           v-for="tab in tabs"
           :key="tab.id"
@@ -5668,8 +5683,8 @@ defineExpose({
             v-if="sortedTabCount > 1"
             class="terminal-panel__tab-close"
             type="button"
-            :title="`Close ${tabDisplayTitle(tab)}`"
-            :aria-label="`Close ${tabDisplayTitle(tab)}`"
+            :title="tt('terminal.closeTabTitle', { title: tabDisplayTitle(tab) })"
+            :aria-label="tt('terminal.closeTabTitle', { title: tabDisplayTitle(tab) })"
             @click.stop="requestCloseTab(tab.id)"
           >
             <svg viewBox="0 0 16 16" aria-hidden="true">
@@ -5683,8 +5698,8 @@ defineExpose({
           :ref="setCreationButtonRef"
           class="terminal-panel__add terminal-panel__add--inline"
           type="button"
-          :title="`Create workspace tab ${SHORTCUTS.workspaceNewTabMenu.display}`"
-          aria-label="Create workspace tab"
+          :title="tt('terminal.createTabTitle', { shortcut: SHORTCUTS.workspaceNewTabMenu.display })"
+          :aria-label="tt('terminal.createTab')"
           @click="openCreationMenu"
           @contextmenu="openCreationMenu"
         >
@@ -5698,8 +5713,8 @@ defineExpose({
         <button
           class="terminal-panel__all-tabs"
           type="button"
-          :title="`Show all tabs ${SHORTCUTS.workspaceAllTabs.display} (${sortedTabCount})`"
-          aria-label="Show all tabs"
+          :title="tt('terminal.showAllTabsTitle', { shortcut: SHORTCUTS.workspaceAllTabs.display, count: sortedTabCount })"
+          :aria-label="tt('terminal.showAllTabs')"
           @click="openAllTabsDialog"
         >
           <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -5707,7 +5722,7 @@ defineExpose({
             <path d="M5.25 12h13.5" />
             <path d="M5.25 16.75h13.5" />
           </svg>
-          <span class="terminal-panel__all-tabs-copy">Tabs</span>
+          <span class="terminal-panel__all-tabs-copy">{{ tt('terminal.tabs') }}</span>
           <span class="terminal-panel__all-tabs-count">{{ sortedTabCount }}</span>
         </button>
 
@@ -5716,8 +5731,8 @@ defineExpose({
             class="terminal-panel__commands-button"
             type="button"
             :disabled="!sortedPresets.length"
-            :title="sortedPresets.length ? 'Run command preset' : 'No command presets configured'"
-            aria-label="Run command preset"
+            :title="sortedPresets.length ? tt('terminal.runPreset') : tt('terminal.noPresets')"
+            :aria-label="tt('terminal.runPreset')"
             @click="toggleCommandMenu"
           >
             <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -5742,7 +5757,7 @@ defineExpose({
               <span class="terminal-panel__menu-copy">
                 <span class="terminal-panel__menu-label">{{ preset.name }}</span>
                 <span class="terminal-panel__menu-meta">
-                  {{ preset.target === 'new-tab' ? 'New shell tab' : 'Active shell tab' }}
+                  {{ preset.target === 'new-tab' ? tt('terminal.newShellTab') : tt('terminal.activeShellTab') }}
                 </span>
               </span>
               <code v-if="preset.shortcutSlot" class="terminal-panel__menu-shortcut">
@@ -5757,7 +5772,7 @@ defineExpose({
           type="button"
           :disabled="!canCollapse"
           :title="collapseButtonTitle"
-          aria-label="Collapse tabs panel"
+          :aria-label="tt('terminal.collapseTabs')"
           @click="emit('toggle-collapse')"
         >
           <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -5779,9 +5794,12 @@ defineExpose({
           :cwd="tab.cwd"
           :shell="tab.shell ?? null"
           :project-root="props.projectRoot"
+          :app-language="props.appLanguage"
           :font-size="tab.fontSize"
           :appearance-theme="props.appearanceTheme"
           :appearance-theme-variant="props.appearanceThemeVariant"
+          :right-click-paste-enabled="props.rightClickPasteEnabled"
+          :selection-auto-copy-enabled="props.selectionAutoCopyEnabled"
           :active="tab.id === activeTabId && !collapsed"
           :reconnect-token="reconnectTokens[tab.id] ?? 0"
           @activate="handleTerminalViewActivate(tab.id)"
@@ -5799,12 +5817,15 @@ defineExpose({
           class="terminal-panel__view"
           :class="{ 'terminal-panel__view--active': tab.id === activeTabId }"
           :active="tab.id === activeTabId && !collapsed"
+          :app-language="props.appLanguage"
           :busy="Boolean(noteBusyByTabId[tab.id])"
           :content="tab.content"
           :file-path="tab.filePath"
           :project-root="props.projectRoot"
           :appearance-theme="props.appearanceTheme"
           :appearance-theme-variant="props.appearanceThemeVariant"
+          :right-click-paste-enabled="props.rightClickPasteEnabled"
+          :selection-auto-copy-enabled="props.selectionAutoCopyEnabled"
           :editor-theme="props.editorTheme"
           :theme-variant="props.editorThemeVariant"
           :is-dirty="tab.content !== tab.savedContent"
@@ -5812,6 +5833,7 @@ defineExpose({
           :view-mode="tab.viewMode"
           :split-ratio="tab.splitRatio"
           :line-numbers-enabled="props.workspaceTabDefaults.noteLineNumbers"
+          :line-wrapping-enabled="props.workspaceTabDefaults.noteLineWrapping"
           :font-size="tab.fontSize"
           :cursor="tab.cursor"
           @focus-previous-tab="selectAdjacentTab(-1)"
@@ -5829,6 +5851,7 @@ defineExpose({
           @update:view-mode="updateNoteViewMode(tab.id, $event)"
           @update:split-ratio="updateNoteSplitRatio(tab.id, $event)"
           @update:line-numbers-enabled="updateWorkspaceTabDefaults({ noteLineNumbers: $event })"
+          @update:line-wrapping-enabled="updateWorkspaceTabDefaults({ noteLineWrapping: $event })"
         />
 
         <CodeTabView
@@ -5837,6 +5860,7 @@ defineExpose({
           class="terminal-panel__view"
           :class="{ 'terminal-panel__view--active': tab.id === activeTabId }"
           :active="tab.id === activeTabId && !collapsed"
+          :app-language="props.appLanguage"
           :busy="Boolean(noteBusyByTabId[tab.id])"
           :content="tab.content"
           :file-path="tab.filePath"
@@ -5844,6 +5868,8 @@ defineExpose({
           :editor-theme="props.editorTheme"
           :theme-variant="props.editorThemeVariant"
           :navigation-request="null"
+          :right-click-paste-enabled="props.rightClickPasteEnabled"
+          :selection-auto-copy-enabled="props.selectionAutoCopyEnabled"
           :is-dirty="tab.content !== tab.savedContent"
           :external-change="externalFileChangeByTabId[tab.id] ?? null"
           :font-size="tab.fontSize"
@@ -5876,7 +5902,7 @@ defineExpose({
             :class="{ 'terminal-panel__multi-display-divider--active': multiDisplaySplit.isDragging.value }"
             role="separator"
             aria-orientation="vertical"
-            title="Drag to resize • Double-click to reset"
+            :title="tt('note.resizeSplit')"
             @pointerdown="multiDisplaySplit.startDrag"
             @dblclick="multiDisplaySplit.reset"
           />
@@ -5894,9 +5920,12 @@ defineExpose({
             :cwd="tab.cwd"
             :shell="tab.shell ?? null"
             :project-root="props.projectRoot"
+            :app-language="props.appLanguage"
             :font-size="tab.fontSize"
             :appearance-theme="props.appearanceTheme"
             :appearance-theme-variant="props.appearanceThemeVariant"
+            :right-click-paste-enabled="props.rightClickPasteEnabled"
+            :selection-auto-copy-enabled="props.selectionAutoCopyEnabled"
             :active="tab.id === activeTabId && !collapsed"
             :reconnect-token="reconnectTokens[tab.id] ?? 0"
             @activate="handleTerminalViewActivate(tab.id)"
@@ -5913,12 +5942,15 @@ defineExpose({
             :key="buildWorkspaceTabRuntimeKey(props.workspaceId, `multi:${tab.id}`)"
             class="terminal-panel__multi-display-view"
             :active="tab.id === activeTabId && !collapsed"
+            :app-language="props.appLanguage"
             :busy="Boolean(noteBusyByTabId[tab.id])"
             :content="tab.content"
             :file-path="tab.filePath"
             :project-root="props.projectRoot"
             :appearance-theme="props.appearanceTheme"
             :appearance-theme-variant="props.appearanceThemeVariant"
+            :right-click-paste-enabled="props.rightClickPasteEnabled"
+            :selection-auto-copy-enabled="props.selectionAutoCopyEnabled"
             :editor-theme="props.editorTheme"
             :theme-variant="props.editorThemeVariant"
             :is-dirty="tab.content !== tab.savedContent"
@@ -5926,6 +5958,7 @@ defineExpose({
             :view-mode="tab.viewMode"
             :split-ratio="tab.splitRatio"
             :line-numbers-enabled="props.workspaceTabDefaults.noteLineNumbers"
+            :line-wrapping-enabled="props.workspaceTabDefaults.noteLineWrapping"
             :font-size="tab.fontSize"
             :cursor="tab.cursor"
             @focus-previous-tab="selectAdjacentTab(-1)"
@@ -5943,6 +5976,7 @@ defineExpose({
             @update:view-mode="updateNoteViewMode(tab.id, $event)"
             @update:split-ratio="updateNoteSplitRatio(tab.id, $event)"
             @update:line-numbers-enabled="updateWorkspaceTabDefaults({ noteLineNumbers: $event })"
+            @update:line-wrapping-enabled="updateWorkspaceTabDefaults({ noteLineWrapping: $event })"
           />
 
           <CodeTabView
@@ -5950,6 +5984,7 @@ defineExpose({
             :key="buildWorkspaceTabRuntimeKey(props.workspaceId, `multi:${tab.id}`)"
             class="terminal-panel__multi-display-view"
             :active="tab.id === activeTabId && !collapsed"
+            :app-language="props.appLanguage"
             :busy="Boolean(noteBusyByTabId[tab.id])"
             :content="tab.content"
             :file-path="tab.filePath"
@@ -5957,6 +5992,8 @@ defineExpose({
             :editor-theme="props.editorTheme"
             :theme-variant="props.editorThemeVariant"
             :navigation-request="null"
+            :right-click-paste-enabled="props.rightClickPasteEnabled"
+            :selection-auto-copy-enabled="props.selectionAutoCopyEnabled"
             :is-dirty="tab.content !== tab.savedContent"
             :external-change="externalFileChangeByTabId[tab.id] ?? null"
             :font-size="tab.fontSize"
@@ -5994,7 +6031,7 @@ defineExpose({
           :style="{ gridColumn: '2', gridRow: '1 / -1' }"
           role="separator"
           aria-orientation="vertical"
-          title="Drag to resize • Double-click to reset"
+          :title="tt('note.resizeSplit')"
           @pointerdown="editorPanesColumnSplit.startDrag"
           @dblclick="editorPanesColumnSplit.reset"
         />
@@ -6005,7 +6042,7 @@ defineExpose({
           :style="{ gridRow: '2', gridColumn: '1 / -1' }"
           role="separator"
           aria-orientation="horizontal"
-          title="Drag to resize • Double-click to reset"
+          :title="tt('note.resizeSplit')"
           @pointerdown="editorPanesRowSplit.startDrag"
           @dblclick="editorPanesRowSplit.reset"
         />
@@ -6051,8 +6088,8 @@ defineExpose({
               <button
                 class="terminal-panel__editor-pane-action"
                 type="button"
-                :title="`Split right ${SHORTCUTS.editorPaneSplitRight.display}`"
-                :aria-label="`Split ${entry.tab.title} to the right`"
+                :title="tt('terminal.splitRightTitle', { shortcut: SHORTCUTS.editorPaneSplitRight.display })"
+                :aria-label="tt('terminal.splitRightAria', { title: entry.tab.title })"
                 @click.stop="splitSpecificEditorPane(entry.pane.id, 'right')"
               >
                 <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -6065,8 +6102,8 @@ defineExpose({
               <button
                 class="terminal-panel__editor-pane-action"
                 type="button"
-                :title="`Split down ${SHORTCUTS.editorPaneSplitDown.display}`"
-                :aria-label="`Split ${entry.tab.title} down`"
+                :title="tt('terminal.splitDownTitle', { shortcut: SHORTCUTS.editorPaneSplitDown.display })"
+                :aria-label="tt('terminal.splitDownAria', { title: entry.tab.title })"
                 @click.stop="splitSpecificEditorPane(entry.pane.id, 'down')"
               >
                 <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -6080,8 +6117,8 @@ defineExpose({
                 class="terminal-panel__editor-pane-action"
                 type="button"
                 :disabled="visibleEditorPanes.length <= 1"
-                title="Close pane"
-                :aria-label="`Close pane for ${entry.tab.title}`"
+                :title="tt('terminal.closePane')"
+                :aria-label="tt('terminal.closePaneFor', { title: entry.tab.title })"
                 @click.stop="closeSpecificEditorPane(entry.pane.id)"
               >
                 <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -6097,12 +6134,15 @@ defineExpose({
             :key="buildWorkspaceTabRuntimeKey(props.workspaceId, `${entry.pane.id}:${entry.tab.id}`)"
             class="terminal-panel__editor-pane-view"
             :active="entry.pane.id === editorPaneLayout.activePaneId && !collapsed"
+            :app-language="props.appLanguage"
             :busy="Boolean(noteBusyByTabId[entry.tab.id])"
             :content="entry.tab.content"
             :file-path="entry.tab.filePath"
             :project-root="props.projectRoot"
             :appearance-theme="props.appearanceTheme"
             :appearance-theme-variant="props.appearanceThemeVariant"
+            :right-click-paste-enabled="props.rightClickPasteEnabled"
+            :selection-auto-copy-enabled="props.selectionAutoCopyEnabled"
             :editor-theme="props.editorTheme"
             :theme-variant="props.editorThemeVariant"
             :is-dirty="entry.tab.content !== entry.tab.savedContent"
@@ -6110,6 +6150,7 @@ defineExpose({
             :view-mode="entry.tab.viewMode"
             :split-ratio="entry.tab.splitRatio"
             :line-numbers-enabled="props.workspaceTabDefaults.noteLineNumbers"
+            :line-wrapping-enabled="props.workspaceTabDefaults.noteLineWrapping"
             :font-size="entry.tab.fontSize"
             :cursor="entry.tab.cursor"
             @focus-previous-tab="selectAdjacentTab(-1)"
@@ -6127,6 +6168,7 @@ defineExpose({
             @update:view-mode="updateNoteViewMode(entry.tab.id, $event)"
             @update:split-ratio="updateNoteSplitRatio(entry.tab.id, $event)"
             @update:line-numbers-enabled="updateWorkspaceTabDefaults({ noteLineNumbers: $event })"
+            @update:line-wrapping-enabled="updateWorkspaceTabDefaults({ noteLineWrapping: $event })"
           />
 
           <CodeTabView
@@ -6134,6 +6176,7 @@ defineExpose({
             :key="buildWorkspaceTabRuntimeKey(props.workspaceId, `${entry.pane.id}:${entry.tab.id}`)"
             class="terminal-panel__editor-pane-view"
             :active="entry.pane.id === editorPaneLayout.activePaneId && !collapsed"
+            :app-language="props.appLanguage"
             :busy="Boolean(noteBusyByTabId[entry.tab.id])"
             :content="entry.tab.content"
             :file-path="entry.tab.filePath"
@@ -6141,6 +6184,8 @@ defineExpose({
             :editor-theme="props.editorTheme"
             :theme-variant="props.editorThemeVariant"
             :navigation-request="codeNavigationRequestByPaneId[entry.pane.id] ?? null"
+            :right-click-paste-enabled="props.rightClickPasteEnabled"
+            :selection-auto-copy-enabled="props.selectionAutoCopyEnabled"
             :is-dirty="entry.tab.content !== entry.tab.savedContent"
             :external-change="externalFileChangeByTabId[entry.tab.id] ?? null"
             :font-size="entry.tab.fontSize"
@@ -6171,13 +6216,13 @@ defineExpose({
         class="terminal-panel__switcher"
         role="dialog"
         aria-modal="true"
-        aria-label="All tabs"
+        :aria-label="tt('terminal.allTabs')"
         @click.stop
       >
         <header class="terminal-panel__switcher-header">
           <div class="terminal-panel__switcher-heading">
-            <span class="terminal-panel__switcher-eyebrow">Workspace</span>
-            <h3 class="terminal-panel__switcher-title">All Tabs</h3>
+            <span class="terminal-panel__switcher-eyebrow">{{ tt('terminal.workspace') }}</span>
+            <h3 class="terminal-panel__switcher-title">{{ tt('terminal.allTabs') }}</h3>
             <p class="terminal-panel__switcher-meta">
               {{ sortedTabCount.toLocaleString() }} open
               <span v-if="activeWorkspaceTab">current: {{ activeWorkspaceTab.title }}</span>
@@ -6187,7 +6232,7 @@ defineExpose({
           <button
             class="terminal-panel__switcher-close"
             type="button"
-            aria-label="Close all tabs list"
+            :aria-label="tt('terminal.closeAllTabsList')"
             @click="closeAllTabsDialog"
           >
             ×
@@ -6196,26 +6241,26 @@ defineExpose({
 
         <div class="terminal-panel__switcher-toolbar">
           <label class="terminal-panel__switcher-search">
-            <span class="terminal-panel__switcher-search-label">Search tabs</span>
+            <span class="terminal-panel__switcher-search-label">{{ tt('terminal.searchTabs') }}</span>
             <input
               :ref="setAllTabsSearchInput"
               v-model="allTabsSearchQuery"
               class="terminal-panel__switcher-search-input"
               type="text"
-              placeholder="title, file path, shell cwd"
+              :placeholder="tt('terminal.searchTabsPlaceholder')"
               @keydown="handleAllTabsDialogKeydown"
             >
           </label>
 
           <div class="terminal-panel__switcher-filter">
-            <span class="terminal-panel__switcher-search-label">Type</span>
+            <span class="terminal-panel__switcher-search-label">{{ tt('terminal.type') }}</span>
             <button
               :ref="setAllTabsFilterButtonRef"
               class="terminal-panel__switcher-filter-button"
               type="button"
               :aria-expanded="allTabsFilterMenuOpen"
               aria-haspopup="menu"
-              aria-label="Filter tabs by type"
+              :aria-label="tt('terminal.filterTabsByType')"
               @click="toggleAllTabsFilterMenu"
             >
               <span>{{ activeAllTabsTypeFilterLabel }}</span>
@@ -6240,7 +6285,7 @@ defineExpose({
                 :aria-checked="allTabsTypeFilter === option.value"
                 @click="setAllTabsTypeFilter(option.value)"
               >
-                {{ option.label }}
+                {{ tt(option.key) }}
               </button>
             </div>
           </div>
@@ -6251,7 +6296,7 @@ defineExpose({
             v-if="allTabsResults.length"
             class="terminal-panel__switcher-list"
             role="listbox"
-            aria-label="Open workspace tabs"
+            :aria-label="tt('terminal.openWorkspaceTabs')"
           >
             <div
               v-for="entry in allTabsResults"
@@ -6318,13 +6363,13 @@ defineExpose({
                     {{ entry.typeLabel }}
                   </span>
                   <span v-if="entry.paneCount > 1" class="terminal-panel__switcher-badge">
-                    {{ entry.paneCount }} panes
+                    {{ tt('terminal.paneCount', { count: entry.paneCount }) }}
                   </span>
                   <span
                     v-if="isEditableTabDirty(entry.tab)"
                     class="terminal-panel__switcher-badge terminal-panel__switcher-badge--dirty"
                   >
-                    Dirty
+                    {{ tt('terminal.dirty') }}
                   </span>
                 </span>
 
@@ -6332,8 +6377,8 @@ defineExpose({
                   v-if="sortedTabCount > 1"
                   class="terminal-panel__switcher-item-close"
                   type="button"
-                  :title="`Close ${entry.tab.title}`"
-                  :aria-label="`Close ${entry.tab.title}`"
+                  :title="tt('terminal.closeTabTitle', { title: entry.tab.title })"
+                  :aria-label="tt('terminal.closeTabTitle', { title: entry.tab.title })"
                   @click.stop="requestCloseTab(entry.tab.id)"
                   @keydown.enter.stop
                   @keydown.space.stop
@@ -6348,7 +6393,7 @@ defineExpose({
           </div>
 
           <div v-else class="terminal-panel__switcher-empty">
-            No tabs match the current search.
+            {{ tt('terminal.noTabsMatch') }}
           </div>
         </div>
       </section>
@@ -6363,13 +6408,13 @@ defineExpose({
         class="terminal-panel__switcher"
         role="dialog"
         aria-modal="true"
-        aria-label="Quick open file"
+        :aria-label="tt('terminal.quickOpenFile')"
         @click.stop
       >
         <header class="terminal-panel__switcher-header">
           <div class="terminal-panel__switcher-heading">
-            <span class="terminal-panel__switcher-eyebrow">Workspace</span>
-            <h3 class="terminal-panel__switcher-title">Quick Open</h3>
+            <span class="terminal-panel__switcher-eyebrow">{{ tt('terminal.workspace') }}</span>
+            <h3 class="terminal-panel__switcher-title">{{ tt('terminal.quickOpen') }}</h3>
             <p class="terminal-panel__switcher-meta">
               {{ quickOpenMeta }}
             </p>
@@ -6378,7 +6423,7 @@ defineExpose({
           <button
             class="terminal-panel__switcher-close"
             type="button"
-            aria-label="Close quick open"
+            :aria-label="tt('terminal.closeQuickOpen')"
             @click="closeQuickOpenDialog"
           >
             ×
@@ -6387,13 +6432,13 @@ defineExpose({
 
         <div class="terminal-panel__switcher-toolbar">
           <label class="terminal-panel__switcher-search">
-            <span class="terminal-panel__switcher-search-label">File path</span>
+            <span class="terminal-panel__switcher-search-label">{{ tt('terminal.filePath') }}</span>
             <input
               :ref="setQuickOpenSearchInput"
               v-model="quickOpenSearchQuery"
               class="terminal-panel__switcher-search-input"
               type="text"
-              placeholder="Search files in current repo"
+              :placeholder="tt('terminal.searchFilesPlaceholder')"
               autocomplete="off"
               spellcheck="false"
               @keydown="handleQuickOpenDialogKeydown"
@@ -6407,7 +6452,7 @@ defineExpose({
             class="terminal-panel__switcher-section"
           >
             <div class="terminal-panel__switcher-section-header">
-              <span class="terminal-panel__switcher-section-title">Recent searches</span>
+              <span class="terminal-panel__switcher-section-title">{{ tt('terminal.recentSearches') }}</span>
             </div>
 
             <div class="terminal-panel__switcher-chip-row">
@@ -6428,13 +6473,13 @@ defineExpose({
             class="terminal-panel__switcher-section"
           >
             <div v-if="!quickOpenSearchQuery.trim()" class="terminal-panel__switcher-section-header">
-              <span class="terminal-panel__switcher-section-title">Recent files</span>
+              <span class="terminal-panel__switcher-section-title">{{ tt('terminal.recentFiles') }}</span>
             </div>
 
             <div
               class="terminal-panel__switcher-list"
               role="listbox"
-              aria-label="Open repository files"
+              :aria-label="tt('terminal.openRepositoryFiles')"
             >
               <button
                 v-for="entry in quickOpenResultEntries"
@@ -6470,22 +6515,22 @@ defineExpose({
                     </span>
                     <span class="terminal-panel__switcher-badges">
                       <span class="terminal-panel__switcher-badge terminal-panel__switcher-badge--type">
-                        {{ entry.tabType === 'note' ? 'Notes' : 'Code' }}
+                        {{ entry.tabType === 'note' ? tt('terminal.tabs.type.notes') : tt('terminal.tabs.type.code') }}
                       </span>
                       <span v-if="entry.openPaneCount > 0" class="terminal-panel__switcher-badge">
-                        {{ entry.openPaneCount > 1 ? `${entry.openPaneCount} tabs` : 'Open' }}
+                        {{ entry.openPaneCount > 1 ? tt('terminal.openTabCount', { count: entry.openPaneCount }) : tt('terminal.open') }}
                       </span>
                       <span
                         v-if="entry.isDirty"
                         class="terminal-panel__switcher-badge terminal-panel__switcher-badge--warning"
                       >
-                        Dirty
+                        {{ tt('terminal.dirty') }}
                       </span>
                       <span
                         v-if="entry.isActive"
                         class="terminal-panel__switcher-badge terminal-panel__switcher-badge--dirty"
                       >
-                        Current
+                        {{ tt('terminal.current') }}
                       </span>
                     </span>
                   </span>
@@ -6529,14 +6574,14 @@ defineExpose({
       >
         <header class="terminal-panel__switcher-header">
           <div class="terminal-panel__switcher-heading">
-            <span class="terminal-panel__switcher-eyebrow">Workspace</span>
+            <span class="terminal-panel__switcher-eyebrow">{{ tt('terminal.workspace') }}</span>
             <h3 class="terminal-panel__switcher-title">{{ findInFilesDialogTitle }}</h3>
           </div>
 
           <button
             class="terminal-panel__switcher-close"
             type="button"
-            :aria-label="`Close ${findInFilesDialogLabel}`"
+            :aria-label="tt('terminal.closeDialog', { title: findInFilesDialogLabel })"
             @click="closeFindInFilesDialog"
           >
             ×
@@ -6557,8 +6602,8 @@ defineExpose({
               v-model="findInFilesSearchQuery"
               class="terminal-panel__switcher-search-input"
               type="text"
-              :aria-label="findInFilesMode === 'replace' ? 'Find text to replace in current repo' : 'Search text in current repo'"
-              placeholder="Search text in current repo"
+              :aria-label="findInFilesMode === 'replace' ? tt('terminal.findTextToReplace') : tt('terminal.searchTextInRepo')"
+              :placeholder="tt('terminal.searchTextInRepo')"
               autocomplete="off"
               spellcheck="false"
               @keydown="handleFindInFilesDialogKeydown"
@@ -6574,8 +6619,8 @@ defineExpose({
               v-model="findInFilesReplaceQuery"
               class="terminal-panel__switcher-search-input"
               type="text"
-              aria-label="Replace matching text with"
-              placeholder="Replace with"
+              :aria-label="tt('terminal.replaceMatchingTextWith')"
+              :placeholder="tt('terminal.replaceWith')"
               autocomplete="off"
               spellcheck="false"
               @keydown="handleFindInFilesDialogKeydown"
@@ -6587,8 +6632,8 @@ defineExpose({
               v-model="findInFilesFileFilter"
               class="terminal-panel__switcher-search-input"
               type="text"
-              aria-label="Filter matching files"
-              placeholder="Filter files (*.php)"
+              :aria-label="tt('terminal.filterMatchingFiles')"
+              :placeholder="tt('terminal.filterFilesPlaceholder')"
               autocomplete="off"
               spellcheck="false"
               @keydown="handleFindInFilesDialogKeydown"
@@ -6600,7 +6645,7 @@ defineExpose({
               class="terminal-panel__switcher-filter-button"
               type="button"
               :aria-pressed="findInFilesIncludeUntracked"
-              aria-label="Toggle untracked files in find in files"
+              :aria-label="tt('terminal.toggleUntrackedFind')"
               @click="toggleFindInFilesIncludeUntracked"
             >
               <span>{{ findInFilesScopeLabel }}</span>
@@ -6615,17 +6660,17 @@ defineExpose({
             :disabled="!canReplaceSelectedFindInFilesMatch"
             @click="replaceSelectedFindInFilesMatch()"
           >
-            {{ isReplacingFindInFiles ? 'Replacing…' : 'Replace' }}
+            {{ isReplacingFindInFiles ? tt('terminal.replacing') : tt('terminal.replace') }}
           </button>
 
           <button
             class="terminal-panel__switcher-action"
             type="button"
             :disabled="!canReplaceSelectedMatchFileFindInFilesMatches"
-            :title="selectedFindInFilesMatchPath ? `Replace shown matches in ${getPathLeafName(selectedFindInFilesMatchPath)}` : 'Select a match to use Replace in document'"
+            :title="selectedFindInFilesMatchPath ? tt('terminal.replaceShownIn', { file: getPathLeafName(selectedFindInFilesMatchPath) }) : tt('terminal.selectMatchForReplaceDocument')"
             @click="replaceSelectedMatchFileFindInFilesMatches()"
           >
-            {{ isReplacingFindInFiles ? 'Replacing…' : 'Replace in document' }}
+            {{ isReplacingFindInFiles ? tt('terminal.replacing') : tt('terminal.replaceInDocument') }}
           </button>
 
           <button
@@ -6634,7 +6679,7 @@ defineExpose({
             :disabled="!canReplaceAllShownFindInFilesMatches"
             @click="replaceAllShownFindInFilesMatches()"
           >
-            {{ isReplacingFindInFiles ? 'Replacing…' : 'Replace all' }}
+            {{ isReplacingFindInFiles ? tt('terminal.replacing') : tt('terminal.replaceAll') }}
           </button>
         </div>
 
@@ -6646,7 +6691,7 @@ defineExpose({
             <div
               class="terminal-panel__switcher-list"
               role="listbox"
-              aria-label="Text search matches"
+                :aria-label="tt('terminal.textSearchMatches')"
             >
               <button
                 v-for="match in findInFilesVisibleItems"
@@ -6678,7 +6723,7 @@ defineExpose({
                   <span class="terminal-panel__find-result-secondary">
                     <span class="terminal-panel__find-result-path">{{ match.path }}:{{ match.line }}:{{ match.column }}</span>
                     <span v-if="match.fileMatchCount > 1" class="terminal-panel__switcher-badge terminal-panel__find-result-count">
-                      {{ match.fileMatchCount.toLocaleString() }} in file
+                      {{ tt('terminal.inFileCount', { count: match.fileMatchCount.toLocaleString() }) }}
                     </span>
                   </span>
                 </span>
@@ -6693,7 +6738,7 @@ defineExpose({
           <div class="terminal-panel__switcher-preview">
             <div class="terminal-panel__switcher-section-header">
               <span class="terminal-panel__switcher-section-title terminal-panel__switcher-section-title--normal">
-                Preview
+                {{ tt('note.preview') }}
               </span>
               <span class="terminal-panel__switcher-path">{{ findInFilesPreviewMeta }}</span>
             </div>
@@ -6743,7 +6788,7 @@ defineExpose({
         type="button"
         @click="startEditing(menuTab)"
       >
-        Rename
+        {{ tt('terminal.rename') }}
       </button>
 
       <button
@@ -6752,7 +6797,7 @@ defineExpose({
         type="button"
         @click="revealWorkspaceTabInAllFiles(menuTab) && closeTabMenu()"
       >
-        Reveal in All files
+        {{ tt('code.revealInAllFiles') }}
       </button>
 
       <button
@@ -6761,7 +6806,7 @@ defineExpose({
         type="button"
         @click="reconnectTab(menuTab.id)"
       >
-        Reconnect shell
+        {{ tt('terminal.reconnectShell') }}
       </button>
 
       <button
@@ -6779,7 +6824,7 @@ defineExpose({
         type="button"
         @click="requestCloseTab(menuTab.id)"
       >
-        Close tab
+        {{ tt('terminal.closeTab') }}
       </button>
 
       <button
@@ -6788,13 +6833,13 @@ defineExpose({
         type="button"
         @click="requestCloseOtherTabs(menuTab.id)"
       >
-        Close other tabs
+        {{ tt('terminal.closeOtherTabs') }}
       </button>
     </div>
 
     <AppConfirmDialog
       :model-value="Boolean(pendingCloseDialog)"
-      dialog-label="Confirm tab close"
+      :dialog-label="tt('terminal.confirmTabClose')"
       :eyebrow="pendingCloseDialogEyebrow"
       :title="pendingCloseDialogTitle"
       :copy="pendingCloseDialogCopy"
@@ -6805,8 +6850,8 @@ defineExpose({
 
     <AppConfirmDialog
       :model-value="Boolean(pendingFindInFilesReplaceDialog)"
-      dialog-label="Confirm replace in files"
-      eyebrow="Replace in files"
+      :dialog-label="tt('terminal.confirmReplaceInFiles')"
+      :eyebrow="tt('terminal.find.replaceLabel')"
       :title="pendingFindInFilesReplaceDialogTitle"
       :copy="pendingFindInFilesReplaceDialogCopy"
       :actions="pendingFindInFilesReplaceDialogActions"

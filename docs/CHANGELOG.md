@@ -1,5 +1,17 @@
 # Changelog
 
+## v1.0.0 - 2026-06-26
+
+First stable BridgeGit release focused on making the app ready for a broader audience while keeping the existing Git, terminal, editor, notes and Docker workflows intact.
+
+- Added full app localization with English as the default language and Czech, Spanish, German, French, Portuguese, Polish, Ukrainian, Chinese, Japanese and Korean translations
+- Added the language selector as the first option in General settings, with persisted per-session language preference and normalized session restore fallback
+- Localized the main workspace, repo panel, diff viewer, Docker dialog, commit history, Git graph, notes, code tabs, terminal tabs, shared copy/error states and settings copy
+- Added clipboard behavior toggles for right-click paste and selection auto-copy across shell, note, code and editable text flows
+- Tightened terminal right-click paste handling so context-menu paste no longer duplicates text through the xterm input path
+- Polished editor and notes selection behavior, including safer clipboard writes, steadier cursor scrolling and clearer saved-file mismatch handling
+- Refreshed the bundled in-app release note so the Message Center highlights the `v1.0.0` update once after install
+
 ## v0.9.0 - 2026-05-21
 
 Notes and repository workflow release focused on turning markdown tasks into a first-class workspace tool while broadening repo-panel actions for larger trees.

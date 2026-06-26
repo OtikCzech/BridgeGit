@@ -167,15 +167,29 @@ export async function listClipboardHistory() {
 
 export async function readClipboardText(options?: {
   eventText?: string | null;
+  forceSystemRead?: boolean;
   preferPreviousDistinctOf?: string | null;
 }) {
   const eventText = normalizeClipboardText(options?.eventText ?? '');
-  const latestEntry = eventText
-    ? rememberClipboardEntry(eventText, {
+  let latestText = '';
+
+  if (eventText) {
+    const latestEntry = rememberClipboardEntry(eventText, {
       skipIfAlreadyLatest: true,
-    })
-    : await syncClipboardHistoryFromSystem();
-  const latestText = clipboardHistory[0]?.text ?? latestEntry?.text ?? '';
+    });
+    latestText = latestEntry?.text ?? clipboardHistory[0]?.text ?? '';
+  } else if (options?.forceSystemRead) {
+    const systemText = await readSystemClipboardText();
+    const latestEntry = systemText
+      ? rememberClipboardEntry(systemText, {
+        skipIfAlreadyLatest: true,
+      })
+      : null;
+    latestText = latestEntry?.text ?? systemText;
+  } else {
+    const latestEntry = await syncClipboardHistoryFromSystem();
+    latestText = clipboardHistory[0]?.text ?? latestEntry?.text ?? '';
+  }
 
   if (!latestText) {
     return '';

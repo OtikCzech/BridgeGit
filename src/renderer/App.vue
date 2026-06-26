@@ -7,6 +7,7 @@ import {
   GLOBAL_WORKSPACE_SESSION_KEY,
   areRepoPathsEquivalent,
   cloneClipboardHistoryEntries,
+  cloneClipboardBehaviorSettings,
   cloneDismissedWorktreePaths,
   cloneDockerDialogState,
   cloneShortcutOverrides,
@@ -21,6 +22,7 @@ import {
   cloneWorkspaceEditorPaneLayout,
   cloneWorkspaceSessionState,
   cloneWorkspaceSessions,
+  normalizeAppLanguage,
   normalizeNoteFontSize,
   normalizeRepoPathForComparison,
   normalizeAppAppearance,
@@ -28,6 +30,7 @@ import {
   resolveThemeVariant,
   resolveWorkspaceFileTabType,
   type AppAppearance,
+  type AppLanguage,
   type ClipboardHistoryEntry,
   type CodeNavigationTarget,
   type EditorTheme,
@@ -90,6 +93,7 @@ import {
   matchesShortcut,
   shortcutBindingsRevision,
 } from './shortcuts';
+import { t } from './i18n';
 
 const CommitHistoryDialog = defineAsyncComponent(() => import('./components/CommitHistoryDialog.vue'));
 const DockerDialog = defineAsyncComponent(() => import('./components/DockerDialog.vue'));
@@ -132,12 +136,14 @@ const panelLayoutsByWorkspace = ref<Record<string, PanelLayout>>({});
 const workspaceRepoPanelStates = ref<Record<string, WorkspaceRepoPanelState>>({});
 const repoPanelFontSize = ref(DEFAULT_SESSION_DATA.repoPanelFontSize);
 const projectTitlesByContext = ref<Record<string, string>>({});
+const appLanguage = ref<AppLanguage>(DEFAULT_SESSION_DATA.appLanguage);
 const appAppearance = ref<AppAppearance>(DEFAULT_SESSION_DATA.appAppearance);
 const editorTheme = ref<EditorTheme>(DEFAULT_SESSION_DATA.editorTheme);
 const shortcutOverrides = ref<ShortcutOverrides>(cloneShortcutOverrides(DEFAULT_SESSION_DATA.shortcutOverrides));
 const workspaceIndicatorVisibility = ref<WorkspaceIndicatorVisibilitySettings>(
   cloneWorkspaceIndicatorVisibilitySettings(DEFAULT_SESSION_DATA.workspaceIndicatorVisibility),
 );
+const clipboardBehavior = ref(cloneClipboardBehaviorSettings(DEFAULT_SESSION_DATA.clipboardBehavior));
 const workspaceTabDefaults = ref<WorkspaceTabDefaults>(
   cloneWorkspaceTabDefaults(DEFAULT_SESSION_DATA.workspaceTabDefaults),
 );
@@ -205,6 +211,8 @@ const runtimeInfo = window.bridgegit ?? {
     node: 'n/a',
   },
 };
+
+const tt = (key: string, params?: Record<string, string | number>) => t(appLanguage.value, key, params);
 
 const { session, loadSession, saveSession, saveSessionSync } = useSession();
 const {
@@ -320,17 +328,17 @@ const collapsedPanels = computed(() => {
   const panels: Array<{ id: PanelId; label: string; shortcut: string }> = [];
 
   if (sidebarCollapsed.value) {
-    panels.push({ id: 'sidebar', label: 'Repo', shortcut: SHORTCUTS.panelRepoToggle.display });
+    panels.push({ id: 'sidebar', label: tt('status.panel.repo'), shortcut: SHORTCUTS.panelRepoToggle.display });
   }
 
   if (diffCollapsed.value) {
-    panels.push({ id: 'diff', label: 'Diff', shortcut: SHORTCUTS.panelDiffToggle.display });
+    panels.push({ id: 'diff', label: tt('status.panel.diff'), shortcut: SHORTCUTS.panelDiffToggle.display });
   }
 
   if (terminalCollapsed.value) {
     panels.push({
       id: 'terminal',
-      label: 'Tabs',
+      label: tt('status.panel.tabs'),
       shortcut: SHORTCUTS.panelTerminalToggle.display,
     });
   }
@@ -1358,10 +1366,12 @@ function buildSessionSavePayload(
     projectTitle: '',
     projectTitleMode: 'auto' as const,
     projectTitlesByContext: projectTitlesByContext.value,
+    appLanguage: appLanguage.value,
     appAppearance: appAppearance.value,
     editorTheme: editorTheme.value,
     shortcutOverrides: shortcutOverrides.value,
     workspaceIndicatorVisibility: workspaceIndicatorVisibility.value,
+    clipboardBehavior: clipboardBehavior.value,
     workspaceTabDefaults: workspaceTabDefaults.value,
     worktreeDetectionIntervalMs: worktreeDetectionIntervalMs.value,
     dismissedWorktreePaths: dismissedWorktreePaths.value,
@@ -1452,6 +1462,10 @@ function applyAppTheme(nextAppearance: AppAppearance) {
   const normalizedAppearance = normalizeAppAppearance(nextAppearance);
   document.documentElement.dataset.appTheme = normalizedAppearance;
   document.documentElement.style.colorScheme = resolveThemeVariant(normalizedAppearance);
+}
+
+function applyAppLanguage(nextLanguage: AppLanguage) {
+  document.documentElement.lang = normalizeAppLanguage(nextLanguage);
 }
 
 function captureWorkspaceRepoPanelState(nextWorkspaceId: string | null) {
@@ -1804,10 +1818,12 @@ async function insertClipboardTextIntoTarget(
   target: HTMLInputElement | HTMLTextAreaElement,
   options: {
     eventText?: string | null;
+    forceSystemRead?: boolean;
   } = {},
 ) {
   const clipboardText = await readSharedClipboardText({
     eventText: options.eventText,
+    forceSystemRead: options.forceSystemRead,
     preferPreviousDistinctOf: getSelectedTextFromTarget(target),
   });
 
@@ -2036,6 +2052,10 @@ function handleMainCloseRequested() {
 }
 
 async function handleGlobalEditableContextMenu(event: MouseEvent) {
+  if (!clipboardBehavior.value.rightClickPaste) {
+    return;
+  }
+
   const target = event.target;
 
   if (!isTextPasteTarget(target) || target.disabled || target.readOnly) {
@@ -2044,7 +2064,9 @@ async function handleGlobalEditableContextMenu(event: MouseEvent) {
 
   event.preventDefault();
   event.stopPropagation();
-  await insertClipboardTextIntoTarget(target);
+  await insertClipboardTextIntoTarget(target, {
+    forceSystemRead: true,
+  });
 }
 
 async function handleGlobalEditablePaste(event: ClipboardEvent) {
@@ -2378,11 +2400,13 @@ async function handleSaveSettings(nextSettings: ProjectSettingsFormData) {
   sidebarSide.value = nextSettings.sidebarSide;
   diffPlacement.value = nextSettings.diffPlacement;
   syncGlobalLayoutPreferences(nextSettings.sidebarSide, nextSettings.diffPlacement);
+  appLanguage.value = normalizeAppLanguage(nextSettings.appLanguage);
   appAppearance.value = normalizeAppAppearance(nextSettings.appAppearance);
   editorTheme.value = normalizeEditorTheme(nextSettings.editorTheme);
   applyAppTheme(appAppearance.value);
   repoPanelFontSize.value = normalizeNoteFontSize(nextSettings.workspacePanelFontSize);
   workspaceIndicatorVisibility.value = cloneWorkspaceIndicatorVisibilitySettings(nextSettings.workspaceIndicatorVisibility);
+  clipboardBehavior.value = cloneClipboardBehaviorSettings(nextSettings.clipboardBehavior);
   workspaceTabDefaults.value = cloneWorkspaceTabDefaults(nextSettings.workspaceTabDefaults);
   worktreeDetectionIntervalMs.value = nextSettings.worktreeDetectionIntervalMs;
   soundNotificationsEnabled.value = nextSettings.soundNotificationsEnabled;
@@ -2395,10 +2419,12 @@ async function handleSaveSettings(nextSettings: ProjectSettingsFormData) {
     projectTitle: '',
     projectTitleMode: 'auto',
     projectTitlesByContext: nextProjectTitlesByContext,
+    appLanguage: nextSettings.appLanguage,
     appAppearance: nextSettings.appAppearance,
     editorTheme: nextSettings.editorTheme,
     shortcutOverrides: nextSettings.shortcutOverrides,
     workspaceIndicatorVisibility: nextSettings.workspaceIndicatorVisibility,
+    clipboardBehavior: nextSettings.clipboardBehavior,
     workspaceTabDefaults: nextSettings.workspaceTabDefaults,
     worktreeDetectionIntervalMs: nextSettings.worktreeDetectionIntervalMs,
     soundNotificationsEnabled: nextSettings.soundNotificationsEnabled,
@@ -2413,12 +2439,15 @@ async function handleSaveSettings(nextSettings: ProjectSettingsFormData) {
   });
 
   projectTitlesByContext.value = cloneProjectTitlesByContext(savedSession.projectTitlesByContext);
+  appLanguage.value = savedSession.appLanguage;
+  applyAppLanguage(savedSession.appLanguage);
   appAppearance.value = savedSession.appAppearance;
   editorTheme.value = savedSession.editorTheme;
   applyAppTheme(savedSession.appAppearance);
   shortcutOverrides.value = cloneShortcutOverrides(savedSession.shortcutOverrides);
   applyShortcutOverrides(shortcutOverrides.value);
   workspaceIndicatorVisibility.value = cloneWorkspaceIndicatorVisibilitySettings(savedSession.workspaceIndicatorVisibility);
+  clipboardBehavior.value = cloneClipboardBehaviorSettings(savedSession.clipboardBehavior);
   workspaceTabDefaults.value = cloneWorkspaceTabDefaults(savedSession.workspaceTabDefaults);
   worktreeDetectionIntervalMs.value = savedSession.worktreeDetectionIntervalMs;
   dismissedWorktreePaths.value = cloneDismissedWorktreePaths(savedSession.dismissedWorktreePaths);
@@ -3633,7 +3662,7 @@ watch(repoPath, () => {
   scheduleSessionSave();
 });
 
-watch([recentRepos, workspaceOrder, appAppearance, editorTheme, shortcutOverrides, workspaceIndicatorVisibility, workspaceTabDefaults, soundNotificationsEnabled, terminalCommandPresets, dockerDialogState, workspaceTabs, workspaceEditorPaneLayout, workspaceMultiDisplayTabIds, activeWorkspaceTabId, workspaceRepoPanelStates], () => {
+watch([recentRepos, workspaceOrder, appLanguage, appAppearance, editorTheme, shortcutOverrides, workspaceIndicatorVisibility, clipboardBehavior, workspaceTabDefaults, soundNotificationsEnabled, terminalCommandPresets, dockerDialogState, workspaceTabs, workspaceEditorPaneLayout, workspaceMultiDisplayTabIds, activeWorkspaceTabId, workspaceRepoPanelStates], () => {
   if (canPersistSession()) {
     captureWorkspaceSession(getCurrentWorkspaceId());
   }
@@ -3723,6 +3752,7 @@ onMounted(async () => {
   window.addEventListener(CLIPBOARD_HISTORY_UPDATED_EVENT, handleClipboardHistoryUpdated as EventListener);
   window.addEventListener('beforeunload', handleWindowBeforeUnload);
   removeCloseRequestedListener = window.bridgegit?.session?.onCloseRequested(handleMainCloseRequested) ?? null;
+  applyAppLanguage(appLanguage.value);
   applyAppTheme(appAppearance.value);
 
   let initialSession = await loadSession();
@@ -3755,12 +3785,15 @@ onMounted(async () => {
 
   soundNotificationsEnabled.value = initialSession.soundNotificationsEnabled;
   projectTitlesByContext.value = cloneProjectTitlesByContext(initialSession.projectTitlesByContext);
+  appLanguage.value = initialSession.appLanguage;
+  applyAppLanguage(initialSession.appLanguage);
   appAppearance.value = initialSession.appAppearance;
   editorTheme.value = initialSession.editorTheme;
   applyAppTheme(initialSession.appAppearance);
   shortcutOverrides.value = cloneShortcutOverrides(initialSession.shortcutOverrides);
   applyShortcutOverrides(shortcutOverrides.value);
   workspaceIndicatorVisibility.value = cloneWorkspaceIndicatorVisibilitySettings(initialSession.workspaceIndicatorVisibility);
+  clipboardBehavior.value = cloneClipboardBehaviorSettings(initialSession.clipboardBehavior);
   workspaceTabDefaults.value = cloneWorkspaceTabDefaults(initialSession.workspaceTabDefaults);
   worktreeDetectionIntervalMs.value = initialSession.worktreeDetectionIntervalMs;
   dismissedWorktreePaths.value = cloneDismissedWorktreePaths(initialSession.dismissedWorktreePaths);
@@ -3887,6 +3920,7 @@ onBeforeUnmount(() => {
     <div ref="shellRef" class="app__shell">
       <aside v-if="!sidebarCollapsed" class="app__sidebar">
         <RepoPanel
+          :app-language="appLanguage"
           :project-title="displayProjectTitle"
           :repo-path="repoPath"
           :appearance-theme="appAppearance"
@@ -3953,7 +3987,7 @@ onBeforeUnmount(() => {
         v-if="showShellDivider"
         class="app__divider app__divider--shell app__divider--vertical"
         type="button"
-        aria-label="Resize git sidebar"
+        :aria-label="tt('app.resizeGitSidebar')"
         @pointerdown="startResize('sidebar', $event)"
       />
 
@@ -3963,6 +3997,7 @@ onBeforeUnmount(() => {
       >
         <div v-if="!diffCollapsed" class="app__surface app__surface--diff">
           <DiffViewer
+            :app-language="appLanguage"
             :repo-path="repoPath"
             :viewer-mode="diffViewerMode"
             :title="diffViewerTitle"
@@ -3980,6 +4015,7 @@ onBeforeUnmount(() => {
             :can-discard-current="canDiscardCurrentDiff"
             :can-open-current-file="canOpenCurrentDiffInEditor"
             :stage-action-label="stageActionLabel"
+            :selection-auto-copy-enabled="clipboardBehavior.selectionAutoCopy"
             :can-collapse="canCollapseDiff"
             :collapse-shortcut-display="SHORTCUTS.panelDiffToggle.display"
             @select-previous="handleSelectAdjacentDiff(-1)"
@@ -3998,7 +4034,7 @@ onBeforeUnmount(() => {
           class="app__divider app__divider--content"
           :class="isDiffSplitHorizontal ? 'app__divider--content-vertical' : 'app__divider--horizontal'"
           type="button"
-          aria-label="Resize right pane split"
+          :aria-label="tt('app.resizeRightPaneSplit')"
           @pointerdown="startResize('content', $event)"
         />
 
@@ -4007,6 +4043,7 @@ onBeforeUnmount(() => {
             ref="terminalPanelRef"
             v-if="sessionReady"
             :workspace-id="getCurrentWorkspaceId()"
+            :app-language="appLanguage"
             :cwd="terminalCwd"
             :project-root="repoPath"
             :appearance-theme="appAppearance"
@@ -4014,6 +4051,8 @@ onBeforeUnmount(() => {
             :editor-theme-variant="resolvedEditorThemeVariant"
             :editor-theme="resolvedEditorTheme"
             :presets="terminalCommandPresets"
+            :right-click-paste-enabled="clipboardBehavior.rightClickPaste"
+            :selection-auto-copy-enabled="clipboardBehavior.selectionAutoCopy"
             :sound-notifications-enabled="soundNotificationsEnabled"
             :workspace-tab-defaults="workspaceTabDefaults"
             :tabs="workspaceTabs"
@@ -4040,10 +4079,10 @@ onBeforeUnmount(() => {
 
         <div v-if="!hasVisibleRightPanels" class="app__surface app__surface--empty">
           <div class="app__empty-state">
-            <span class="app__empty-eyebrow">Panels</span>
-            <h2 class="app__empty-title">Diff and tabs are collapsed</h2>
+            <span class="app__empty-eyebrow">{{ tt('app.empty.eyebrow') }}</span>
+            <h2 class="app__empty-title">{{ tt('app.empty.title') }}</h2>
             <p class="app__empty-copy">
-              Restore a panel from the footer or use its keyboard shortcut.
+              {{ tt('app.empty.copy') }}
             </p>
           </div>
         </div>
@@ -4052,6 +4091,7 @@ onBeforeUnmount(() => {
     </div>
 
     <StatusBar
+      :app-language="appLanguage"
       :branch="branch"
       :repo-name="repoName"
       :changed-count="changedCount"
@@ -4072,11 +4112,13 @@ onBeforeUnmount(() => {
       :has-unread-info-note="hasUnreadInfoNote"
       :sidebar-side="sidebarSide"
       :diff-placement="diffPlacement"
+      :app-language="appLanguage"
       :app-appearance="appAppearance"
       :editor-theme="editorTheme"
       :shortcut-overrides="shortcutOverrides"
       :workspace-panel-font-size="repoPanelFontSize"
       :workspace-indicator-visibility="workspaceIndicatorVisibility"
+      :clipboard-behavior="clipboardBehavior"
       :workspace-tab-defaults="workspaceTabDefaults"
       :worktree-detection-interval-ms="worktreeDetectionIntervalMs"
       :sound-notifications-enabled="soundNotificationsEnabled"
@@ -4087,6 +4129,7 @@ onBeforeUnmount(() => {
 
     <DockerDialog
       v-model="isDockerDialogOpen"
+      :app-language="appLanguage"
       :active-view="dockerDialogState.activeView"
       :expanded-group-ids="dockerDialogState.expandedGroupIds"
       :project-root="repoPath"
@@ -4097,6 +4140,7 @@ onBeforeUnmount(() => {
 
     <CommitHistoryDialog
       v-model="isCommitHistoryOpen"
+      :app-language="appLanguage"
       :sidebar-side="sidebarSide"
       :sidebar-width="sidebarWidth"
       :workspace-panel-font-size="repoPanelFontSize"
@@ -4149,15 +4193,15 @@ onBeforeUnmount(() => {
       >
         <header class="app__clipboard-history-header">
           <div class="app__clipboard-history-heading">
-            <p class="app__clipboard-history-eyebrow">Clipboard</p>
-            <h2 id="clipboard-history-title" class="app__clipboard-history-title">Clipboard History</h2>
-            <p class="app__clipboard-history-meta">Recent unique entries from copy and selection.</p>
+            <p class="app__clipboard-history-eyebrow">{{ tt('app.clipboard.eyebrow') }}</p>
+            <h2 id="clipboard-history-title" class="app__clipboard-history-title">{{ tt('app.clipboard.title') }}</h2>
+            <p class="app__clipboard-history-meta">{{ tt('app.clipboard.meta') }}</p>
           </div>
 
           <button
             class="app__clipboard-history-close"
             type="button"
-            aria-label="Close clipboard history"
+            :aria-label="tt('app.clipboard.close')"
             @click="closeClipboardHistoryDialog"
           >
             ×
@@ -4175,7 +4219,7 @@ onBeforeUnmount(() => {
               v-model="clipboardHistoryQuery"
               class="app__clipboard-history-search-input"
               type="search"
-              placeholder="Filter clipboard history"
+              :placeholder="tt('app.clipboard.filter')"
               @keydown="handleClipboardHistoryKeydown"
             >
           </label>
@@ -4198,7 +4242,7 @@ onBeforeUnmount(() => {
                 <span class="app__clipboard-history-item-header">
                   <span class="app__clipboard-history-item-labels">
                     <span class="app__clipboard-history-item-index">#{{ index + 1 }}</span>
-                    <span v-if="index === 0" class="app__clipboard-history-item-badge">latest</span>
+                    <span v-if="index === 0" class="app__clipboard-history-item-badge">{{ tt('app.clipboard.latest') }}</span>
                   </span>
                   <span class="app__clipboard-history-item-time">{{ formatClipboardHistoryCapturedAt(item.capturedAt) }}</span>
                 </span>
@@ -4208,8 +4252,8 @@ onBeforeUnmount(() => {
           </ul>
 
           <div v-else class="app__clipboard-history-empty">
-            <p class="app__clipboard-history-empty-title">Clipboard history is empty</p>
-            <p class="app__clipboard-history-empty-copy">Copy or select some text first.</p>
+            <p class="app__clipboard-history-empty-title">{{ tt('app.clipboard.emptyTitle') }}</p>
+            <p class="app__clipboard-history-empty-copy">{{ tt('app.clipboard.emptyCopy') }}</p>
           </div>
         </div>
       </section>

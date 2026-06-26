@@ -17,11 +17,13 @@ import typescriptLanguage from 'highlight.js/lib/languages/typescript';
 import xmlLanguage from 'highlight.js/lib/languages/xml';
 import yamlLanguage from 'highlight.js/lib/languages/yaml';
 import { computed, onBeforeUnmount, onMounted, onUpdated, ref } from 'vue';
-import type { GitDiffMode } from '../../shared/bridgegit';
+import type { AppLanguage, GitDiffMode } from '../../shared/bridgegit';
 import { writeClipboardText as writeSharedClipboardText } from '../clipboard';
+import { t } from '../i18n';
 import CopyableErrorNotice from './CopyableErrorNotice.vue';
 
 interface Props {
+  appLanguage: AppLanguage;
   repoPath: string | null;
   viewerMode: 'working-tree' | 'commit';
   viewMode?: 'side-by-side' | 'line-by-line';
@@ -42,6 +44,7 @@ interface Props {
   canDiscardCurrent: boolean;
   canOpenCurrentFile: boolean;
   stageActionLabel: string;
+  selectionAutoCopyEnabled?: boolean;
   canCollapse: boolean;
   collapseShortcutDisplay: string;
 }
@@ -123,26 +126,27 @@ const rootRef = ref<HTMLElement | null>(null);
 const internalViewMode = ref<'side-by-side' | 'line-by-line'>('side-by-side');
 const copyToast = ref<string | null>(null);
 const isCommitMode = computed(() => props.viewerMode === 'commit');
+const tt = (key: string, params?: Record<string, string | number>) => t(props.appLanguage, key, params);
 const currentViewMode = computed(() => props.viewMode ?? internalViewMode.value);
 const showViewToggle = computed(() => props.showViewToggle ?? true);
 const resolvedEyebrowText = computed(() => (
   props.eyebrowText === undefined
-    ? (isCommitMode.value ? 'Commit Diff' : 'Diff Viewer')
+    ? (isCommitMode.value ? tt('diff.eyebrow.commit') : tt('diff.eyebrow.viewer'))
     : props.eyebrowText
 ));
 const isSideBySide = computed(() => currentViewMode.value === 'side-by-side');
 const viewToggleTitle = computed(() => (
-  isSideBySide.value ? 'Switch diff to unified view' : 'Switch diff to side by side view'
+  isSideBySide.value ? tt('diff.switchUnified') : tt('diff.switchSideBySide')
 ));
 const collapseButtonTitle = computed(() => (
   props.canCollapse
-    ? `Collapse diff panel ${props.collapseShortcutDisplay}`
-    : 'Diff panel cannot be collapsed while it is the last visible panel'
+    ? tt('diff.collapseTitle', { shortcut: props.collapseShortcutDisplay })
+    : tt('diff.cannotCollapse')
 ));
 const canDiscardHunks = computed(() => !isCommitMode.value && props.gitDiffMode !== 'working-tree' ? true : !isCommitMode.value);
 const currentDiffTargetLine = computed(() => findFirstChangedLine(props.diff));
 const openCurrentFileLabel = computed(() => (
-  currentDiffTargetLine.value ? `Open at line ${currentDiffTargetLine.value}` : 'Open file'
+  currentDiffTargetLine.value ? tt('diff.openAtLine', { line: currentDiffTargetLine.value }) : tt('diff.openFile')
 ));
 let copySelectionTimer: number | null = null;
 let copyToastTimer: number | null = null;
@@ -371,7 +375,7 @@ function buildLineActions(headerLines: string[], hunkLines: string[], hunkIndex:
 
     lineActions.push({
       id: `hunk-${hunkIndex + 1}-line-${lineActionIndex + 1}`,
-      label: `Discard line ${targetLineNumber}`,
+      label: tt('diff.discardLine', { line: targetLineNumber }),
       patch,
     });
     lineActionIndex += 1;
@@ -694,9 +698,20 @@ function showCopyToast(message: string) {
   }, 1800);
 }
 
-function scheduleSelectionCopy() {
+function scheduleSelectionCopy({ force = false }: { force?: boolean } = {}) {
+  if (props.selectionAutoCopyEnabled === false) {
+    lastCopiedSelection = null;
+    selectionCopyPendingAfterPointer = false;
+    clearPendingSelectionCopy();
+    return;
+  }
+
   if (selectionPointerActive) {
     selectionCopyPendingAfterPointer = true;
+    return;
+  }
+
+  if (!force) {
     return;
   }
 
@@ -719,11 +734,15 @@ function scheduleSelectionCopy() {
     try {
       await writeClipboard(currentSelection);
       lastCopiedSelection = currentSelection;
-      showCopyToast('Copied');
+      showCopyToast(tt('diff.copied'));
     } catch {
-      showCopyToast('Copy failed');
+      showCopyToast(tt('diff.copyFailed'));
     }
   }, 90);
+}
+
+function handleDocumentSelectionChange() {
+  scheduleSelectionCopy();
 }
 
 function handleDocumentPointerDown(event: PointerEvent) {
@@ -747,7 +766,7 @@ function handleDocumentPointerUp() {
   }
 
   selectionCopyPendingAfterPointer = false;
-  scheduleSelectionCopy();
+  scheduleSelectionCopy({ force: true });
 }
 
 onMounted(() => {
@@ -755,7 +774,7 @@ onMounted(() => {
   annotateDiffTargets();
   document.addEventListener('pointerdown', handleDocumentPointerDown);
   document.addEventListener('pointerup', handleDocumentPointerUp);
-  document.addEventListener('selectionchange', scheduleSelectionCopy);
+  document.addEventListener('selectionchange', handleDocumentSelectionChange);
 });
 
 onUpdated(() => {
@@ -766,7 +785,7 @@ onUpdated(() => {
 onBeforeUnmount(() => {
   document.removeEventListener('pointerdown', handleDocumentPointerDown);
   document.removeEventListener('pointerup', handleDocumentPointerUp);
-  document.removeEventListener('selectionchange', scheduleSelectionCopy);
+  document.removeEventListener('selectionchange', handleDocumentSelectionChange);
   clearPendingSelectionCopy();
 
   if (copyToastTimer) {
@@ -794,8 +813,8 @@ onBeforeUnmount(() => {
           class="diff-viewer__icon-button"
           type="button"
           :disabled="!canSelectPrevious"
-          title="Previous change"
-          aria-label="Previous change"
+          :title="tt('diff.previousChange')"
+          :aria-label="tt('diff.previousChange')"
           @click="emit('select-previous')"
         >
           <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -828,8 +847,8 @@ onBeforeUnmount(() => {
           class="diff-viewer__icon-button"
           type="button"
           :disabled="!canSelectNext"
-          title="Next change"
-          aria-label="Next change"
+          :title="tt('diff.nextChange')"
+          :aria-label="tt('diff.nextChange')"
           @click="emit('select-next')"
         >
           <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -858,7 +877,7 @@ onBeforeUnmount(() => {
           :disabled="!canDiscardCurrent"
           @click="emit('discard-current')"
         >
-          Discard current
+          {{ tt('diff.discardCurrent') }}
         </button>
 
         <button
@@ -886,7 +905,7 @@ onBeforeUnmount(() => {
           class="diff-viewer__icon-button"
           type="button"
           :title="collapseButtonTitle"
-          aria-label="Collapse diff panel"
+          :aria-label="tt('diff.collapseAria')"
           @click="emit('toggle-collapse')"
         >
           <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -902,26 +921,27 @@ onBeforeUnmount(() => {
       <CopyableErrorNotice
         v-if="error"
         class="diff-viewer__badge diff-viewer__badge--remove"
+        :app-language="appLanguage"
         :message="error"
       />
     </div>
 
     <div v-if="!repoPath" class="diff-viewer__empty">
-      Open a Git repository to inspect diffs.
+      {{ tt('diff.noRepo') }}
     </div>
 
     <div v-else-if="!hasTarget" class="diff-viewer__empty">
       {{ isCommitMode
-        ? 'Pick a commit in history to render its patch.'
-        : 'Pick a file in the Repo panel to render its patch.' }}
+        ? tt('diff.pickCommit')
+        : tt('diff.pickFile') }}
     </div>
 
     <div v-else-if="isLoading && !hasDiff" class="diff-viewer__empty">
-      Loading diff...
+      {{ tt('diff.loading') }}
     </div>
 
     <div v-else-if="!hasDiff" class="diff-viewer__empty">
-      No textual diff is available for this file yet. Untracked files usually show content after staging.
+      {{ tt('diff.noTextual') }}
     </div>
 
     <div v-else-if="shouldRenderHunkSections" class="diff-viewer__rendered diff-viewer__rendered--hunks">
@@ -931,7 +951,7 @@ onBeforeUnmount(() => {
         class="diff-viewer__hunk"
       >
         <header class="diff-viewer__hunk-header">
-          <span class="diff-viewer__hunk-label">Hunk {{ index + 1 }}</span>
+          <span class="diff-viewer__hunk-label">{{ tt('diff.hunkLabel', { index: index + 1 }) }}</span>
           <div class="diff-viewer__hunk-actions">
             <button
               v-if="canDiscardHunks"
@@ -939,7 +959,7 @@ onBeforeUnmount(() => {
               type="button"
               @click="emit('discard-hunk', hunk.patch)"
             >
-              Discard hunk
+              {{ tt('diff.discardHunk') }}
             </button>
           </div>
         </header>

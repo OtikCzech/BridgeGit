@@ -1,8 +1,11 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref } from 'vue';
+import type { AppLanguage } from '../../shared/bridgegit';
 import { writeClipboardText as writeSharedClipboardText } from '../clipboard';
+import { t } from '../i18n';
 
 interface Props {
+  appLanguage: AppLanguage;
   message: string;
   detail?: string | null;
 }
@@ -12,6 +15,7 @@ const copyToast = ref<string | null>(null);
 
 let copyToastTimer: number | null = null;
 
+const tt = (key: string, params?: Record<string, string | number>) => t(props.appLanguage, key, params);
 const normalizedMessage = computed(() => props.message.trim());
 const normalizedDetail = computed(() => props.detail?.trim() || null);
 const textToCopy = computed(() => {
@@ -26,7 +30,7 @@ const titleText = computed(() => {
     ? normalizedDetail.value
     : normalizedMessage.value;
 
-  return `${baseDetail}\n\nKlikni pro zkopírování chyby.`;
+  return `${baseDetail}\n\n${tt('copyableError.copyHint')}`;
 });
 
 function showCopyToast(message: string) {
@@ -55,9 +59,9 @@ async function copyError() {
 
   try {
     await writeClipboardText(nextText);
-    showCopyToast('Copied');
+    showCopyToast(tt('clipboard.copied'));
   } catch {
-    showCopyToast('Copy failed');
+    showCopyToast(tt('clipboard.copyFailed'));
   }
 }
 

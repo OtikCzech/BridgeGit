@@ -502,6 +502,11 @@ export interface WorkspaceIndicatorVisibilitySettings {
   attention: boolean;
 }
 
+export interface ClipboardBehaviorSettings {
+  rightClickPaste: boolean;
+  selectionAutoCopy: boolean;
+}
+
 export type AppAppearance = 'bridgegit-dark' | 'bridgegit-light' | 'github-dark' | 'github-light' | 'nord';
 export type EditorThemePreset = AppAppearance;
 export type EditorTheme = 'follow-app' | EditorThemePreset;
@@ -514,6 +519,7 @@ export interface WorkspaceTabDefaults {
   noteFontSize: number;
   noteViewMode: WorkspaceNoteViewMode;
   noteLineNumbers: boolean;
+  noteLineWrapping: boolean;
 }
 
 export type WorktreeDetectionInterval = 60_000 | 180_000 | 300_000 | 900_000 | null;
@@ -661,6 +667,19 @@ export type ShortcutOverrides = Record<string, ShortcutOverride>;
 
 export type ProjectTitleMode = 'auto' | 'custom';
 
+export type AppLanguage =
+  | 'en'
+  | 'cs'
+  | 'es'
+  | 'de'
+  | 'fr'
+  | 'pt'
+  | 'pl'
+  | 'uk'
+  | 'zh'
+  | 'ja'
+  | 'ko';
+
 export interface SessionData {
   persistenceRevision: number;
   lastRepoPath: string | null;
@@ -676,10 +695,12 @@ export interface SessionData {
   projectTitle: string;
   projectTitleMode: ProjectTitleMode;
   projectTitlesByContext: Record<string, string>;
+  appLanguage: AppLanguage;
   appAppearance: AppAppearance;
   editorTheme: EditorTheme;
   shortcutOverrides: ShortcutOverrides;
   workspaceIndicatorVisibility: WorkspaceIndicatorVisibilitySettings;
+  clipboardBehavior: ClipboardBehaviorSettings;
   workspaceTabDefaults: WorkspaceTabDefaults;
   worktreeDetectionIntervalMs: WorktreeDetectionInterval;
   dismissedWorktreePaths: string[];
@@ -702,11 +723,13 @@ export interface ProjectSettingsFormData {
   projectTitle: string;
   sidebarSide: PanelLayout['sidebarSide'];
   diffPlacement: PanelLayout['diffPlacement'];
+  appLanguage: AppLanguage;
   appAppearance: AppAppearance;
   editorTheme: EditorTheme;
   shortcutOverrides: ShortcutOverrides;
   workspacePanelFontSize: number;
   workspaceIndicatorVisibility: WorkspaceIndicatorVisibilitySettings;
+  clipboardBehavior: ClipboardBehaviorSettings;
   workspaceTabDefaults: WorkspaceTabDefaults;
   worktreeDetectionIntervalMs: WorktreeDetectionInterval;
   soundNotificationsEnabled: boolean;
@@ -717,6 +740,12 @@ export function cloneWorkspaceIndicatorVisibilitySettings(
   workspaceIndicatorVisibility: WorkspaceIndicatorVisibilitySettings,
 ): WorkspaceIndicatorVisibilitySettings {
   return { ...workspaceIndicatorVisibility };
+}
+
+export function cloneClipboardBehaviorSettings(
+  clipboardBehavior: ClipboardBehaviorSettings,
+): ClipboardBehaviorSettings {
+  return { ...clipboardBehavior };
 }
 
 export function cloneShortcutOverrides(shortcutOverrides: ShortcutOverrides): ShortcutOverrides {
@@ -868,6 +897,25 @@ export function normalizeEditorTheme(editorTheme: EditorTheme | null | undefined
   return 'follow-app';
 }
 
+export function normalizeAppLanguage(appLanguage: AppLanguage | null | undefined): AppLanguage {
+  if (
+    appLanguage === 'cs'
+    || appLanguage === 'es'
+    || appLanguage === 'de'
+    || appLanguage === 'fr'
+    || appLanguage === 'pt'
+    || appLanguage === 'pl'
+    || appLanguage === 'uk'
+    || appLanguage === 'zh'
+    || appLanguage === 'ja'
+    || appLanguage === 'ko'
+  ) {
+    return appLanguage;
+  }
+
+  return 'en';
+}
+
 export function resolveThemeVariant(theme: AppAppearance | EditorTheme | ResolvedEditorTheme): ThemeVariant {
   return theme === 'bridgegit-light' || theme === 'github-light' ? 'light' : 'dark';
 }
@@ -1010,6 +1058,7 @@ export const DEFAULT_SESSION_DATA: SessionData = {
   projectTitle: 'BridgeGit',
   projectTitleMode: 'auto',
   projectTitlesByContext: {},
+  appLanguage: 'en',
   appAppearance: 'bridgegit-dark',
   editorTheme: 'follow-app',
   shortcutOverrides: {},
@@ -1018,11 +1067,16 @@ export const DEFAULT_SESSION_DATA: SessionData = {
     activity: true,
     attention: true,
   },
+  clipboardBehavior: {
+    rightClickPaste: true,
+    selectionAutoCopy: true,
+  },
   workspaceTabDefaults: {
     shellFontSize: DEFAULT_SHELL_FONT_SIZE,
     noteFontSize: DEFAULT_NOTE_FONT_SIZE,
     noteViewMode: 'split',
     noteLineNumbers: true,
+    noteLineWrapping: true,
   },
   worktreeDetectionIntervalMs: 180_000,
   dismissedWorktreePaths: [],

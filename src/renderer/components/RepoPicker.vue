@@ -1,15 +1,20 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
-import type { RecentRepoEntry } from '../../shared/bridgegit';
+import type { AppLanguage, RecentRepoEntry } from '../../shared/bridgegit';
+import { t } from '../i18n';
 
 interface Props {
+  appLanguage?: AppLanguage;
   repoPath: string | null;
   recentRepos: RecentRepoEntry[];
   projectTitlesByContext: Record<string, string>;
   isBusy?: boolean;
 }
 
-const props = defineProps<Props>();
+const props = withDefaults(defineProps<Props>(), {
+  appLanguage: 'en',
+});
+const tt = (key: string, params?: Record<string, string | number>) => t(props.appLanguage, key, params);
 
 const emit = defineEmits<{
   open: [];
@@ -111,13 +116,13 @@ onBeforeUnmount(() => {
       <button
         class="repo-picker__path-button"
         type="button"
-        :title="repoPath ?? 'Choose or reopen a repository'"
+        :title="repoPath ?? tt('repoPicker.choose')"
         :aria-expanded="isMenuOpen"
         aria-haspopup="dialog"
         @click="toggleMenu"
       >
         <span class="repo-picker__path">
-          {{ repoPath ?? 'Choose or reopen a repository' }}
+          {{ repoPath ?? tt('repoPicker.choose') }}
         </span>
         <span class="repo-picker__chevron" aria-hidden="true">▾</span>
       </button>
@@ -126,8 +131,8 @@ onBeforeUnmount(() => {
         class="repo-picker__icon-button"
         type="button"
         :disabled="isBusy"
-        title="Open repository folder"
-        aria-label="Open repository folder"
+        :title="tt('repoPicker.openFolder')"
+        :aria-label="tt('repoPicker.openFolder')"
         @click="$emit('open')"
       >
         <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -138,13 +143,13 @@ onBeforeUnmount(() => {
       </button>
     </div>
 
-    <section v-if="isMenuOpen" class="repo-picker__menu" role="dialog" aria-label="Recent repositories">
+    <section v-if="isMenuOpen" class="repo-picker__menu" role="dialog" :aria-label="tt('repoPicker.recent')">
       <div class="repo-picker__search-shell">
         <input
           v-model="filter"
           class="repo-picker__search"
           type="search"
-          placeholder="Filter repositories"
+          :placeholder="tt('repoPicker.filter')"
           autocomplete="off"
         />
       </div>
@@ -166,7 +171,7 @@ onBeforeUnmount(() => {
       </div>
 
       <div v-else class="repo-picker__empty">
-        No repositories match the current filter.
+        {{ tt('repoPicker.empty') }}
       </div>
     </section>
   </div>

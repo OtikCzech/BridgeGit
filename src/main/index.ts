@@ -88,6 +88,15 @@ function formatErrorMessage(error: unknown): string {
   return 'Unexpected file system error.';
 }
 
+function isSafeExternalUrl(value: string) {
+  try {
+    const url = new URL(value);
+    return url.protocol === 'http:' || url.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
 async function readNoteFileHandle(filePath: string): Promise<NoteFileHandle> {
   const resolvedFilePath = await resolveReadableFilePath(filePath);
   const [content, fileStat] = await Promise.all([
@@ -294,7 +303,9 @@ async function createMainWindow() {
   };
 
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    void shell.openExternal(url);
+    if (isSafeExternalUrl(url)) {
+      void shell.openExternal(url);
+    }
     return { action: 'deny' };
   });
 
@@ -523,6 +534,13 @@ function registerCoreIpcHandlers() {
     } else {
       shell.beep();
     }
+  });
+  ipcMain.handle('system:openExternalUrl', async (_event, url: string) => {
+    if (!isSafeExternalUrl(url)) {
+      throw new Error('Only http and https links can be opened externally.');
+    }
+
+    await shell.openExternal(url);
   });
 
   ipcMain.handle('session:load', async () => loadSession());

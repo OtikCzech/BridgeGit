@@ -6,6 +6,7 @@ import { nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import {
   normalizeShellFontSize,
   type AppAppearance,
+  type AppLanguage,
   type CodeNavigationTarget,
   type NoteFileHandle,
   type TerminalCommandPreset,
@@ -24,6 +25,7 @@ import {
 } from '../clipboard';
 import { useClipboardHistoryTarget } from '../composables/useClipboardHistoryTarget';
 import CopyableErrorNotice from './CopyableErrorNotice.vue';
+import { t } from '../i18n';
 import { SHORTCUTS, matchesCommandSlotShortcut, matchesShortcut } from '../shortcuts';
 import { useTerminal } from '../composables/useTerminal';
 
@@ -32,9 +34,12 @@ interface Props {
   cwd: string;
   shell?: string | null;
   projectRoot?: string | null;
+  appLanguage: AppLanguage;
   fontSize: number;
   appearanceTheme: AppAppearance;
   appearanceThemeVariant: ThemeVariant;
+  rightClickPasteEnabled: boolean;
+  selectionAutoCopyEnabled: boolean;
   active: boolean;
   reconnectToken?: number;
 }
@@ -72,7 +77,9 @@ const {
 } = useTerminal(props.sessionKey);
 const OUTPUT_BUFFER_LIMIT = 12000;
 const DEFAULT_PROMPT_TIMEOUT_MS = 20_000;
+const RIGHT_CLICK_PASTE_DUPLICATE_WINDOW_MS = 700;
 const terminalFontSize = ref(normalizeShellFontSize(props.fontSize));
+const tt = (key: string, params?: Record<string, string | number>) => t(props.appLanguage, key, params);
 
 interface PromptWaiter {
   pattern: RegExp;
@@ -98,6 +105,14 @@ let plainTextBufferOffset = 0;
 let activePresetExecutionId = 0;
 let nextPresetExecutionId = 1;
 let lastChoicePromptOffset = -1;
+let lastSentInput = {
+  data: '',
+  at: 0,
+};
+let lastRightClickPasteInput = {
+  data: '',
+  at: 0,
+};
 const promptWaiters = new Set<PromptWaiter>();
 const terminalWheelListenerOptions = {
   passive: false,
@@ -264,7 +279,7 @@ async function activateTerminalFileLink(rawLinkText: string) {
   const targets = getTerminalNavigationTargets(rawLinkText);
 
   if (!targets.length || !window.bridgegit?.notes) {
-    showToast('No file target detected');
+    showToast(tt('terminal.link.noFileTarget'));
     return;
   }
 
@@ -276,7 +291,7 @@ async function activateTerminalFileLink(rawLinkText: string) {
         continue;
       }
 
-      showToast(`Opening ${resolvedTarget.file.path}`);
+      showToast(tt('terminal.link.openingFile', { path: resolvedTarget.file.path }));
       emit('open-navigation-target', {
         ...target,
         filePath: resolvedTarget.file.path,
@@ -286,9 +301,9 @@ async function activateTerminalFileLink(rawLinkText: string) {
       return;
     }
 
-    showToast(`File not found: ${targets[0]?.filePath ?? rawLinkText}`);
+    showToast(tt('terminal.link.fileNotFound', { path: targets[0]?.filePath ?? rawLinkText }));
   } catch {
-    showToast('Unable to open file link.');
+    showToast(tt('terminal.link.openFileLinkFailed'));
   }
 }
 
@@ -345,6 +360,12 @@ function registerTerminalFileLinkProvider() {
   };
 
   terminalFileLinkProviderDisposable = terminal.registerLinkProvider(linkProvider);
+}
+
+function openTerminalWebLink(_event: MouseEvent, uri: string) {
+  void window.bridgegit?.system.openExternalUrl(uri).catch(() => {
+    showToast(tt('terminal.link.openBrowserLinkFailed'));
+  });
 }
 
 function focusTerminal() {
@@ -450,9 +471,38 @@ function emitAttentionForChoicePrompt() {
   emit('attention');
 }
 
-function sendInput(data: string) {
+function sendInput(
+  data: string,
+  options: {
+    markRightClickPaste?: boolean;
+    skipRecentRightClickPasteDuplicate?: boolean;
+  } = {},
+) {
+  if (
+    options.skipRecentRightClickPasteDuplicate
+    && data === lastRightClickPasteInput.data
+    && Date.now() - lastRightClickPasteInput.at <= RIGHT_CLICK_PASTE_DUPLICATE_WINDOW_MS
+  ) {
+    lastRightClickPasteInput = {
+      data: '',
+      at: 0,
+    };
+    terminal?.focus();
+    return;
+  }
+
   suppressActivityUntilInput = false;
   lastChoicePromptOffset = getAbsoluteOutputOffset();
+  lastSentInput = {
+    data,
+    at: Date.now(),
+  };
+  if (options.markRightClickPaste) {
+    lastRightClickPasteInput = {
+      data,
+      at: lastSentInput.at,
+    };
+  }
   emit('input', data);
   write(data);
 }
@@ -536,16 +586,35 @@ async function writeClipboard(text: string) {
   await writeSharedClipboardText(text);
 }
 
-async function pasteTextFromClipboard(eventText?: string | null) {
+async function pasteTextFromClipboard(
+  eventText?: string | null,
+  options: {
+    forceSystemRead?: boolean;
+    markRightClickPaste?: boolean;
+    skipRecentDuplicate?: boolean;
+  } = {},
+) {
   const resolvedText = await readSharedClipboardText({
     eventText,
+    forceSystemRead: options.forceSystemRead,
   });
 
   if (!resolvedText) {
     return;
   }
 
-  sendInput(resolvedText);
+  if (
+    options.skipRecentDuplicate
+    && resolvedText === lastSentInput.data
+    && Date.now() - lastSentInput.at <= RIGHT_CLICK_PASTE_DUPLICATE_WINDOW_MS
+  ) {
+    terminal?.focus();
+    return;
+  }
+
+  sendInput(resolvedText, {
+    markRightClickPaste: options.markRightClickPaste,
+  });
   terminal?.focus();
 }
 
@@ -554,6 +623,18 @@ function normalizeCopiedTerminalSelection(value: string) {
 }
 
 function scheduleSelectionCopy() {
+  if (!props.selectionAutoCopyEnabled) {
+    lastCopiedSelection = null;
+    selectionCopyPendingAfterPointer = false;
+
+    if (copySelectionTimer) {
+      window.clearTimeout(copySelectionTimer);
+      copySelectionTimer = null;
+    }
+
+    return;
+  }
+
   if (selectionPointerActive) {
     selectionCopyPendingAfterPointer = true;
     return;
@@ -588,9 +669,9 @@ function scheduleSelectionCopy() {
     try {
       await writeClipboard(selection);
       lastCopiedSelection = selection;
-      showToast('Copied');
+      showToast(tt('clipboard.copied'));
     } catch {
-      showToast('Copy failed');
+      showToast(tt('clipboard.copyFailed'));
     }
   }, 90);
 }
@@ -606,7 +687,7 @@ function handleTerminalCopy(event: ClipboardEvent) {
   event.clipboardData.setData('text/plain', selection);
   rememberClipboardText(selection);
   lastCopiedSelection = selection;
-  showToast('Copied');
+  showToast(tt('clipboard.copied'));
 }
 
 useClipboardHistoryTarget({
@@ -696,9 +777,17 @@ function handleTerminalPaste(event: ClipboardEvent) {
 }
 
 function handleContextMenuPaste(event: MouseEvent) {
+  if (!props.rightClickPasteEnabled) {
+    return;
+  }
+
   event.preventDefault();
   event.stopPropagation();
-  void pasteTextFromClipboard();
+  void pasteTextFromClipboard(null, {
+    forceSystemRead: true,
+    markRightClickPaste: true,
+    skipRecentDuplicate: true,
+  });
 }
 
 function handleTerminalKeydown(event: KeyboardEvent) {
@@ -720,6 +809,13 @@ function handleTerminalKeydown(event: KeyboardEvent) {
 
 function handleTerminalPointerdown(event: PointerEvent) {
   emit('activate');
+
+  if (event.button === 2 && !props.rightClickPasteEnabled) {
+    event.preventDefault();
+    event.stopPropagation();
+    terminal?.focus();
+    return;
+  }
 
   if (event.button !== 0) {
     return;
@@ -952,7 +1048,7 @@ function initializeTerminal() {
 
   fitAddon = new FitAddon();
   terminal.loadAddon(fitAddon);
-  terminal.loadAddon(new WebLinksAddon());
+  terminal.loadAddon(new WebLinksAddon(openTerminalWebLink));
   registerTerminalFileLinkProvider();
   terminal.attachCustomKeyEventHandler((event) => {
     if (isPasteShortcut(event)) {
@@ -965,7 +1061,7 @@ function initializeTerminal() {
     if (isCopyShortcut(event) && copyInterruptGuardActive) {
       event.preventDefault();
       event.stopPropagation();
-      showToast('Ctrl+C blocked during mouse selection');
+      showToast(tt('terminal.copyBlockedDuringSelection'));
       return false;
     }
 
@@ -990,7 +1086,9 @@ function initializeTerminal() {
   terminal.open(terminalRoot.value);
 
   terminal.onData((data) => {
-    sendInput(data);
+    sendInput(data, {
+      skipRecentRightClickPasteDuplicate: true,
+    });
   });
 
   terminal.onResize(({ cols, rows }) => {
@@ -1135,7 +1233,7 @@ onBeforeUnmount(() => {
   terminalFileLinkProviderDisposable?.dispose();
   terminalFileLinkProviderDisposable = null;
   resizeObserver?.disconnect();
-  rejectPromptWaiters('Terminal session closed.');
+  rejectPromptWaiters(tt('terminal.sessionClosed'));
   dispose();
   terminal?.dispose();
 });
@@ -1146,11 +1244,12 @@ onBeforeUnmount(() => {
     <CopyableErrorNotice
       v-if="error"
       class="terminal-session__notice terminal-session__notice--error"
+      :app-language="appLanguage"
       :message="error"
     />
 
     <div v-else-if="exitCode !== null" class="terminal-session__notice terminal-session__notice--info">
-      Process exited with code {{ exitCode }}.
+      {{ tt('terminal.processExitedWithCode', { code: exitCode }) }}
     </div>
 
     <div class="terminal-session__viewport">

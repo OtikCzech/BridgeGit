@@ -5,9 +5,11 @@ import { markdown, markdownLanguage } from '@codemirror/lang-markdown';
 import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands';
 import { bracketMatching, indentOnInput } from '@codemirror/language';
 import { highlightSelectionMatches, openSearchPanel, search, searchKeymap } from '@codemirror/search';
-import { Compartment, EditorSelection, EditorState } from '@codemirror/state';
+import { Compartment, EditorSelection, EditorState, StateField } from '@codemirror/state';
 import {
+  Decoration,
   EditorView,
+  type DecorationSet,
   drawSelection,
   highlightActiveLine,
   highlightActiveLineGutter,
@@ -17,6 +19,7 @@ import {
 } from '@codemirror/view';
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import {
+  type AppLanguage,
   normalizeNoteFontSize,
   type AppAppearance,
   type ResolvedEditorTheme,
@@ -32,10 +35,12 @@ import {
 import { bridgeGitEditorChromeTheme, getCodeEditorThemeExtension } from '../codemirror/codeEditor';
 import { useClipboardHistoryTarget } from '../composables/useClipboardHistoryTarget';
 import { useColumnSplitter } from '../composables/useColumnSplitter';
+import { t } from '../i18n';
 import { SHORTCUTS, matchesShortcut, shortcutBindingsRevision } from '../shortcuts';
 
 interface Props {
   active: boolean;
+  appLanguage: AppLanguage;
   busy: boolean;
   content: string;
   externalChange: WorkspaceExternalFileChangeState | null;
@@ -49,12 +54,16 @@ interface Props {
   viewMode: WorkspaceNoteTabState['viewMode'];
   splitRatio: number;
   lineNumbersEnabled: boolean;
+  lineWrappingEnabled: boolean;
   fontSize: number;
+  rightClickPasteEnabled: boolean;
+  selectionAutoCopyEnabled: boolean;
   cursor?: WorkspaceEditorCursorState;
 }
 
 const props = defineProps<Props>();
 const shortcutBindingsVersion = shortcutBindingsRevision;
+const tt = (key: string, params?: Record<string, string | number>) => t(props.appLanguage, key, params);
 
 const emit = defineEmits<{
   'dismiss-external-change': [];
@@ -70,6 +79,7 @@ const emit = defineEmits<{
   'update:cursor': [cursor: WorkspaceEditorCursorState];
   'update:font-size': [fontSize: number];
   'update:line-numbers-enabled': [enabled: boolean];
+  'update:line-wrapping-enabled': [enabled: boolean];
   'update:split-ratio': [splitRatio: number];
   'update:view-mode': [viewMode: WorkspaceNoteTabState['viewMode']];
 }>();
@@ -89,15 +99,17 @@ const searchVisible = ref(false);
 const searchQuery = ref('');
 const activePreviewMatchIndex = ref(0);
 const previewMatchCount = ref(0);
-const renderedMarkdown = ref('<p class="note-tab__preview-empty">Nothing to preview yet.</p>');
+const renderedMarkdown = ref('');
 
 const editableCompartment = new Compartment();
 const languageCompartment = new Compartment();
 const themeCompartment = new Compartment();
 const lineNumbersCompartment = new Compartment();
+const lineWrappingCompartment = new Compartment();
 let editorView: EditorView | null = null;
 let suppressContentSync = false;
 const lineNumbersEnabled = ref(props.lineNumbersEnabled);
+const lineWrappingEnabled = ref(props.lineWrappingEnabled);
 let copyToastTimer: number | null = null;
 let copySelectionTimer: number | null = null;
 let lastCopiedSelection: string | null = null;
@@ -119,7 +131,8 @@ const TASK_COPY_MENU_WIDTH = 176;
 const TASK_COPY_MENU_HEIGHT = 116;
 const NOTE_VIEW_MODES: WorkspaceNoteTabState['viewMode'][] = ['source', 'split', 'preview'];
 const NOTE_FILE_EXTENSIONS = new Set(['md', 'markdown', 'txt']);
-const TASK_LINE_PATTERN = /^(\s*(?:>\s*)*(?:[-*+]|\d+[.)])\s+\[)([ xX./\-!])(\].*)$/;
+const TASK_LINE_PATTERN = /^(\s*(?:>\s*)*(?:(?:[-*+]|\d+[.)])\s+)?\[)([ xX./\-!])(\].*)$/;
+const BARE_TASK_MARKER_PATTERN = /^(\s*(?:>\s*)*)\[[ xX./\-!]\]/;
 const CODE_LANGUAGE_ALIASES: Record<string, string> = {
   js: 'javascript',
   jsx: 'javascript',
@@ -164,6 +177,7 @@ type NoteTaskState = 'open' | 'in-progress' | 'waiting' | 'done' | 'cancelled';
 interface RenderedMarkdownTask {
   taskIndex: number;
   state: NoteTaskState;
+  isBare: boolean;
 }
 
 interface ParsedNoteTask {
@@ -184,21 +198,74 @@ const TASK_STATE_MARKERS: Record<NoteTaskState, string> = {
   cancelled: '!',
 };
 
-const TASK_STATE_MENU_ITEMS: Array<{ state: NoteTaskState; label: string }> = [
-  { state: 'open', label: 'Open' },
-  { state: 'in-progress', label: 'In progress' },
-  { state: 'waiting', label: 'Waiting' },
-  { state: 'done', label: 'Done' },
-  { state: 'cancelled', label: 'Cancelled' },
-];
-const TASK_FILTER_ITEMS: Array<{ value: 'all' | NoteTaskState; label: string }> = [
-  { value: 'all', label: 'All' },
-  { value: 'open', label: 'Open' },
-  { value: 'in-progress', label: 'Active' },
-  { value: 'waiting', label: 'Waiting' },
-  { value: 'done', label: 'Done' },
-  { value: 'cancelled', label: 'Cancelled' },
-];
+const bareTaskMarkerDecoration = Decoration.mark({
+  class: 'note-tab__bare-task-marker',
+});
+
+function buildBareTaskMarkerDecorations(state: EditorState): DecorationSet {
+  const decorations = [];
+  let activeFenceMarker: '`' | '~' | null = null;
+  let activeFenceLength = 0;
+
+  for (let lineNumber = 1; lineNumber <= state.doc.lines; lineNumber += 1) {
+    const line = state.doc.line(lineNumber);
+    const fenceMatch = /^(\s*)(`{3,}|~{3,})/.exec(line.text);
+
+    if (fenceMatch) {
+      const markerCharacter = fenceMatch[2]?.[0];
+      const markerLength = fenceMatch[2]?.length ?? 0;
+
+      if (!activeFenceMarker) {
+        activeFenceMarker = markerCharacter === '~' ? '~' : '`';
+        activeFenceLength = markerLength;
+      } else if (markerCharacter === activeFenceMarker && markerLength >= activeFenceLength) {
+        activeFenceMarker = null;
+        activeFenceLength = 0;
+      }
+
+      continue;
+    }
+
+    if (activeFenceMarker) {
+      continue;
+    }
+
+    const match = BARE_TASK_MARKER_PATTERN.exec(line.text);
+
+    if (!match) {
+      continue;
+    }
+
+    const markerStart = line.from + (match[1]?.length ?? 0);
+    decorations.push(bareTaskMarkerDecoration.range(markerStart, markerStart + 3));
+  }
+
+  return Decoration.set(decorations);
+}
+
+const bareTaskMarkerField = StateField.define<DecorationSet>({
+  create: buildBareTaskMarkerDecorations,
+  update(value, transaction) {
+    return transaction.docChanged ? buildBareTaskMarkerDecorations(transaction.state) : value;
+  },
+  provide: (field) => EditorView.decorations.from(field),
+});
+
+const taskStateMenuItems = computed<Array<{ state: NoteTaskState; label: string }>>(() => [
+  { state: 'open', label: tt('note.task.state.open') },
+  { state: 'in-progress', label: tt('note.task.state.inProgress') },
+  { state: 'waiting', label: tt('note.task.state.waiting') },
+  { state: 'done', label: tt('note.task.state.done') },
+  { state: 'cancelled', label: tt('note.task.state.cancelled') },
+]);
+const taskFilterItems = computed<Array<{ value: 'all' | NoteTaskState; label: string }>>(() => [
+  { value: 'all', label: tt('note.task.filter.all') },
+  { value: 'open', label: tt('note.task.state.open') },
+  { value: 'in-progress', label: tt('note.task.filter.active') },
+  { value: 'waiting', label: tt('note.task.state.waiting') },
+  { value: 'done', label: tt('note.task.state.done') },
+  { value: 'cancelled', label: tt('note.task.state.cancelled') },
+]);
 
 marked.use({
   extensions: [WIKI_LINK_TOKENIZER as never],
@@ -220,6 +287,14 @@ function escapeHtml(value: string) {
 
 function escapeHtmlAttribute(value: string) {
   return escapeHtml(value);
+}
+
+function previewEmptyHtml() {
+  return `<p class="note-tab__preview-empty">${escapeHtml(tt('note.preview.empty'))}</p>`;
+}
+
+function previewErrorHtml() {
+  return `<p class="note-tab__preview-error">${escapeHtml(tt('note.preview.failed'))}</p>`;
 }
 
 function getTaskStateFromMarker(marker: string): NoteTaskState | null {
@@ -252,17 +327,17 @@ function isNoteTaskState(value: string | null | undefined): value is NoteTaskSta
 function getTaskStateLabel(state: NoteTaskState) {
   switch (state) {
     case 'open':
-      return 'Open';
+      return tt('note.task.state.open');
     case 'in-progress':
-      return 'In progress';
+      return tt('note.task.state.inProgress');
     case 'waiting':
-      return 'Waiting';
+      return tt('note.task.state.waiting');
     case 'done':
-      return 'Done';
+      return tt('note.task.state.done');
     case 'cancelled':
-      return 'Cancelled';
+      return tt('note.task.state.cancelled');
     default:
-      return 'Task';
+      return tt('note.task.state.task');
   }
 }
 
@@ -347,6 +422,18 @@ function stripTaskTags(text: string) {
   return text.replace(/(^|\s)#[a-zA-Z0-9_-]+/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
+function hasMarkdownTaskListPrefix(prefix: string) {
+  return /(?:^|\s|>)(?:[-*+]|\d+[.)])\s+\[$/.test(prefix);
+}
+
+function buildRenderedTaskPrefix(prefix: string) {
+  if (hasMarkdownTaskListPrefix(prefix)) {
+    return prefix;
+  }
+
+  return `${prefix.slice(0, -1)}- [`;
+}
+
 function parseNoteTasks(content: string) {
   const lines = content.split('\n');
   const parsedTasks: ParsedNoteTask[] = [];
@@ -389,11 +476,14 @@ function parseNoteTasks(content: string) {
       return line;
     }
 
+    const taskPrefix = match[1] ?? '';
+    const isBareTask = !hasMarkdownTaskListPrefix(taskPrefix);
     const rawText = (match[3] ?? '').replace(/^\]\s*/, '').trim();
 
     renderedTasks.push({
       taskIndex,
       state,
+      isBare: isBareTask,
     });
     parsedTasks.push({
       taskIndex,
@@ -406,7 +496,7 @@ function parseNoteTasks(content: string) {
     });
     taskIndex += 1;
 
-    return `${match[1]}${state === 'done' ? 'x' : ' '}${match[3]}`;
+    return `${buildRenderedTaskPrefix(taskPrefix)}${state === 'done' ? 'x' : ' '}${match[3]}`;
   });
 
   return {
@@ -507,11 +597,11 @@ function enhanceRenderedMarkdownHtml(
   const headingSlugCounts = new Map<string, number>();
   const headingItems: Array<{ id: string; level: number; label: string }> = [];
   const calloutTitles: Record<string, string> = {
-    note: 'Note',
-    tip: 'Tip',
-    warning: 'Warning',
-    important: 'Important',
-    caution: 'Caution',
+    note: tt('note.callout.note'),
+    tip: tt('note.callout.tip'),
+    warning: tt('note.callout.warning'),
+    important: tt('note.callout.important'),
+    caution: tt('note.callout.caution'),
   };
 
   container.querySelectorAll<HTMLInputElement>('input[type="checkbox"]').forEach((checkbox, index) => {
@@ -533,6 +623,9 @@ function enhanceRenderedMarkdownHtml(
 
     taskItem?.classList.add('note-tab__task-item');
     taskItem?.classList.add(`note-tab__task-item--${taskState}`);
+    if (renderedTask?.isBare) {
+      taskItem?.classList.add('note-tab__task-item--bare');
+    }
     taskItem?.setAttribute('data-task-index', String(renderedTask?.taskIndex ?? index));
     taskItem?.setAttribute('data-task-state', taskState);
 
@@ -578,7 +671,7 @@ function enhanceRenderedMarkdownHtml(
     const copyButton = documentRoot.createElement('button');
     copyButton.className = 'note-tab__code-copy';
     copyButton.type = 'button';
-    copyButton.textContent = 'Copy';
+    copyButton.textContent = tt('note.copy');
     toolbar.append(copyButton);
 
     if (language === 'mermaid') {
@@ -643,7 +736,7 @@ function enhanceRenderedMarkdownHtml(
     const anchor = documentRoot.createElement('a');
     anchor.className = 'note-tab__heading-anchor';
     anchor.href = `#${headingId}`;
-    anchor.setAttribute('aria-label', `Link to ${headingLabel || 'section'}`);
+    anchor.setAttribute('aria-label', tt('note.heading.linkTo', { label: headingLabel || tt('note.heading.section') }));
     anchor.textContent = '#';
     heading.append(documentRoot.createTextNode(' '), anchor);
   });
@@ -657,10 +750,10 @@ function enhanceRenderedMarkdownHtml(
 
     const nav = documentRoot.createElement('nav');
     nav.className = 'note-tab__toc';
-    nav.setAttribute('aria-label', 'Table of contents');
+    nav.setAttribute('aria-label', tt('note.toc.aria'));
     const title = documentRoot.createElement('div');
     title.className = 'note-tab__toc-title';
-    title.textContent = 'Contents';
+    title.textContent = tt('note.toc.contents');
     nav.append(title);
     const list = documentRoot.createElement('ol');
     list.className = 'note-tab__toc-list';
@@ -705,7 +798,7 @@ async function updateRenderedMarkdown() {
   const renderToken = ++markdownRenderToken;
 
   if (!props.content.trim()) {
-    renderedMarkdown.value = '<p class="note-tab__preview-empty">Nothing to preview yet.</p>';
+    renderedMarkdown.value = previewEmptyHtml();
     return;
   }
 
@@ -750,7 +843,7 @@ async function updateRenderedMarkdown() {
       return;
     }
 
-    renderedMarkdown.value = '<p class="note-tab__preview-error">Preview failed.</p>';
+    renderedMarkdown.value = previewErrorHtml();
   }
 }
 
@@ -810,8 +903,8 @@ async function renderMermaidDiagrams() {
       diagramNode.dataset.mermaidState = 'error';
       diagramNode.innerHTML = `
         <div class="note-tab__mermaid-error">
-          <strong>Mermaid render failed.</strong>
-          <span>The diagram source is still available via Copy.</span>
+          <strong>${escapeHtml(tt('note.mermaid.failed'))}</strong>
+          <span>${escapeHtml(tt('note.mermaid.copyAvailable'))}</span>
         </div>
       `;
     }
@@ -829,7 +922,7 @@ function markPendingMermaidDiagramsAsError(message: string) {
     diagramNode.dataset.mermaidState = 'error';
     diagramNode.innerHTML = `
       <div class="note-tab__mermaid-error">
-        <strong>Mermaid render failed.</strong>
+        <strong>${escapeHtml(tt('note.mermaid.failed'))}</strong>
         <span>${escapeHtml(message)}</span>
       </div>
     `;
@@ -843,7 +936,7 @@ async function refreshRenderedPreviewDecorations() {
     await renderMermaidDiagrams();
   } catch (error) {
     console.error('Failed to initialize mermaid preview.', error);
-    markPendingMermaidDiagramsAsError('The diagram could not be initialized.');
+    markPendingMermaidDiagramsAsError(tt('note.mermaid.initFailed'));
   }
 
   if (!searchVisible.value) {
@@ -896,7 +989,7 @@ function resolveProjectRelativePath(filePath: string | null, projectRoot: string
 }
 
 const noteLocationLabel = computed(() => (
-  props.filePath ? truncatePathStart(props.filePath) : 'Scratch note'
+  props.filePath ? truncatePathStart(props.filePath) : tt('note.scratch')
 ));
 const noteFileNameLabel = computed(() => (
   props.filePath?.split(/[\\/]/).at(-1)?.trim() || noteLocationLabel.value
@@ -1044,30 +1137,30 @@ const activeMatchDisplayIndex = computed(() => (
 const externalChangeCopy = computed(() => {
   if (props.externalChange === 'unavailable') {
     return {
-      title: 'File is no longer available on disk.',
+      title: tt('note.external.unavailable.title'),
       body: props.isDirty
-        ? 'Reload is unavailable until the file becomes readable again. Your current note edits stay only in this tab.'
-        : 'The note preview is showing the last loaded version. Reload becomes available once the file is readable again.',
+        ? tt('note.external.unavailable.dirty')
+        : tt('note.external.unavailable.clean'),
       actionLabel: null,
     };
   }
 
   if (props.externalChange === 'session-dirty') {
     return {
-      title: 'This tab restored unsaved session changes.',
-      body: 'The note content differs from the file currently saved on disk. Reload to discard the restored version, or keep working and save when ready.',
-      actionLabel: 'Refresh from disk',
+      title: tt('note.external.sessionDirty.title'),
+      body: tt('note.external.sessionDirty.body'),
+      actionLabel: tt('note.refreshFromDisk'),
     };
   }
 
   return {
     title: props.isDirty
-      ? 'File changed on disk.'
-      : 'A newer version of this note is available.',
+      ? tt('note.external.changedDirty.title')
+      : tt('note.external.changedClean.title'),
     body: props.isDirty
-      ? 'Reload will replace your current unsaved edits with the version from disk.'
-      : 'Reload this tab to sync it with the latest file content from disk.',
-    actionLabel: 'Refresh from disk',
+      ? tt('note.external.changedDirty.body')
+      : tt('note.external.changedClean.body'),
+    actionLabel: tt('note.refreshFromDisk'),
   };
 });
 
@@ -1139,7 +1232,15 @@ function getSelectedNoteText() {
   return getSelectedEditorText() ?? getSelectedPreviewText();
 }
 
-function scheduleSelectionCopy() {
+function scheduleSelectionCopy({ force = false }: { force?: boolean } = {}) {
+  if (!props.selectionAutoCopyEnabled) {
+    lastCopiedSelection = null;
+    selectionCopyPendingAfterKeyboard = false;
+    selectionCopyPendingAfterPointer = false;
+    clearPendingSelectionCopy();
+    return;
+  }
+
   if (selectionKeyboardActive) {
     selectionCopyPendingAfterKeyboard = true;
     return;
@@ -1147,6 +1248,10 @@ function scheduleSelectionCopy() {
 
   if (selectionPointerActive) {
     selectionCopyPendingAfterPointer = true;
+    return;
+  }
+
+  if (!force) {
     return;
   }
 
@@ -1169,11 +1274,15 @@ function scheduleSelectionCopy() {
     try {
       await writeClipboard(currentSelection);
       lastCopiedSelection = currentSelection;
-      showCopyToast('Copied');
+      showCopyToast(tt('note.toast.copied'));
     } catch {
-      showCopyToast('Copy failed');
+      showCopyToast(tt('note.toast.copyFailed'));
     }
   }, 90);
+}
+
+function handleDocumentSelectionChange() {
+  scheduleSelectionCopy();
 }
 
 async function copyFilePathText(text: string, successMessage: string) {
@@ -1181,7 +1290,7 @@ async function copyFilePathText(text: string, successMessage: string) {
     await writeClipboard(text);
     showCopyToast(successMessage);
   } catch {
-    showCopyToast('Copy failed');
+    showCopyToast(tt('note.toast.copyFailed'));
   }
 }
 
@@ -1208,20 +1317,23 @@ function getTaskCopyMenuPosition(event: MouseEvent) {
 }
 
 async function copyFullPath() {
-  await copyFilePathText(props.filePath ?? noteLocationLabel.value, props.filePath ? 'Path copied' : 'Copied');
+  await copyFilePathText(
+    props.filePath ?? noteLocationLabel.value,
+    props.filePath ? tt('note.toast.pathCopied') : tt('note.toast.copied'),
+  );
 }
 
 async function copyProjectRelativePath() {
   if (!projectRelativePathLabel.value) {
-    showCopyToast('Project root not available');
+    showCopyToast(tt('note.toast.projectRootUnavailable'));
     return;
   }
 
-  await copyFilePathText(projectRelativePathLabel.value, 'Project path copied');
+  await copyFilePathText(projectRelativePathLabel.value, tt('note.toast.projectPathCopied'));
 }
 
 async function copyFileName() {
-  await copyFilePathText(noteFileNameLabel.value, 'Name copied');
+  await copyFilePathText(noteFileNameLabel.value, tt('note.toast.nameCopied'));
 }
 
 function closeFilePathMenu() {
@@ -1301,7 +1413,7 @@ async function copyTaskLineByIndex(taskIndex: number) {
   const task = getParsedTaskByIndex(taskIndex);
 
   if (!task) {
-    showCopyToast('Task not found');
+    showCopyToast(tt('note.toast.taskNotFound'));
     return;
   }
 
@@ -1312,15 +1424,15 @@ async function copyTaskText(task: ParsedNoteTask) {
   const text = task.rawText.trim();
 
   if (!text) {
-    showCopyToast('Nothing to copy');
+    showCopyToast(tt('note.toast.nothingToCopy'));
     return;
   }
 
   try {
     await writeClipboard(text);
-    showCopyToast('Task text copied');
+    showCopyToast(tt('note.toast.taskTextCopied'));
   } catch {
-    showCopyToast('Copy failed');
+    showCopyToast(tt('note.toast.copyFailed'));
   }
 }
 
@@ -1335,7 +1447,7 @@ async function applyTaskCopyMenuSelection(mode: 'line' | 'text') {
   closeTaskCopyMenu();
 
   if (!task) {
-    showCopyToast('Task not found');
+    showCopyToast(tt('note.toast.taskNotFound'));
     return;
   }
 
@@ -1349,15 +1461,15 @@ async function applyTaskCopyMenuSelection(mode: 'line' | 'text') {
 
 async function copyAll() {
   if (!props.content) {
-    showCopyToast('Nothing to copy');
+    showCopyToast(tt('note.toast.nothingToCopy'));
     return;
   }
 
   try {
     await writeClipboard(props.content);
-    showCopyToast('Copied');
+    showCopyToast(tt('note.toast.copied'));
   } catch {
-    showCopyToast('Copy failed');
+    showCopyToast(tt('note.toast.copyFailed'));
   }
 }
 
@@ -1408,9 +1520,15 @@ function insertTextIntoEditor(text: string) {
   editorView.focus();
 }
 
-async function pasteClipboardIntoEditor(eventText?: string | null) {
+async function pasteClipboardIntoEditor(
+  eventText?: string | null,
+  options: {
+    forceSystemRead?: boolean;
+  } = {},
+) {
   const clipboardText = await readSharedClipboardText({
     eventText,
+    forceSystemRead: options.forceSystemRead,
     preferPreviousDistinctOf: getSelectedEditorText(),
   });
 
@@ -1441,6 +1559,14 @@ function buildLineNumbersExtension() {
 
 function toggleLineNumbers() {
   emit('update:line-numbers-enabled', !lineNumbersEnabled.value);
+}
+
+function buildLineWrappingExtension() {
+  return lineWrappingEnabled.value ? EditorView.lineWrapping : [];
+}
+
+function toggleLineWrapping() {
+  emit('update:line-wrapping-enabled', !lineWrappingEnabled.value);
 }
 
 const CURSOR_EMIT_DEBOUNCE_MS = 250;
@@ -1506,10 +1632,12 @@ function applyExternalCursor({ focus = false }: { focus?: boolean } = {}) {
   const mainSelection = editorView.state.selection.main;
   const selectionChanged = mainSelection.anchor !== anchor || mainSelection.head !== head;
 
-  editorView.dispatch({
-    ...(selectionChanged ? { selection: EditorSelection.single(anchor, head) } : {}),
-    effects: EditorView.scrollIntoView(anchor, { y: 'center' }),
-  });
+  if (selectionChanged) {
+    editorView.dispatch({
+      selection: EditorSelection.single(anchor, head),
+      effects: EditorView.scrollIntoView(anchor, { y: 'center' }),
+    });
+  }
 
   if (focus && props.active && props.viewMode !== 'preview') {
     editorView.focus();
@@ -1562,7 +1690,7 @@ function createEditor() {
     selection: buildInitialSelection(props.content.length),
     extensions: [
       EditorState.tabSize.of(2),
-      EditorView.lineWrapping,
+      lineWrappingCompartment.of(buildLineWrappingExtension()),
       lineNumbersCompartment.of(buildLineNumbersExtension()),
       highlightActiveLine(),
       highlightActiveLineGutter(),
@@ -1572,6 +1700,7 @@ function createEditor() {
       indentOnInput(),
       search({ top: true }),
       highlightSelectionMatches(),
+      bareTaskMarkerField,
       keymap.of([
         ...defaultKeymap,
         ...historyKeymap,
@@ -1586,9 +1715,15 @@ function createEditor() {
       }),
       EditorView.domEventHandlers({
         contextmenu: (event) => {
+          if (!props.rightClickPasteEnabled) {
+            return false;
+          }
+
           event.preventDefault();
           event.stopPropagation();
-          void pasteClipboardIntoEditor();
+          void pasteClipboardIntoEditor(null, {
+            forceSystemRead: true,
+          });
           return true;
         },
         paste: (event) => {
@@ -1668,6 +1803,17 @@ watch(
 
     editorView?.dispatch({
       effects: lineNumbersCompartment.reconfigure(buildLineNumbersExtension()),
+    });
+  },
+);
+
+watch(
+  () => props.lineWrappingEnabled,
+  (enabled) => {
+    lineWrappingEnabled.value = enabled;
+
+    editorView?.dispatch({
+      effects: lineWrappingCompartment.reconfigure(buildLineWrappingExtension()),
     });
   },
 );
@@ -1850,15 +1996,15 @@ async function copyTaskLine(task: ParsedNoteTask) {
   const sourceLine = task.sourceLine.trimEnd();
 
   if (!sourceLine.trim()) {
-    showCopyToast('Nothing to copy');
+    showCopyToast(tt('note.toast.nothingToCopy'));
     return;
   }
 
   try {
     await writeClipboard(sourceLine);
-    showCopyToast('Task line copied');
+    showCopyToast(tt('note.toast.taskLineCopied'));
   } catch {
-    showCopyToast('Copy failed');
+    showCopyToast(tt('note.toast.copyFailed'));
   }
 }
 
@@ -1906,15 +2052,15 @@ async function handlePreviewClick(event: MouseEvent) {
       ?? '';
 
     if (!codeText) {
-      showCopyToast('Nothing to copy');
+      showCopyToast(tt('note.toast.nothingToCopy'));
       return;
     }
 
     try {
       await writeClipboard(codeText);
-      showCopyToast('Code copied');
+      showCopyToast(tt('note.toast.codeCopied'));
     } catch {
-      showCopyToast('Copy failed');
+      showCopyToast(tt('note.toast.copyFailed'));
     }
 
     return;
@@ -1934,7 +2080,7 @@ async function handlePreviewClick(event: MouseEvent) {
     const resolvedPath = await window.bridgegit?.notes.resolveLink(props.filePath, noteLinkTarget) ?? null;
 
     if (!resolvedPath) {
-      showCopyToast('Note not found');
+      showCopyToast(tt('note.toast.noteNotFound'));
       return;
     }
 
@@ -2049,7 +2195,7 @@ function handleDocumentPointerUp() {
   }
 
   selectionCopyPendingAfterPointer = false;
-  scheduleSelectionCopy();
+  scheduleSelectionCopy({ force: true });
 }
 
 function clearPreviewSearchHighlights() {
@@ -2391,7 +2537,7 @@ function handleDocumentKeyup(event: KeyboardEvent) {
   }
 
   selectionCopyPendingAfterKeyboard = false;
-  scheduleSelectionCopy();
+  scheduleSelectionCopy({ force: true });
 }
 
 const handleFlushEditorState = () => {
@@ -2405,7 +2551,7 @@ onMounted(() => {
   document.addEventListener('keyup', handleDocumentKeyup);
   document.addEventListener('pointerdown', handleDocumentPointerDown);
   document.addEventListener('pointerup', handleDocumentPointerUp);
-  document.addEventListener('selectionchange', scheduleSelectionCopy);
+  document.addEventListener('selectionchange', handleDocumentSelectionChange);
   window.addEventListener('bridgegit:flush-editor-state', handleFlushEditorState);
   void focusEditor();
   void refreshRenderedPreviewDecorations();
@@ -2417,7 +2563,7 @@ onBeforeUnmount(() => {
   document.removeEventListener('keyup', handleDocumentKeyup);
   document.removeEventListener('pointerdown', handleDocumentPointerDown);
   document.removeEventListener('pointerup', handleDocumentPointerUp);
-  document.removeEventListener('selectionchange', scheduleSelectionCopy);
+  document.removeEventListener('selectionchange', handleDocumentSelectionChange);
   window.removeEventListener('bridgegit:flush-editor-state', handleFlushEditorState);
   clearPendingSelectionCopy();
   flushSplitRatioEmit();
@@ -2557,8 +2703,8 @@ defineExpose({
           <button
             class="note-tab__file-path-button"
             type="button"
-            :title="`${filePath || noteLocationLabel}\nClick to copy path from project root\nRight-click for more options`"
-            aria-label="Copy note path"
+            :title="tt('note.pathButtonTitle', { path: filePath || noteLocationLabel })"
+            :aria-label="tt('note.copyNotePath')"
             aria-haspopup="menu"
             @click="handleFilePathClick"
             @contextmenu="openFilePathMenu"
@@ -2569,8 +2715,8 @@ defineExpose({
             class="note-tab__action note-tab__action--inline"
             type="button"
             :aria-pressed="searchVisible"
-            :title="`Find in note ${SHORTCUTS.noteSearch.display}`"
-            aria-label="Find in note"
+            :title="tt('note.findInNoteTitle', { shortcut: SHORTCUTS.noteSearch.display })"
+            :aria-label="tt('note.findInNote')"
             @click="openSearch(true)"
           >
             <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -2585,8 +2731,8 @@ defineExpose({
           class="note-tab__action"
           type="button"
           :disabled="busy"
-          title="Open file [Ctrl+O]"
-          aria-label="Open file"
+          :title="tt('note.openFileTitle')"
+          :aria-label="tt('code.openFile')"
           @click="emit('open-file')"
         >
           <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -2598,8 +2744,8 @@ defineExpose({
           class="note-tab__action"
           type="button"
           :disabled="busy"
-          title="Save note file [Ctrl+S]"
-          aria-label="Save note file"
+          :title="tt('note.saveFileTitle')"
+          :aria-label="tt('note.saveFile')"
           @click="emit('save-file')"
         >
           <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -2611,8 +2757,8 @@ defineExpose({
           class="note-tab__action"
           type="button"
           :disabled="busy"
-          title="Save note file as [Ctrl+Shift+S]"
-          aria-label="Save note file as"
+          :title="tt('note.saveFileAsTitle')"
+          :aria-label="tt('note.saveFileAs')"
           @click="emit('save-file-as')"
         >
           <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -2623,13 +2769,13 @@ defineExpose({
 
       <div class="note-tab__actions">
 
-        <div class="note-tab__mode-toggle" role="group" aria-label="Notes view mode">
+        <div class="note-tab__mode-toggle" role="group" :aria-label="tt('note.viewMode')">
           <button
             class="note-tab__mode-button"
             :class="{ 'note-tab__mode-button--active': viewMode === 'source' }"
             type="button"
-            title="Source only"
-            aria-label="Source only"
+            :title="tt('note.mode.source')"
+            :aria-label="tt('note.mode.source')"
             :aria-pressed="viewMode === 'source'"
             @click="setViewMode('source')"
           >
@@ -2642,8 +2788,8 @@ defineExpose({
             class="note-tab__mode-button"
             :class="{ 'note-tab__mode-button--active': viewMode === 'split' }"
             type="button"
-            title="Source and preview"
-            aria-label="Source and preview"
+            :title="tt('note.mode.split')"
+            :aria-label="tt('note.mode.split')"
             :aria-pressed="viewMode === 'split'"
             @click="setViewMode('split')"
           >
@@ -2656,8 +2802,8 @@ defineExpose({
             class="note-tab__mode-button"
             :class="{ 'note-tab__mode-button--active': viewMode === 'preview' }"
             type="button"
-            title="Preview only"
-            aria-label="Preview only"
+            :title="tt('note.mode.preview')"
+            :aria-label="tt('note.mode.preview')"
             :aria-pressed="viewMode === 'preview'"
             @click="setViewMode('preview')"
           >
@@ -2671,8 +2817,8 @@ defineExpose({
           class="note-tab__action"
           :class="{ 'note-tab__action--active': lineNumbersEnabled }"
           type="button"
-          :title="lineNumbersEnabled ? 'Hide line numbers' : 'Show line numbers'"
-          :aria-label="lineNumbersEnabled ? 'Hide line numbers' : 'Show line numbers'"
+          :title="lineNumbersEnabled ? tt('note.hideLineNumbers') : tt('note.showLineNumbers')"
+          :aria-label="lineNumbersEnabled ? tt('note.hideLineNumbers') : tt('note.showLineNumbers')"
           :aria-pressed="lineNumbersEnabled"
           @click="toggleLineNumbers"
         >
@@ -2683,9 +2829,23 @@ defineExpose({
 
         <button
           class="note-tab__action"
+          :class="{ 'note-tab__action--active': lineWrappingEnabled }"
           type="button"
-          title="Copy full note"
-          aria-label="Copy full note"
+          :title="lineWrappingEnabled ? tt('note.disableLineWrapping') : tt('note.enableLineWrapping')"
+          :aria-label="lineWrappingEnabled ? tt('note.disableLineWrapping') : tt('note.enableLineWrapping')"
+          :aria-pressed="lineWrappingEnabled"
+          @click="toggleLineWrapping"
+        >
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M4.75 6.25h14.5a.75.75 0 0 1 0 1.5H4.75a.75.75 0 0 1 0-1.5Zm0 5h10.5a3.5 3.5 0 1 1 0 7h-3.69l1.22 1.22a.75.75 0 1 1-1.06 1.06l-2.5-2.5a.75.75 0 0 1 0-1.06l2.5-2.5a.75.75 0 1 1 1.06 1.06l-1.22 1.22h3.69a2 2 0 1 0 0-4H4.75a.75.75 0 0 1 0-1.5Zm0 5.5h2.5a.75.75 0 0 1 0 1.5h-2.5a.75.75 0 0 1 0-1.5Z" />
+          </svg>
+        </button>
+
+        <button
+          class="note-tab__action"
+          type="button"
+          :title="tt('note.copyFullNote')"
+          :aria-label="tt('note.copyFullNote')"
           @click="copyAll"
         >
           <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -2716,7 +2876,7 @@ defineExpose({
           :disabled="busy"
           @click="emit('dismiss-external-change')"
         >
-          Keep current
+          {{ tt('code.keepCurrent') }}
         </button>
       </div>
     </div>
@@ -2738,7 +2898,7 @@ defineExpose({
           class="note-tab__search-action"
           type="button"
           :disabled="activeMatchCount < 1"
-          title="Previous match [Shift+Enter]"
+          :title="tt('note.search.previous')"
           @click="goToPreviousSearchMatch"
         >
           ↑
@@ -2748,7 +2908,7 @@ defineExpose({
           class="note-tab__search-action"
           type="button"
           :disabled="activeMatchCount < 1"
-          title="Next match [Enter]"
+          :title="tt('note.search.next')"
           @click="goToNextSearchMatch"
         >
           ↓
@@ -2757,8 +2917,8 @@ defineExpose({
         <button
           class="note-tab__search-action"
           type="button"
-          :title="`Close find ${SHORTCUTS.noteSearch.display}`"
-          aria-label="Close find"
+          :title="tt('note.search.closeTitle', { shortcut: SHORTCUTS.noteSearch.display })"
+          :aria-label="tt('note.search.close')"
           @click="closeSearch"
         >
           ×
@@ -2771,7 +2931,7 @@ defineExpose({
           v-model="searchQuery"
           class="note-tab__search-input"
           type="search"
-          :placeholder="`Find in this note ${SHORTCUTS.noteSearch.display}`"
+          :placeholder="tt('note.search.placeholder', { shortcut: SHORTCUTS.noteSearch.display })"
           @keydown="handleSearchKeydown"
         >
       </label>
@@ -2798,7 +2958,7 @@ defineExpose({
         :class="{ 'note-tab__split-divider--active': noteSplit.isDragging.value }"
         role="separator"
         aria-orientation="vertical"
-        title="Drag to resize • Double-click to reset"
+        :title="tt('note.resizeSplit')"
         @pointerdown="noteSplit.startDrag"
         @dblclick="noteSplit.reset"
       />
@@ -2812,7 +2972,7 @@ defineExpose({
         @contextmenu="handlePreviewContextMenu"
       >
         <div class="note-tab__preview-lens">
-          <div class="note-tab__preview-lens-toggle" role="group" aria-label="Preview lens">
+          <div class="note-tab__preview-lens-toggle" role="group" :aria-label="tt('note.previewLens')">
             <button
               class="note-tab__preview-lens-button"
               :class="{ 'note-tab__preview-lens-button--active': previewLens === 'preview' }"
@@ -2820,7 +2980,7 @@ defineExpose({
               :aria-pressed="previewLens === 'preview'"
               @click="setPreviewLens('preview')"
             >
-              Preview
+              {{ tt('note.preview') }}
             </button>
             <button
               class="note-tab__preview-lens-button"
@@ -2829,7 +2989,7 @@ defineExpose({
               :aria-pressed="previewLens === 'tasks'"
               @click="setPreviewLens('tasks')"
             >
-              Tasks
+              {{ tt('note.tasks') }}
               <span v-if="parsedNoteTasks.length" class="note-tab__preview-lens-count">{{ parsedNoteTasks.length }}</span>
             </button>
           </div>
@@ -2841,11 +3001,11 @@ defineExpose({
           v-html="renderedMarkdown"
         />
 
-        <section v-else class="note-tab__tasks" aria-label="Note tasks">
+        <section v-else class="note-tab__tasks" :aria-label="tt('note.tasks.aria')">
           <div class="note-tab__tasks-filters">
-            <div class="note-tab__tasks-filter-group" role="group" aria-label="Task state filter">
+            <div class="note-tab__tasks-filter-group" role="group" :aria-label="tt('note.task.stateFilter')">
               <button
-                v-for="item in TASK_FILTER_ITEMS"
+                v-for="item in taskFilterItems"
                 :key="item.value"
                 class="note-tab__tasks-filter"
                 :class="{ 'note-tab__tasks-filter--active': taskFilter === item.value }"
@@ -2857,7 +3017,7 @@ defineExpose({
               </button>
             </div>
 
-            <div v-if="availableTaskTags.length" class="note-tab__tasks-tags" role="group" aria-label="Task tag filter">
+            <div v-if="availableTaskTags.length" class="note-tab__tasks-tags" role="group" :aria-label="tt('note.task.tagFilter')">
               <button
                 class="note-tab__tasks-tag"
                 :class="{ 'note-tab__tasks-tag--active': activeTaskTagFilter === null }"
@@ -2865,7 +3025,7 @@ defineExpose({
                 :aria-pressed="activeTaskTagFilter === null"
                 @click="activeTaskTagFilter = null"
               >
-                All tags
+                {{ tt('note.task.allTags') }}
               </button>
               <button
                 v-for="tag in availableTaskTags"
@@ -2904,7 +3064,7 @@ defineExpose({
                 class="note-tab__task-card-body"
                 role="button"
                 tabindex="0"
-                :title="`Toggle task state · ${getTaskStateLabel(task.state)}`"
+                :title="tt('note.task.toggleStateTitle', { state: getTaskStateLabel(task.state) })"
                 @click="handlePreviewTaskToggle(task.taskIndex, task.state)"
                 @contextmenu="openTaskStateMenu($event, task.taskIndex)"
                 @keydown.enter.prevent="handlePreviewTaskToggle(task.taskIndex, task.state)"
@@ -2930,16 +3090,16 @@ defineExpose({
                   v-if="viewMode !== 'preview'"
                   class="note-tab__task-card-action"
                   type="button"
-                  :title="`Show in note · Line ${task.lineIndex + 1}`"
+                  :title="tt('note.task.showInNoteTitle', { line: task.lineIndex + 1 })"
                   @click.stop="revealTaskInNote(task)"
                 >
-                  Show
+                  {{ tt('note.task.show') }}
                 </button>
                 <button
                   class="note-tab__action note-tab__action--inline note-tab__task-card-copy"
                   type="button"
-                  title="Copy task line · Right-click for more options"
-                  aria-label="Copy task line"
+                  :title="tt('note.task.copyLineTitle')"
+                  :aria-label="tt('note.task.copyLine')"
                   @click.stop="void copyTaskLineByIndex(task.taskIndex)"
                   @contextmenu.stop="openTaskCopyMenu($event, task.taskIndex)"
                 >
@@ -2952,7 +3112,7 @@ defineExpose({
           </div>
 
           <p v-else class="note-tab__tasks-empty">
-            No tasks match the current filters.
+            {{ tt('note.task.empty') }}
           </p>
         </section>
       </div>
@@ -2969,7 +3129,7 @@ defineExpose({
       class="note-tab__path-menu"
       :style="{ left: `${filePathMenu.x}px`, top: `${filePathMenu.y}px` }"
       role="menu"
-      aria-label="Copy note path"
+      :aria-label="tt('note.copyNotePath')"
     >
       <button
         class="note-tab__path-menu-item"
@@ -2977,7 +3137,7 @@ defineExpose({
         role="menuitem"
         @click="handleCopyFullPathMenuClick"
       >
-        Copy full path
+        {{ tt('code.copyFullPath') }}
       </button>
       <button
         class="note-tab__path-menu-item"
@@ -2986,7 +3146,7 @@ defineExpose({
         :disabled="!projectRelativePathLabel"
         @click="handleCopyProjectRelativePathMenuClick"
       >
-        Copy path from project root
+        {{ tt('code.copyProjectPath') }}
       </button>
       <button
         class="note-tab__path-menu-item"
@@ -2995,7 +3155,7 @@ defineExpose({
         :disabled="!filePath"
         @click="handleRevealInAllFilesMenuClick"
       >
-        Reveal in All files
+        {{ tt('code.revealInAllFiles') }}
       </button>
       <button
         class="note-tab__path-menu-item"
@@ -3003,7 +3163,7 @@ defineExpose({
         role="menuitem"
         @click="handleCopyFileNameMenuClick"
       >
-        Copy file name
+        {{ tt('code.copyFileName') }}
       </button>
     </div>
 
@@ -3012,10 +3172,10 @@ defineExpose({
       class="note-tab__task-menu"
       :style="{ left: `${taskStateMenu.x}px`, top: `${taskStateMenu.y}px` }"
       role="menu"
-      aria-label="Task state"
+      :aria-label="tt('note.task.stateMenu')"
     >
       <button
-        v-for="item in TASK_STATE_MENU_ITEMS"
+        v-for="item in taskStateMenuItems"
         :key="item.state"
         class="note-tab__task-menu-item"
         :class="{ 'note-tab__task-menu-item--active': activeTaskMenuState === item.state }"
@@ -3034,7 +3194,7 @@ defineExpose({
       class="note-tab__task-copy-menu"
       :style="{ left: `${taskCopyMenu.x}px`, top: `${taskCopyMenu.y}px` }"
       role="menu"
-      aria-label="Copy task"
+      :aria-label="tt('note.task.copy')"
     >
       <button
         class="note-tab__task-copy-menu-item"
@@ -3042,7 +3202,7 @@ defineExpose({
         role="menuitem"
         @click="void applyTaskCopyMenuSelection('line')"
       >
-        Copy
+        {{ tt('note.copy') }}
       </button>
       <button
         class="note-tab__task-copy-menu-item"
@@ -3050,7 +3210,7 @@ defineExpose({
         role="menuitem"
         @click="void applyTaskCopyMenuSelection('text')"
       >
-        Copy text
+        {{ tt('note.copyText') }}
       </button>
     </div>
   </section>
@@ -3824,6 +3984,10 @@ defineExpose({
   background: rgba(141, 199, 255, 0.14);
 }
 
+.note-tab__editor :deep(.note-tab__bare-task-marker) {
+  color: var(--code-token-number);
+}
+
 .note-tab__editor :deep(.cm-panels) {
   border-bottom: 1px solid rgba(108, 124, 148, 0.22);
   background: var(--note-editor-panel-bg);
@@ -4181,7 +4345,6 @@ defineExpose({
 }
 
 .note-tab__markdown :deep(.task-list-item) {
-  list-style: none;
   margin-left: 0;
 }
 
@@ -4189,6 +4352,14 @@ defineExpose({
   position: relative;
   min-height: 1.25em;
   padding-left: 1.65em;
+}
+
+.note-tab__markdown :deep(.note-tab__task-item--bare) {
+  list-style: none;
+}
+
+.note-tab__markdown :deep(.note-tab__task-item--bare::marker) {
+  content: '';
 }
 
 .note-tab__markdown :deep(.note-tab__task-content) {
