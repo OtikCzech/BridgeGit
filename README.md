@@ -1,35 +1,35 @@
 # BridgeGit
 
-BridgeGit is an Electron desktop app that combines Git workflows, an integrated terminal workspace, notes and a code editor in one window.
+BridgeGit is a desktop Git GUI workspace for AI-assisted development with worktrees, terminal sessions, diffs, code editor tabs and built-in Markdown notes.
 
-Current release: `v1.0.0`
+Run Codex, Claude or other AI coding agents in parallel, keep each task in its own branch or worktree, and review the actual Git diff before you commit. BridgeGit keeps the surrounding context close: shell output, prompts, task notes, release checklists, changed files and code views all stay in one window.
 
-It is built for day-to-day repository work where you want Git status, history, diffs, shell sessions and file editing to stay in the same context.
+It is built for developers who want AI speed without losing Git discipline.
 
-## Highlights
+Current release: `v1.0.1`
 
-- Repository panel with branch status, staged/unstaged/untracked/conflicted files, sync actions and worktree-aware branch handling
+## Built For AI Coding Workflows
+
+- Run multiple AI coding sessions across separate shell tabs, branches or worktrees
+- Keep prompts, task plans, review notes and release checklists in built-in Markdown notes
+- Review staged and unstaged diffs before accepting AI-generated code
+- Compare AI edits with split code panes and side-by-side workspace tabs
+- Keep tests, build commands and packaging logs next to the repository state
+- Restore repository context, terminal tabs, notes and layout between sessions
+
+## Core Workspace
+
+- Git panel with branch status, staged/unstaged/untracked/conflicted files, sync actions and worktree-aware branch handling
 - Syntax-highlighted diff viewer with working-tree and staged diffs plus direct stage-and-continue flow
-- Workspace tabs for shell, notes and code files
-- Code editor with split panes up to `2x2`, file-backed tabs and code navigation for common languages
-- Notes tabs with Markdown editing, split preview and Mermaid rendering
+- Terminal tabs for agents, tests, build commands, packaging and release checks
+- Built-in Markdown notes with split preview and Mermaid rendering for prompts, plans and review notes
+- Code editor with file-backed tabs, split panes up to `2x2` and code navigation for common languages
 - `Quick Open`, `All Tabs`, `Find in Files`, `Replace in Files` and `All files` tree for larger repos
 - Two-tab side-by-side workspace view via `Ctrl+click` on tab headers for `shell`, `note` and `code` tabs
 - Global Docker dialog for containers, images, Compose grouping, quick actions and log handoff into workspace tabs
 - Localized UI with English as the default language plus Czech, Spanish, German, French, Portuguese, Polish, Ukrainian, Chinese, Japanese and Korean
 - Clipboard behavior settings, including right-click paste and selection auto-copy controls for terminal and editor workflows
 - Session persistence for repo context, layout, workspace tabs and comparison view state
-
-## What's New in v1.0.0
-
-BridgeGit `v1.0.0` is the first stable release. It keeps the existing Git, terminal, editor, notes and Docker workflows, and adds a broader localization and clipboard polish pass.
-
-- Default app language is English, with language selection at the top of `Settings -> General`
-- Added complete UI dictionaries for `en`, `cs`, `es`, `de`, `fr`, `pt`, `pl`, `uk`, `zh`, `ja` and `ko`
-- Localized the main workspace, repo panel, diff viewer, commit history, Docker dialog, notes, code tabs, terminal tabs and shared error/copy states
-- Added configurable clipboard behavior for right-click paste and selection auto-copy
-- Fixed the terminal right-click paste edge case where clipboard text could be inserted twice
-- Refined editor and notes copy/selection behavior around stale selections, cursor scrolling and saved-file state
 
 ## Tech Stack
 
