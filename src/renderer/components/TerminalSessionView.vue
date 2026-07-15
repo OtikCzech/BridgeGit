@@ -113,6 +113,15 @@ let lastRightClickPasteInput = {
   data: '',
   at: 0,
 };
+let rightClickPasteGesture = {
+  active: false,
+  pointerDown: false,
+  mouseUpSeen: false,
+  contextMenuSeen: false,
+  pasted: false,
+  at: 0,
+};
+let suppressNextRightAuxClick = false;
 const promptWaiters = new Set<PromptWaiter>();
 const terminalWheelListenerOptions = {
   passive: false,
@@ -471,6 +480,26 @@ function emitAttentionForChoicePrompt() {
   emit('attention');
 }
 
+function normalizePasteDuplicateInput(data: string) {
+  return data
+    .replace(/\u001b\[200~/g, '')
+    .replace(/\u001b\[201~/g, '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n');
+}
+
+function isRecentInputDuplicate(data: string, previous: { data: string; at: number }) {
+  if (!previous.data || Date.now() - previous.at > RIGHT_CLICK_PASTE_DUPLICATE_WINDOW_MS) {
+    return false;
+  }
+
+  if (data === previous.data) {
+    return true;
+  }
+
+  return normalizePasteDuplicateInput(data) === normalizePasteDuplicateInput(previous.data);
+}
+
 function sendInput(
   data: string,
   options: {
@@ -480,8 +509,7 @@ function sendInput(
 ) {
   if (
     options.skipRecentRightClickPasteDuplicate
-    && data === lastRightClickPasteInput.data
-    && Date.now() - lastRightClickPasteInput.at <= RIGHT_CLICK_PASTE_DUPLICATE_WINDOW_MS
+    && isRecentInputDuplicate(data, lastRightClickPasteInput)
   ) {
     lastRightClickPasteInput = {
       data: '',
@@ -605,8 +633,7 @@ async function pasteTextFromClipboard(
 
   if (
     options.skipRecentDuplicate
-    && resolvedText === lastSentInput.data
-    && Date.now() - lastSentInput.at <= RIGHT_CLICK_PASTE_DUPLICATE_WINDOW_MS
+    && isRecentInputDuplicate(resolvedText, lastSentInput)
   ) {
     terminal?.focus();
     return;
@@ -758,6 +785,90 @@ function isModifierOnlyKey(event: KeyboardEvent) {
     || event.key === 'Meta';
 }
 
+function stopTerminalMouseEvent(event: MouseEvent | PointerEvent) {
+  event.preventDefault();
+  event.stopPropagation();
+  event.stopImmediatePropagation();
+}
+
+function clearRightClickPasteGesture() {
+  rightClickPasteGesture = {
+    active: false,
+    pointerDown: false,
+    mouseUpSeen: false,
+    contextMenuSeen: false,
+    pasted: false,
+    at: 0,
+  };
+}
+
+function markRightClickPasteGesture() {
+  suppressNextRightAuxClick = false;
+  rightClickPasteGesture.active = true;
+  rightClickPasteGesture.pointerDown = true;
+  rightClickPasteGesture.mouseUpSeen = false;
+  rightClickPasteGesture.contextMenuSeen = false;
+  rightClickPasteGesture.pasted = false;
+  rightClickPasteGesture.at = Date.now();
+}
+
+function completeRightClickPasteGestureIfReady() {
+  if (!rightClickPasteGesture.active) {
+    return;
+  }
+
+  if (!rightClickPasteGesture.mouseUpSeen || !rightClickPasteGesture.contextMenuSeen) {
+    return;
+  }
+
+  suppressNextRightAuxClick = true;
+  clearRightClickPasteGesture();
+}
+
+function markRightClickPasteMouseUp() {
+  if (!rightClickPasteGesture.active) {
+    return;
+  }
+
+  rightClickPasteGesture.pointerDown = false;
+  rightClickPasteGesture.mouseUpSeen = true;
+  completeRightClickPasteGestureIfReady();
+}
+
+function markRightClickPasteContextMenu() {
+  if (!rightClickPasteGesture.active) {
+    return;
+  }
+
+  rightClickPasteGesture.contextMenuSeen = true;
+  completeRightClickPasteGestureIfReady();
+}
+
+function isActiveRightClickPasteGesture() {
+  return rightClickPasteGesture.active;
+}
+
+function pasteFromRightClickGestureOnce() {
+  if (!rightClickPasteGesture.active || rightClickPasteGesture.pasted) {
+    return;
+  }
+
+  rightClickPasteGesture.pasted = true;
+  void pasteTextFromClipboard(null, {
+    forceSystemRead: true,
+    markRightClickPaste: true,
+    skipRecentDuplicate: true,
+  });
+}
+
+function pasteFromContextMenuFallback() {
+  void pasteTextFromClipboard(null, {
+    forceSystemRead: true,
+    markRightClickPaste: true,
+    skipRecentDuplicate: true,
+  });
+}
+
 function clearCopyInterruptGuard() {
   copyInterruptGuardActive = false;
 }
@@ -773,25 +884,58 @@ function isSoftLineBreakShortcut(event: KeyboardEvent) {
 function handleTerminalPaste(event: ClipboardEvent) {
   event.preventDefault();
   event.stopPropagation();
-  void pasteTextFromClipboard(event.clipboardData?.getData('text/plain') ?? '');
-}
-
-function handleContextMenuPaste(event: MouseEvent) {
-  if (!props.rightClickPasteEnabled) {
-    return;
-  }
-
-  event.preventDefault();
-  event.stopPropagation();
-  void pasteTextFromClipboard(null, {
-    forceSystemRead: true,
-    markRightClickPaste: true,
+  event.stopImmediatePropagation();
+  void pasteTextFromClipboard(event.clipboardData?.getData('text/plain') ?? '', {
     skipRecentDuplicate: true,
   });
 }
 
+function handleContextMenuPaste(event: MouseEvent) {
+  if (!props.rightClickPasteEnabled) {
+    stopTerminalMouseEvent(event);
+    terminal?.focus();
+    return;
+  }
+
+  stopTerminalMouseEvent(event);
+
+  if (isActiveRightClickPasteGesture()) {
+    markRightClickPasteContextMenu();
+    return;
+  }
+
+  pasteFromContextMenuFallback();
+}
+
+function handleTerminalMouseFollowup(event: MouseEvent) {
+  if (event.button !== 2) {
+    return;
+  }
+
+  if (suppressNextRightAuxClick && event.type === 'auxclick') {
+    suppressNextRightAuxClick = false;
+    stopTerminalMouseEvent(event);
+    terminal?.focus();
+    return;
+  }
+
+  if (!props.rightClickPasteEnabled || isActiveRightClickPasteGesture()) {
+    stopTerminalMouseEvent(event);
+    terminal?.focus();
+
+    if (event.type === 'mouseup' || event.type === 'auxclick') {
+      pasteFromRightClickGestureOnce();
+      markRightClickPasteMouseUp();
+    }
+  }
+}
+
 function handleTerminalKeydown(event: KeyboardEvent) {
   emit('activate');
+
+  if (isActiveRightClickPasteGesture()) {
+    clearRightClickPasteGesture();
+  }
 
   if (!isModifierOnlyKey(event) && !isCopyShortcut(event)) {
     clearCopyInterruptGuard();
@@ -810,10 +954,18 @@ function handleTerminalKeydown(event: KeyboardEvent) {
 function handleTerminalPointerdown(event: PointerEvent) {
   emit('activate');
 
-  if (event.button === 2 && !props.rightClickPasteEnabled) {
-    event.preventDefault();
-    event.stopPropagation();
+  if (event.button !== 2 && isActiveRightClickPasteGesture()) {
+    clearRightClickPasteGesture();
+  }
+
+  if (event.button === 2) {
+    stopTerminalMouseEvent(event);
     terminal?.focus();
+
+    if (props.rightClickPasteEnabled) {
+      markRightClickPasteGesture();
+    }
+
     return;
   }
 
@@ -832,7 +984,13 @@ function handleTerminalPointerdown(event: PointerEvent) {
   armCopyInterruptGuard();
 }
 
-function handleTerminalPointerup() {
+function handleTerminalPointerup(event: PointerEvent) {
+  if (event.button === 2) {
+    pasteFromRightClickGestureOnce();
+    markRightClickPasteMouseUp();
+    return;
+  }
+
   if (!selectionPointerActive) {
     return;
   }
@@ -856,6 +1014,8 @@ function handleTerminalFocusIn() {
 }
 
 function handleTerminalFocusOut() {
+  suppressNextRightAuxClick = false;
+  clearRightClickPasteGesture();
   setTerminalRefreshShortcutEnabled(false);
 }
 
@@ -1105,13 +1265,16 @@ function initializeTerminal() {
 
   resizeObserver.observe(terminalRoot.value);
   terminalRoot.value.addEventListener('pointerdown', handleTerminalPointerdown, true);
+  terminalRoot.value.addEventListener('mousedown', handleTerminalMouseFollowup, true);
+  terminalRoot.value.addEventListener('mouseup', handleTerminalMouseFollowup, true);
+  terminalRoot.value.addEventListener('auxclick', handleTerminalMouseFollowup, true);
   document.addEventListener('pointerup', handleTerminalPointerup);
   terminalRoot.value.addEventListener('keyup', scheduleSelectionCopy);
   terminalRoot.value.addEventListener('keydown', handleTerminalKeydown, true);
   terminalRoot.value.addEventListener('wheel', handleWheelZoom, terminalWheelListenerOptions);
-  terminalRoot.value.addEventListener('paste', handleTerminalPaste);
+  terminalRoot.value.addEventListener('paste', handleTerminalPaste, true);
   terminalRoot.value.addEventListener('copy', handleTerminalCopy);
-  terminalRoot.value.addEventListener('contextmenu', handleContextMenuPaste);
+  terminalRoot.value.addEventListener('contextmenu', handleContextMenuPaste, true);
   terminalRoot.value.addEventListener('focusin', handleTerminalFocusIn);
   terminalRoot.value.addEventListener('focusout', handleTerminalFocusOut);
 }
@@ -1221,18 +1384,23 @@ onBeforeUnmount(() => {
 
   document.removeEventListener('pointerup', handleTerminalPointerup);
   terminalRoot.value?.removeEventListener('pointerdown', handleTerminalPointerdown, true);
+  terminalRoot.value?.removeEventListener('mousedown', handleTerminalMouseFollowup, true);
+  terminalRoot.value?.removeEventListener('mouseup', handleTerminalMouseFollowup, true);
+  terminalRoot.value?.removeEventListener('auxclick', handleTerminalMouseFollowup, true);
   terminalRoot.value?.removeEventListener('keyup', scheduleSelectionCopy);
   terminalRoot.value?.removeEventListener('keydown', handleTerminalKeydown, true);
   terminalRoot.value?.removeEventListener('wheel', handleWheelZoom, terminalWheelListenerOptions);
-  terminalRoot.value?.removeEventListener('paste', handleTerminalPaste);
+  terminalRoot.value?.removeEventListener('paste', handleTerminalPaste, true);
   terminalRoot.value?.removeEventListener('copy', handleTerminalCopy);
-  terminalRoot.value?.removeEventListener('contextmenu', handleContextMenuPaste);
+  terminalRoot.value?.removeEventListener('contextmenu', handleContextMenuPaste, true);
   terminalRoot.value?.removeEventListener('focusin', handleTerminalFocusIn);
   terminalRoot.value?.removeEventListener('focusout', handleTerminalFocusOut);
   setTerminalRefreshShortcutEnabled(false);
   terminalFileLinkProviderDisposable?.dispose();
   terminalFileLinkProviderDisposable = null;
   resizeObserver?.disconnect();
+  suppressNextRightAuxClick = false;
+  clearRightClickPasteGesture();
   rejectPromptWaiters(tt('terminal.sessionClosed'));
   dispose();
   terminal?.dispose();

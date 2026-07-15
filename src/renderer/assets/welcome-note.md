@@ -2,16 +2,18 @@
 
 This note is the default place for release updates and small product messages inside BridgeGit.
 
-## New in 1.0.0
+## New in 1.0.1
 
-- BridgeGit now has full app localization with English as the default language
-- choose the app language first in `Settings -> General`
-- use Czech, Spanish, German, French, Portuguese, Polish, Ukrainian, Chinese, Japanese or Korean UI translations
-- keep the main workspace, repo panel, diff viewer, Docker dialog, commit history, notes, code tabs and terminal labels in the selected language
-- paste from the terminal context menu without the previous duplicate insert edge case
+- mouse-driven paste in shell tabs now inserts external clipboard text only once
+- terminal paste handling now blocks the native xterm textarea path before it can emit a duplicate input event
+- right-click paste now runs on button release, which avoids the press/release duplication seen with slower clicks
+- `Ctrl+V` paste behavior stays unchanged
 
 ## Also in the 1.0.0 release
 
+- BridgeGit has full app localization with English as the default language
+- choose the app language first in `Settings -> General`
+- use Czech, Spanish, German, French, Portuguese, Polish, Ukrainian, Chinese, Japanese or Korean UI translations
 - clipboard behavior can be adjusted from General settings
 - editor and notes selection handling is steadier during copy and paste workflows
 - the bundled release note now follows the app version, so the envelope button highlights this update once after install

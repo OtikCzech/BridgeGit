@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.0.1 - 2026-07-15
+
+Patch release focused on fixing duplicate terminal paste input from mouse interactions.
+
+- Prevented mouse-driven terminal paste from reaching both BridgeGit and xterm input paths, so selected external text is inserted only once
+- Moved terminal paste interception into the capture phase and stopped duplicate native textarea paste propagation before xterm can emit a second input event
+- Kept `Ctrl+V` paste behavior intact while making right-click paste wait for button release to avoid press/release duplication
+
 ## v1.0.0 - 2026-06-26
 
 First stable BridgeGit release focused on making the app ready for a broader audience while keeping the existing Git, terminal, editor, notes and Docker workflows intact.
