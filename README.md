@@ -1,5 +1,7 @@
 # BridgeGit
 
+![License](https://img.shields.io/badge/license-MIT-green) ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-lightgrey) ![Electron](https://img.shields.io/badge/Electron-41-47848f) ![Vue](https://img.shields.io/badge/Vue-3-42b883) ![TypeScript](https://img.shields.io/badge/TypeScript-5-blue) ![AI Assisted](https://img.shields.io/badge/AI-Assisted-blue)
+
 BridgeGit is a desktop Git GUI workspace for AI-assisted development with worktrees, terminal sessions, diffs, code editor tabs and built-in Markdown notes.
 
 Run Codex, Claude or other AI coding agents in parallel, keep each task in its own branch or worktree, and review the actual Git diff before you commit. BridgeGit keeps the surrounding context close: shell output, prompts, task notes, release checklists, changed files and code views all stay in one window.
