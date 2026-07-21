@@ -30,6 +30,8 @@ import type {
   RemoveWorktreeResult,
   RemoveWorktreeAndDeleteBranchResult,
   RepoDirectoryEntry,
+  SessionBackupInfo,
+  SessionBackupPreview,
   SessionData,
 } from '../shared/bridgegit';
 
@@ -76,6 +78,10 @@ const bridgegitApi = {
   },
   session: {
     load: () => ipcRenderer.invoke('session:load') as Promise<SessionData>,
+    createBackup: () => ipcRenderer.invoke('session:createBackup') as Promise<SessionBackupInfo | null>,
+    pickBackupFile: () => ipcRenderer.invoke('session:pickBackupFile') as Promise<SessionBackupPreview | null>,
+    restoreBackupFile: (filePath: string) =>
+      ipcRenderer.invoke('session:restoreBackupFile', filePath) as Promise<SessionData>,
     save: (session: Partial<SessionData>) =>
       ipcRenderer.invoke('session:save', session) as Promise<SessionData>,
     saveSync: (session: Partial<SessionData>) =>

@@ -2,7 +2,14 @@
 
 This note is the default place for release updates and small product messages inside BridgeGit.
 
-## New in 1.0.1
+## New in 1.0.2
+
+- BridgeGit now writes a launch-time backup of the restored session before continuing startup
+- the app keeps the three newest session launch backups in its user data folder
+- Settings can save a session snapshot manually when you want a known-good restore point
+- restoring a selected backup JSON shows a short comparison of workspaces, repositories and open tabs before it replaces the saved session
+
+## Also in 1.0.1
 
 - mouse-driven paste in shell tabs now inserts external clipboard text only once
 - terminal paste handling now blocks the native xterm textarea path before it can emit a duplicate input event

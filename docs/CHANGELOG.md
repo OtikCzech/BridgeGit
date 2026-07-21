@@ -1,5 +1,14 @@
 # Changelog
 
+## v1.0.2 - 2026-07-21
+
+Patch release focused on protecting restored workspace sessions before the app writes normalized session state back to disk.
+
+- Added a launch-time session backup in the app data directory before the running session continues
+- Kept the three most recent launch backups so a bad session restore can be recovered without growing unbounded backup files
+- Added Settings actions to save a session snapshot manually and restore a user-selected backup JSON file
+- Added a restore confirmation summary that compares current vs snapshot workspaces, repositories and open tabs
+
 ## v1.0.1 - 2026-07-15
 
 Patch release focused on fixing duplicate terminal paste input from mouse interactions.

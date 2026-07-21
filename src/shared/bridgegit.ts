@@ -682,6 +682,8 @@ export type AppLanguage =
 
 export interface SessionData {
   persistenceRevision: number;
+  sessionLaunchCount: number;
+  lastSessionBackupAt: string | null;
   lastRepoPath: string | null;
   activeWorkspaceId: string | null;
   recentRepos: RecentRepoEntry[];
@@ -710,6 +712,17 @@ export interface SessionData {
   terminalCommandPresets: TerminalCommandPreset[];
   dockerDialogState: DockerDialogState;
   workspaceSessions: WorkspaceSessionsById;
+}
+
+export interface SessionBackupInfo {
+  id: string;
+  createdAt: string;
+  launchCount: number | null;
+}
+
+export interface SessionBackupPreview {
+  filePath: string;
+  session: SessionData;
 }
 
 export interface ClipboardHistoryEntry {
@@ -1037,6 +1050,8 @@ export const DEFAULT_PANEL_LAYOUT: PanelLayout = {
 
 export const DEFAULT_SESSION_DATA: SessionData = {
   persistenceRevision: 0,
+  sessionLaunchCount: 0,
+  lastSessionBackupAt: null,
   lastRepoPath: null,
   activeWorkspaceId: GLOBAL_WORKSPACE_ID,
   recentRepos: [],

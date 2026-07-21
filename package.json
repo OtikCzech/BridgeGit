@@ -1,6 +1,6 @@
 {
   "name": "bridgegit",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Git GUI + PowerShell terminal desktop app",
   "main": "dist/main/index.js",
   "scripts": {

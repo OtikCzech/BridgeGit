@@ -1,6 +1,14 @@
 import {
   existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
 } from 'node:fs';
+import { join } from 'node:path';
+import { app } from 'electron';
 import {
   CLIPBOARD_HISTORY_LIMIT,
   DEFAULT_SESSION_DATA,
@@ -21,6 +29,8 @@ import {
   type RepoPanelFileListMode,
   type RepoPanelSectionId,
   type RepoPanelSectionState,
+  type SessionBackupInfo,
+  type SessionBackupPreview,
   type SessionData,
   type ShortcutOverride,
   type TerminalCommandPreset,
@@ -209,6 +219,11 @@ interface SessionStore {
 
 let storePromise: Promise<SessionStore> | null = null;
 let storeInstance: SessionStore | null = null;
+let sessionLaunchRecorded = false;
+
+const SESSION_BACKUP_LIMIT = 3;
+const SESSION_BACKUP_PREFIX = 'bridgegit-session-launch-';
+const SESSION_BACKUP_SUFFIX = '.json';
 
 function getRepoName(repoPath: string): string {
   const parts = repoPath.split(/[\\/]/).filter(Boolean);
@@ -292,6 +307,15 @@ function buildWorkspaceId(
 function normalizeTimestamp(value: string | undefined): string {
   const timestamp = value ? Date.parse(value) : NaN;
   return Number.isNaN(timestamp) ? new Date().toISOString() : new Date(timestamp).toISOString();
+}
+
+function normalizeOptionalTimestamp(value: string | null | undefined): string | null {
+  if (!value) {
+    return null;
+  }
+
+  const timestamp = Date.parse(value);
+  return Number.isNaN(timestamp) ? null : new Date(timestamp).toISOString();
 }
 
 function normalizeRecentRepos(
@@ -1208,6 +1232,9 @@ function normalizeSession(session: LegacySessionData): SessionData {
   const persistenceRevision = typeof session.persistenceRevision === 'number' && Number.isFinite(session.persistenceRevision)
     ? Math.max(0, Math.floor(session.persistenceRevision))
     : DEFAULT_SESSION_DATA.persistenceRevision;
+  const sessionLaunchCount = typeof session.sessionLaunchCount === 'number' && Number.isFinite(session.sessionLaunchCount)
+    ? Math.max(0, Math.floor(session.sessionLaunchCount))
+    : DEFAULT_SESSION_DATA.sessionLaunchCount;
   const lastRepoPath = normalizeExistingStoredPath(session.lastRepoPath ?? DEFAULT_SESSION_DATA.lastRepoPath);
   const fallbackCwd = normalizeExistingStoredPath(session.terminalCwd)
     ?? normalizeTerminalCwd(null, lastRepoPath);
@@ -1280,6 +1307,8 @@ function normalizeSession(session: LegacySessionData): SessionData {
 
   return {
     persistenceRevision,
+    sessionLaunchCount,
+    lastSessionBackupAt: normalizeOptionalTimestamp(session.lastSessionBackupAt),
     lastRepoPath,
     activeWorkspaceId,
     recentRepos,
@@ -1361,8 +1390,150 @@ export function getStoreSync(): SessionStore | null {
 export async function loadSession(): Promise<SessionData> {
   const store = await getStore();
   const normalizedSession = normalizeSession(store.store as LegacySessionData);
+
+  if (!sessionLaunchRecorded) {
+    sessionLaunchRecorded = true;
+    const nextSession = recordSessionLaunchAndMaybeBackup(normalizedSession);
+    store.set(nextSession);
+    return nextSession;
+  }
+
   store.set(normalizedSession);
   return normalizedSession;
+}
+
+function recordSessionLaunchAndMaybeBackup(session: SessionData): SessionData {
+  const nextSession: SessionData = {
+    ...session,
+    sessionLaunchCount: session.sessionLaunchCount + 1,
+  };
+
+  try {
+    nextSession.lastSessionBackupAt = new Date().toISOString();
+    writeSessionBackup(nextSession);
+  } catch (error) {
+    console.warn('[bridgegit] Unable to write session backup', error);
+  }
+
+  return nextSession;
+}
+
+function writeSessionBackup(session: SessionData): void {
+  const backupDirectory = ensureSessionBackupDirectory();
+
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const launchCount = session.sessionLaunchCount.toString().padStart(6, '0');
+  const backupPath = join(backupDirectory, `${SESSION_BACKUP_PREFIX}${launchCount}-${timestamp}${SESSION_BACKUP_SUFFIX}`);
+
+  writeFileSync(backupPath, `${JSON.stringify(session, null, '\t')}\n`, 'utf8');
+  pruneSessionBackups(backupDirectory);
+}
+
+function getSessionBackupDirectory(): string {
+  return join(app.getPath('userData'), 'session-backups');
+}
+
+function ensureSessionBackupDirectory(): string {
+  const backupDirectory = getSessionBackupDirectory();
+  mkdirSync(backupDirectory, { recursive: true });
+  return backupDirectory;
+}
+
+function pruneSessionBackups(backupDirectory: string): void {
+  const backups = readSessionBackupEntries(backupDirectory)
+    .sort((left, right) => right.modifiedAt - left.modifiedAt);
+
+  for (const backup of backups.slice(SESSION_BACKUP_LIMIT)) {
+    unlinkSync(backup.filePath);
+  }
+}
+
+function isSessionBackupFileName(fileName: string): boolean {
+  return fileName.startsWith(SESSION_BACKUP_PREFIX) && fileName.endsWith(SESSION_BACKUP_SUFFIX);
+}
+
+function parseSessionBackupLaunchCount(fileName: string): number | null {
+  const match = fileName.match(/^bridgegit-session-launch-(\d+)-/);
+
+  if (!match) {
+    return null;
+  }
+
+  const launchCount = Number.parseInt(match[1], 10);
+  return Number.isFinite(launchCount) ? launchCount : null;
+}
+
+function toSessionBackupInfo(id: string, modifiedAt: number): SessionBackupInfo {
+  return {
+    id,
+    createdAt: new Date(modifiedAt).toISOString(),
+    launchCount: parseSessionBackupLaunchCount(id),
+  };
+}
+
+function readSessionBackupEntries(backupDirectory: string) {
+  if (!existsSync(backupDirectory)) {
+    return [];
+  }
+
+  return readdirSync(backupDirectory)
+    .filter(isSessionBackupFileName)
+    .map((fileName) => {
+      const filePath = join(backupDirectory, fileName);
+      const fileStat = statSync(filePath);
+
+      return {
+        id: fileName,
+        filePath,
+        modifiedAt: fileStat.mtimeMs,
+      };
+    });
+}
+
+function readSessionBackupFile(filePath: string): SessionData {
+  return normalizeSession(JSON.parse(readFileSync(filePath, 'utf8')) as LegacySessionData);
+}
+
+async function replaceStoredSessionWithBackup(backupPath: string): Promise<SessionData> {
+  const restoredSession = readSessionBackupFile(backupPath);
+  const store = await getStore();
+
+  try {
+    writeSessionBackup(normalizeSession(store.store as LegacySessionData));
+  } catch (error) {
+    console.warn('[bridgegit] Unable to write pre-restore session backup', error);
+  }
+
+  store.set(restoredSession);
+  return restoredSession;
+}
+
+export function getSessionBackupDirectoryPath(): string {
+  return ensureSessionBackupDirectory();
+}
+
+export function listSessionBackups(): SessionBackupInfo[] {
+  return readSessionBackupEntries(getSessionBackupDirectory())
+    .sort((left, right) => right.modifiedAt - left.modifiedAt)
+    .map((entry) => toSessionBackupInfo(entry.id, entry.modifiedAt));
+}
+
+export async function createSessionBackup(): Promise<SessionBackupInfo | null> {
+  const store = await getStore();
+  writeSessionBackup(normalizeSession(store.store as LegacySessionData));
+
+  return listSessionBackups()[0] ?? null;
+}
+
+export async function restoreSessionBackupFile(filePath: string): Promise<SessionData> {
+  return replaceStoredSessionWithBackup(filePath);
+}
+
+export function inspectSessionBackupFile(filePath: string): SessionBackupPreview {
+  return {
+    filePath,
+    session: readSessionBackupFile(filePath),
+  };
 }
 
 function persistSession(store: SessionStore, session: Partial<SessionData>): SessionData {

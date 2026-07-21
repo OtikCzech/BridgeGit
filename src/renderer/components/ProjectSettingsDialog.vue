@@ -107,6 +107,8 @@ const props = defineProps<Props>();
 const emit = defineEmits<{
   'update:modelValue': [value: boolean];
   'open-info': [];
+  'create-session-backup': [];
+  'restore-session-backup-file': [];
   save: [value: ProjectSettingsFormData];
 }>();
 
@@ -910,6 +912,24 @@ function handleShortcutCapture(shortcutId: string, event: KeyboardEvent) {
                 <button class="settings-dialog__button settings-dialog__button--ghost" type="button" @click="emit('open-info')">
                   {{ tt('settings.general.openMessageCenter') }}
                 </button>
+              </div>
+
+              <div class="settings-dialog__hint-card">
+                <span class="settings-dialog__hint-label">{{ tt('settings.general.sessionBackups') }}</span>
+                <p class="settings-dialog__hint-copy">
+                  {{ tt('settings.general.sessionBackupsCopy') }}
+                </p>
+                <div class="settings-dialog__button-row">
+                  <button class="settings-dialog__button settings-dialog__button--ghost" type="button" @click="emit('create-session-backup')">
+                    {{ tt('settings.general.saveSessionBackup') }}
+                  </button>
+                  <button class="settings-dialog__button settings-dialog__button--secondary" type="button" @click="emit('restore-session-backup-file')">
+                    {{ tt('settings.general.restoreSessionBackupFile') }}
+                  </button>
+                </div>
+                <p class="settings-dialog__hint-copy">
+                  {{ tt('settings.general.restoreSessionBackupHint') }}
+                </p>
               </div>
             </section>
 
@@ -2015,6 +2035,12 @@ function handleShortcutCapture(shortcutId: string, event: KeyboardEvent) {
   color: var(--text-muted);
   font-size: 0.8rem;
   line-height: 1.4;
+}
+
+.settings-dialog__button-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
 }
 
 .settings-dialog__info-status {

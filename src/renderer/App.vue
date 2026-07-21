@@ -45,6 +45,8 @@ import {
   type ProjectSettingsFormData,
   type RepoPanelSectionState,
   type RecentRepoEntry,
+  type SessionBackupPreview,
+  type SessionData,
   type ShortcutOverrides,
   type TerminalCommandPreset,
   type WorktreeDetectionInterval,
@@ -65,6 +67,7 @@ import { useTerminal } from './composables/useTerminal';
 import RepoPanel from './components/RepoPanel.vue';
 import StatusBar from './components/StatusBar.vue';
 import TerminalPanel from './components/TerminalPanel.vue';
+import AppConfirmDialog, { type AppConfirmDialogAction } from './components/AppConfirmDialog.vue';
 import {
   CURRENT_APP_VERSION,
   CURRENT_INFO_NOTE_REVISION,
@@ -193,6 +196,8 @@ const clipboardHistoryItems = ref<ClipboardHistoryEntry[]>([]);
 const clipboardHistoryQuery = ref('');
 const clipboardHistorySelectedIndex = ref(0);
 const detectedWorktrees = ref<GitWorktreeSummary[]>([]);
+const selectedSessionBackupPreview = ref<SessionBackupPreview | null>(null);
+const isSessionBackupRestoreConfirmOpen = ref(false);
 const sessionReady = ref(false);
 const sessionPersistenceEnabled = ref(false);
 const isSwitchingWorkspaceContext = ref(false);
@@ -995,6 +1000,17 @@ const infoMessage = computed(() => (
   ?? error.value
   ?? (selectedCommit.value ? selectedCommit.value.shortHash : selectedPath.value)
   ?? 'Ready'
+));
+
+const sessionBackupRestoreActions = computed<AppConfirmDialogAction[]>(() => [
+  { id: 'cancel', label: tt('common.cancel') },
+  { id: 'restore', label: tt('settings.general.restoreSessionBackupConfirmAction'), tone: 'danger' },
+]);
+
+const selectedSessionBackupSummary = computed(() => (
+  selectedSessionBackupPreview.value
+    ? buildSessionBackupSummary(session.value, selectedSessionBackupPreview.value.session)
+    : ''
 ));
 
 function resolveWorkspaceDefaultTerminalCwd(
@@ -2358,6 +2374,129 @@ function handleOpenWelcomeNote() {
   }
 
   scheduleSessionSave();
+}
+
+function summarizeSessionWorkspace(sessionData: SessionData) {
+  const workspaceIds = Object.keys(sessionData.workspaceSessions);
+  const repos = new Set<string>();
+  const tabLabels: string[] = [];
+
+  for (const workspaceId of workspaceIds) {
+    const descriptor = sessionData.workspaceDescriptors[workspaceId];
+    const workspaceLabel = descriptor?.repoPath
+      ? getRepoName(descriptor.repoPath)
+      : workspaceId;
+
+    if (descriptor?.repoPath) {
+      repos.add(descriptor.repoPath);
+    }
+
+    const workspaceSession = sessionData.workspaceSessions[workspaceId];
+
+    for (const tab of workspaceSession.tabs) {
+      const label = 'title' in tab && tab.title.trim()
+        ? tab.title.trim()
+        : tab.type;
+      tabLabels.push(`${workspaceLabel} / ${tab.type}: ${label}`);
+    }
+  }
+
+  return {
+    workspaceCount: workspaceIds.length,
+    repos: [...repos].sort(),
+    tabLabels: tabLabels.sort(),
+  };
+}
+
+function formatListPreview(items: string[], emptyLabel: string): string {
+  if (items.length < 1) {
+    return emptyLabel;
+  }
+
+  const visibleItems = items.slice(0, 5);
+  const suffix = items.length > visibleItems.length
+    ? ` +${items.length - visibleItems.length}`
+    : '';
+
+  return `${visibleItems.join(', ')}${suffix}`;
+}
+
+function buildSessionBackupSummary(currentSession: SessionData, backupSession: SessionData): string {
+  const current = summarizeSessionWorkspace(currentSession);
+  const backup = summarizeSessionWorkspace(backupSession);
+
+  const addedRepos = backup.repos.filter((repo) => !current.repos.includes(repo));
+  const removedRepos = current.repos.filter((repo) => !backup.repos.includes(repo));
+  const addedTabs = backup.tabLabels.filter((tab) => !current.tabLabels.includes(tab));
+  const removedTabs = current.tabLabels.filter((tab) => !backup.tabLabels.includes(tab));
+
+  return [
+    tt('settings.general.restoreSessionBackupSummaryWorkspaces', {
+      current: current.workspaceCount,
+      snapshot: backup.workspaceCount,
+    }),
+    tt('settings.general.restoreSessionBackupSummaryRepos', {
+      current: current.repos.length,
+      snapshot: backup.repos.length,
+    }),
+    tt('settings.general.restoreSessionBackupSummaryTabs', {
+      current: current.tabLabels.length,
+      snapshot: backup.tabLabels.length,
+    }),
+    tt('settings.general.restoreSessionBackupSummaryAddedRepos', {
+      value: formatListPreview(addedRepos, tt('common.none')),
+    }),
+    tt('settings.general.restoreSessionBackupSummaryRemovedRepos', {
+      value: formatListPreview(removedRepos, tt('common.none')),
+    }),
+    tt('settings.general.restoreSessionBackupSummaryAddedTabs', {
+      value: formatListPreview(addedTabs, tt('common.none')),
+    }),
+    tt('settings.general.restoreSessionBackupSummaryRemovedTabs', {
+      value: formatListPreview(removedTabs, tt('common.none')),
+    }),
+  ].join('\n');
+}
+
+async function handleCreateSessionBackup() {
+  try {
+    await window.bridgegit?.session?.createBackup();
+    showProjectTitleSavedToast(tt('settings.general.sessionBackupSaved'));
+  } catch (error) {
+    showProjectTitleSavedToast(error instanceof Error ? error.message : tt('settings.general.sessionBackupSaveFailed'));
+  }
+}
+
+async function handlePickSessionBackupFile() {
+  try {
+    const preview = await window.bridgegit?.session?.pickBackupFile();
+
+    if (!preview) {
+      return;
+    }
+
+    selectedSessionBackupPreview.value = preview;
+    isSessionBackupRestoreConfirmOpen.value = true;
+  } catch (error) {
+    showProjectTitleSavedToast(error instanceof Error ? error.message : tt('settings.general.sessionBackupInspectFailed'));
+  }
+}
+
+async function handleSessionBackupRestoreAction(actionId: string) {
+  if (actionId !== 'restore' || !selectedSessionBackupPreview.value) {
+    isSessionBackupRestoreConfirmOpen.value = false;
+    selectedSessionBackupPreview.value = null;
+    return;
+  }
+
+  try {
+    await window.bridgegit?.session?.restoreBackupFile(selectedSessionBackupPreview.value.filePath);
+    window.location.reload();
+  } catch (error) {
+    isSessionBackupRestoreConfirmOpen.value = false;
+    selectedSessionBackupPreview.value = null;
+    showProjectTitleSavedToast(error instanceof Error ? error.message : tt('settings.general.sessionBackupRestoreFailed'));
+  }
 }
 
 function markInfoNoteAsSeenWhenActive() {
@@ -4124,7 +4263,19 @@ onBeforeUnmount(() => {
       :sound-notifications-enabled="soundNotificationsEnabled"
       :terminal-command-presets="terminalCommandPresets"
       @open-info="handleOpenWelcomeNote"
+      @create-session-backup="handleCreateSessionBackup"
+      @restore-session-backup-file="handlePickSessionBackupFile"
       @save="handleSaveSettings"
+    />
+
+    <AppConfirmDialog
+      v-model="isSessionBackupRestoreConfirmOpen"
+      :dialog-label="tt('settings.general.restoreSessionBackupDialogLabel')"
+      :eyebrow="tt('settings.general.sessionBackups')"
+      :title="tt('settings.general.restoreSessionBackupConfirmTitle')"
+      :copy="selectedSessionBackupSummary"
+      :actions="sessionBackupRestoreActions"
+      @action="handleSessionBackupRestoreAction"
     />
 
     <DockerDialog

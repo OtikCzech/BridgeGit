@@ -9,7 +9,15 @@ import { registerDockerIpcHandlers } from './docker';
 import { resolveDialogDefaultPath, resolveReadableFilePath } from './file-path-resolution';
 import { registerGitIpcHandlers } from './git';
 import { cleanupPtysForWebContents, registerPtyIpcHandlers } from './pty';
-import { loadSession, saveSession, saveSessionSync } from './store';
+import {
+  createSessionBackup,
+  getSessionBackupDirectoryPath,
+  inspectSessionBackupFile,
+  loadSession,
+  restoreSessionBackupFile,
+  saveSession,
+  saveSessionSync,
+} from './store';
 import type {
   NoteFileHandle,
   NoteFileStat,
@@ -544,6 +552,31 @@ function registerCoreIpcHandlers() {
   });
 
   ipcMain.handle('session:load', async () => loadSession());
+  ipcMain.handle('session:createBackup', async () => createSessionBackup());
+  ipcMain.handle('session:pickBackupFile', async () => {
+    const openDialogOptions: OpenDialogOptions = {
+      title: 'Select BridgeGit session backup',
+      defaultPath: getSessionBackupDirectoryPath(),
+      properties: ['openFile'],
+      filters: [
+        { name: 'BridgeGit session backup', extensions: ['json'] },
+        { name: 'All files', extensions: ['*'] },
+      ],
+    };
+    const parentWindow = getDialogWindow();
+    const result = parentWindow
+      ? await dialog.showOpenDialog(parentWindow, openDialogOptions)
+      : await dialog.showOpenDialog(openDialogOptions);
+
+    if (result.canceled || !result.filePaths[0]) {
+      return null;
+    }
+
+    return inspectSessionBackupFile(result.filePaths[0]);
+  });
+  ipcMain.handle('session:restoreBackupFile', async (_event, filePath: string) =>
+    restoreSessionBackupFile(filePath),
+  );
   ipcMain.handle('session:save', async (_event, session: Partial<SessionData>) =>
     saveSession(session),
   );

@@ -31,6 +31,8 @@ import type {
   RemoveWorktreeResult,
   RemoveWorktreeAndDeleteBranchResult,
   RepoDirectoryEntry,
+  SessionBackupInfo,
+  SessionBackupPreview,
   SessionData,
 } from '../shared/bridgegit';
 
@@ -71,6 +73,9 @@ declare global {
       };
       session: {
         load: () => Promise<SessionData>;
+        createBackup: () => Promise<SessionBackupInfo | null>;
+        pickBackupFile: () => Promise<SessionBackupPreview | null>;
+        restoreBackupFile: (filePath: string) => Promise<SessionData>;
         save: (session: Partial<SessionData>) => Promise<SessionData>;
         saveSync: (session: Partial<SessionData>) => SessionData | null;
         onCloseRequested: (callback: () => void) => () => void;

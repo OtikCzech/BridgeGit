@@ -70,7 +70,7 @@ function handleAction(actionId: string) {
 .app-confirm-dialog__backdrop {
   position: fixed;
   inset: 0;
-  z-index: 30;
+  z-index: 180;
   display: grid;
   place-items: center;
   padding: 24px;
@@ -108,6 +108,7 @@ function handleAction(actionId: string) {
   color: var(--text-muted);
   font-size: 0.82rem;
   line-height: 1.5;
+  white-space: pre-line;
 }
 
 .app-confirm-dialog__actions {

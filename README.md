@@ -6,7 +6,7 @@ Run Codex, Claude or other AI coding agents in parallel, keep each task in its o
 
 It is built for developers who want AI speed without losing Git discipline.
 
-Current release: `v1.0.1`
+Current release: `v1.0.2`
 
 ## Built For AI Coding Workflows
 
@@ -30,6 +30,16 @@ Current release: `v1.0.1`
 - Localized UI with English as the default language plus Czech, Spanish, German, French, Portuguese, Polish, Ukrainian, Chinese, Japanese and Korean
 - Clipboard behavior settings, including right-click paste and selection auto-copy controls for terminal and editor workflows
 - Session persistence for repo context, layout, workspace tabs and comparison view state
+
+## What's New in v1.0.2
+
+BridgeGit `v1.0.2` adds a session safety pass for workspace recovery.
+
+- Writes a launch-time session backup before startup continues
+- Adds a manual session snapshot action in Settings
+- Restores from a user-selected backup JSON file
+- Shows a short comparison of workspaces, repositories and open tabs before restore
+- Keeps the restore confirmation above Settings so the snapshot summary is visible immediately
 
 ## Tech Stack
 
